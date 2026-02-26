@@ -1,0 +1,982 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tucows Domains — Unified Incident Management Platform</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+  :root {
+    --bg:#0a0a0f;--surface:#12121a;--surface2:#1a1a28;--surface3:#222236;
+    --border:#2a2a40;--border-light:#3a3a55;
+    --text:#e4e4ed;--text-muted:#8888a4;--text-dim:#5a5a78;
+    --accent:#6c5ce7;--accent-light:#a29bfe;--accent-glow:rgba(108,92,231,0.15);
+    --green:#00b894;--green-dim:rgba(0,184,148,0.12);
+    --red:#ff6b6b;--red-dim:rgba(255,107,107,0.12);
+    --orange:#fdcb6e;--orange-dim:rgba(253,203,110,0.12);
+    --blue:#74b9ff;--blue-dim:rgba(116,185,255,0.12);
+    --cyan:#81ecec;--cyan-dim:rgba(129,236,236,0.12);
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.7;-webkit-font-smoothing:antialiased;}
+  .container{max-width:1080px;margin:0 auto;padding:0 40px;}
+  a{color:var(--accent-light);text-decoration:none;}
+  a:hover{text-decoration:underline;}
+
+  .cover{min-height:100vh;display:flex;flex-direction:column;justify-content:center;position:relative;overflow:hidden;padding:80px 0;}
+  .cover::before{content:'';position:absolute;top:-200px;right:-200px;width:600px;height:600px;background:radial-gradient(circle,rgba(108,92,231,0.08) 0%,transparent 70%);pointer-events:none;}
+  .cover .label{font-size:12px;font-weight:600;letter-spacing:3px;text-transform:uppercase;color:var(--accent-light);margin-bottom:24px;}
+  .cover h1{font-size:52px;font-weight:800;line-height:1.1;letter-spacing:-1.5px;background:linear-gradient(135deg,#fff 0%,var(--accent-light) 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:24px;}
+  .cover .subtitle{font-size:20px;color:var(--text-muted);line-height:1.6;max-width:680px;margin-bottom:48px;}
+  .cover-meta{display:flex;gap:32px;flex-wrap:wrap;}
+  .cover-meta-item{font-size:13px;color:var(--text-dim);}
+  .cover-meta-item span{color:var(--text);font-weight:500;}
+
+  .section{padding:80px 0;border-top:1px solid var(--border);}
+  .section-num{font-size:11px;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:var(--accent);margin-bottom:12px;}
+  .section h2{font-size:36px;font-weight:700;letter-spacing:-0.5px;margin-bottom:16px;line-height:1.2;}
+  .section h3{font-size:22px;font-weight:600;margin:40px 0 16px;color:var(--text);}
+  .section h4{font-size:16px;font-weight:600;margin:28px 0 12px;color:var(--accent-light);}
+  .section-intro{font-size:17px;color:var(--text-muted);max-width:720px;margin-bottom:40px;}
+  p{margin-bottom:16px;font-size:15px;}
+  strong{font-weight:600;color:#fff;}
+
+  .diagram{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:40px;margin:32px 0;overflow-x:auto;}
+  .diagram-title{font-size:13px;font-weight:600;letter-spacing:2px;text-transform:uppercase;color:var(--text-dim);margin-bottom:24px;}
+
+  .arch{display:flex;flex-direction:column;gap:16px;}
+  .arch-layer{border:1px solid var(--border);border-radius:12px;padding:20px 24px;}
+  .arch-layer.operator{border-color:var(--accent);background:var(--accent-glow);}
+  .arch-layer.orchestration{border-color:var(--green);background:var(--green-dim);}
+  .arch-layer.incident{border-color:var(--orange);background:var(--orange-dim);}
+  .arch-layer.data{border-color:var(--blue);background:var(--blue-dim);}
+  .arch-layer-label{font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;}
+  .arch-layer.operator .arch-layer-label{color:var(--accent-light);}
+  .arch-layer.orchestration .arch-layer-label{color:var(--green);}
+  .arch-layer.incident .arch-layer-label{color:var(--orange);}
+  .arch-layer.data .arch-layer-label{color:var(--blue);}
+  .arch-boxes{display:flex;gap:10px;flex-wrap:wrap;}
+  .arch-box{background:rgba(0,0,0,0.3);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:10px 16px;font-size:13px;font-weight:500;flex:1;min-width:120px;text-align:center;position:relative;cursor:default;}
+  .arch-box small{display:block;font-size:11px;color:var(--text-dim);font-weight:400;margin-top:4px;}
+  .arch-arrow{text-align:center;color:var(--text-dim);font-size:20px;line-height:1;}
+
+  /* INFO BUTTON */
+  .info-btn{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:var(--accent);color:#fff;font-size:10px;font-weight:700;cursor:pointer;position:absolute;top:6px;right:6px;border:none;line-height:1;z-index:2;transition:transform 0.15s;}
+  .info-btn:hover{transform:scale(1.2);}
+  .info-panel{display:none;position:absolute;top:calc(100% + 8px);left:50%;transform:translateX(-50%);width:340px;background:var(--surface3);border:1px solid var(--border-light);border-radius:12px;padding:16px;z-index:100;text-align:left;box-shadow:0 12px 40px rgba(0,0,0,0.5);}
+  .info-panel.active{display:block;}
+  .info-panel h5{font-size:14px;font-weight:700;color:#fff;margin-bottom:6px;}
+  .info-panel p{font-size:12px;color:var(--text-muted);margin:0 0 8px;line-height:1.6;}
+  .info-panel .info-link{font-size:12px;font-weight:600;}
+  .info-panel .info-interactions{font-size:11px;color:var(--text-dim);border-top:1px solid var(--border);padding-top:8px;margin-top:8px;}
+
+  table{width:100%;border-collapse:collapse;margin:24px 0;font-size:14px;}
+  thead th{text-align:left;padding:12px 16px;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--text-dim);border-bottom:1px solid var(--border);background:var(--surface);}
+  tbody td{padding:12px 16px;border-bottom:1px solid var(--border);vertical-align:top;}
+  tbody tr:hover{background:rgba(255,255,255,0.02);}
+
+  .card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;margin:24px 0;}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;}
+  .card:hover{border-color:var(--border-light);}
+  .card .card-icon{font-size:28px;margin-bottom:12px;}
+  .card h4{font-size:16px;font-weight:600;margin:0 0 8px;color:#fff;}
+  .card p{font-size:13px;color:var(--text-muted);margin:0;}
+
+  .tag{display:inline-block;font-size:11px;font-weight:600;padding:3px 10px;border-radius:100px;letter-spacing:0.5px;}
+  .tag.green{background:var(--green-dim);color:var(--green);}
+  .tag.red{background:var(--red-dim);color:var(--red);}
+  .tag.orange{background:var(--orange-dim);color:var(--orange);}
+  .tag.blue{background:var(--blue-dim);color:var(--blue);}
+  .tag.purple{background:var(--accent-glow);color:var(--accent-light);}
+  .tag.cyan{background:var(--cyan-dim);color:var(--cyan);}
+
+  .code-block{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px 24px;margin:16px 0;font-family:'JetBrains Mono',monospace;font-size:13px;line-height:1.8;overflow-x:auto;color:var(--text-muted);white-space:pre;}
+
+  .slack-mock{background:#1a1d21;border-radius:12px;padding:24px;margin:24px 0;font-family:'Inter',sans-serif;border:1px solid #2c2f33;}
+  .slack-mock .sm-header{display:flex;align-items:center;gap:10px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid #2c2f33;}
+  .slack-mock .sm-avatar{width:36px;height:36px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:18px;background:#2c2f33;}
+  .slack-mock .sm-name{font-weight:700;font-size:14px;color:#fff;}
+  .slack-mock .sm-time{font-size:12px;color:#616061;}
+  .slack-mock .sm-body{font-size:14px;line-height:1.7;color:#d1d2d3;}
+  .slack-mock .sm-body strong{color:#fff;}
+  .slack-mock .sm-divider{border:none;border-top:1px solid #2c2f33;margin:8px 0;}
+  .slack-mock .sm-link{color:#1d9bd1;text-decoration:none;}
+  .slack-mock .sm-buttons{display:flex;gap:8px;margin-top:16px;flex-wrap:wrap;}
+  .slack-mock .sm-btn{padding:6px 16px;border-radius:6px;font-size:13px;font-weight:600;border:1px solid #2c2f33;background:#2c2f33;color:#d1d2d3;cursor:pointer;}
+  .slack-mock .sm-btn.primary{background:#007a5a;border-color:#007a5a;color:#fff;}
+  .slack-mock .sm-btn.danger{background:#e01e5a;border-color:#e01e5a;color:#fff;}
+
+  .checklist{list-style:none;margin:16px 0;}
+  .checklist li{display:flex;align-items:flex-start;gap:12px;padding:8px 0;font-size:14px;border-bottom:1px solid var(--border);}
+  .checklist li:last-child{border:none;}
+  .check-icon{width:20px;height:20px;border-radius:6px;border:2px solid var(--border-light);flex-shrink:0;margin-top:2px;}
+
+  .callout{border-left:3px solid var(--accent);background:var(--accent-glow);padding:16px 20px;border-radius:0 8px 8px 0;margin:24px 0;font-size:14px;}
+  .callout.warn{border-color:var(--orange);background:var(--orange-dim);}
+  .callout.success{border-color:var(--green);background:var(--green-dim);}
+  .callout strong{display:block;margin-bottom:4px;}
+
+  .phase-badge{display:inline-flex;align-items:center;gap:8px;background:var(--surface2);border:1px solid var(--border);border-radius:100px;padding:6px 16px;font-size:12px;font-weight:600;margin-bottom:16px;}
+  .phase-badge .pb-dot{width:8px;height:8px;border-radius:50%;}
+
+  .metric-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px;margin:24px 0;}
+  .metric-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px;text-align:center;}
+  .metric-card .mc-label{font-size:11px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--text-dim);margin-bottom:8px;}
+  .metric-card .mc-current{font-size:14px;color:var(--red);text-decoration:line-through;margin-bottom:4px;}
+  .metric-card .mc-target{font-size:28px;font-weight:700;color:var(--green);}
+  .metric-card .mc-note{font-size:12px;color:var(--text-dim);margin-top:4px;}
+
+  .timeline{display:grid;grid-template-columns:repeat(6,1fr);gap:0;margin:24px 0;position:relative;}
+  .timeline::before{content:'';position:absolute;top:19px;left:0;right:0;height:2px;background:var(--border);}
+  .tl-item{text-align:center;position:relative;padding:0 4px;}
+  .tl-dot{width:12px;height:12px;border-radius:50%;margin:13px auto 16px;position:relative;z-index:1;}
+  .tl-label{font-size:12px;font-weight:700;color:var(--text);}
+  .tl-weeks{font-size:11px;color:var(--text-dim);margin-bottom:8px;}
+  .tl-desc{font-size:11px;color:var(--text-muted);line-height:1.5;}
+
+  /* SEVERITY FLOW */
+  .sev-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin:24px 0;}
+  .sev-card{border-radius:12px;padding:20px;text-align:center;}
+  .sev-card.p1{background:var(--red-dim);border:1px solid rgba(255,107,107,0.3);}
+  .sev-card.p2{background:var(--orange-dim);border:1px solid rgba(253,203,110,0.3);}
+  .sev-card.p3{background:var(--blue-dim);border:1px solid rgba(116,185,255,0.3);}
+  .sev-card h4{margin:0 0 8px;font-size:18px;}
+  .sev-card p{font-size:12px;color:var(--text-muted);margin:0 0 4px;line-height:1.5;}
+  .sev-card .sev-actions{font-size:12px;color:var(--text);font-weight:500;margin-top:10px;border-top:1px solid rgba(255,255,255,0.08);padding-top:10px;text-align:left;}
+
+  /* TOC */
+  .toc-grid{display:grid;grid-template-columns:1fr;gap:0;}
+  .toc-row{display:flex;align-items:center;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border);transition:background 0.15s;}
+  .toc-row:hover{background:var(--surface2);}
+  .toc-row .toc-num{font-size:14px;font-weight:700;color:var(--accent-light);min-width:32px;}
+  .toc-row .toc-title{font-size:15px;font-weight:500;flex:1;}
+  .toc-row .toc-tag{margin-left:auto;}
+
+  .flow-step{display:flex;align-items:flex-start;gap:16px;padding:12px 0;}
+  .flow-time{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);min-width:72px;padding-top:2px;}
+  .flow-dot-col{display:flex;flex-direction:column;align-items:center;min-width:20px;}
+  .flow-dot{width:12px;height:12px;border-radius:50%;background:var(--accent);border:2px solid var(--bg);flex-shrink:0;z-index:1;}
+  .flow-dot.green{background:var(--green);}
+  .flow-dot.red{background:var(--red);}
+  .flow-dot.orange{background:var(--orange);}
+  .flow-dot.blue{background:var(--blue);}
+  .flow-line{width:2px;flex:1;background:var(--border);min-height:16px;}
+  .flow-content{flex:1;padding-bottom:8px;}
+  .flow-content p{margin:0;font-size:14px;}
+  .flow-content .flow-label{font-size:11px;font-weight:600;letter-spacing:1px;text-transform:uppercase;margin-bottom:4px;}
+
+  @media(max-width:768px){
+    .container{padding:0 20px;}.cover h1{font-size:32px;}.section h2{font-size:28px;}
+    .arch-boxes{flex-direction:column;}.card-grid{grid-template-columns:1fr;}
+    .metric-grid{grid-template-columns:1fr 1fr;}.timeline{grid-template-columns:1fr 1fr;gap:16px;}
+    .timeline::before{display:none;}.sev-grid{grid-template-columns:1fr;}
+    .info-panel{width:260px;}
+  }
+  @media print{
+    body{background:#fff;color:#111;}.container{max-width:100%;padding:0 20px;}
+    .cover{min-height:auto;padding:40px 0;}.cover h1{background:none;-webkit-text-fill-color:#111;font-size:36px;}
+    .section{padding:40px 0;}.info-btn{display:none;}
+  }
+</style>
+</head>
+<body>
+
+<!-- COVER -->
+<div class="cover">
+  <div class="container">
+    <div class="label">Infrastructure &amp; Reliability Engineering</div>
+    <h1>Unified Incident<br>Management Platform</h1>
+    <p class="subtitle">
+      A self-hosted, Slack-centric incident management platform that unifies all Tucows Domains infrastructure alerts into a single operational workflow — replacing tool fragmentation with a composable, open-source stack.
+    </p>
+    <div class="cover-meta">
+      <div class="cover-meta-item">Organization <span>Tucows Domains</span></div>
+      <div class="cover-meta-item">Scale <span>~24M domains · ~17M registry · 35,000+ resellers</span></div>
+      <div class="cover-meta-item">Timeline <span>22 Weeks</span></div>
+      <div class="cover-meta-item">Date <span>February 2026</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- TOC -->
+<div class="section" id="toc" style="padding-top:40px;">
+  <div class="container">
+    <div class="section-num">Contents</div>
+    <h2>Document Overview</h2>
+    <div class="toc-grid">
+      <a href="#s01" class="toc-row"><div class="toc-num">01</div><div class="toc-title">Scope &amp; Infrastructure Coverage</div><div class="toc-tag"><span class="tag purple">Context</span></div></a>
+      <a href="#s02" class="toc-row"><div class="toc-num">02</div><div class="toc-title">Platform Architecture</div><div class="toc-tag"><span class="tag purple">Design</span></div></a>
+      <a href="#s03" class="toc-row"><div class="toc-num">03</div><div class="toc-title">Alert Severity Model, Response Tiers &amp; Jira Integration</div><div class="toc-tag"><span class="tag orange">Process</span></div></a>
+      <a href="#s04" class="toc-row"><div class="toc-num">04</div><div class="toc-title">Infrastructure Requirements</div><div class="toc-tag"><span class="tag blue">Planning</span></div></a>
+      <a href="#s05" class="toc-row"><div class="toc-num">05</div><div class="toc-title">Phase 1 — Alert Unification (Keep)</div><div class="toc-tag"><span class="tag green">Build</span></div></a>
+      <a href="#s06" class="toc-row"><div class="toc-num">06</div><div class="toc-title">Phase 2 — On-Call &amp; Escalation (GoAlert)</div><div class="toc-tag"><span class="tag green">Build</span></div></a>
+      <a href="#s07" class="toc-row"><div class="toc-num">07</div><div class="toc-title">Phase 3 — Automation &amp; Slack Workflows (n8n)</div><div class="toc-tag"><span class="tag green">Build</span></div></a>
+      <a href="#s08" class="toc-row"><div class="toc-num">08</div><div class="toc-title">Phase 4 — Log Consolidation (Loki)</div><div class="toc-tag"><span class="tag green">Build</span></div></a>
+      <a href="#s09" class="toc-row"><div class="toc-num">09</div><div class="toc-title">Phase 5 — LLM Integration (Self-Hosted on H200 Cluster)</div><div class="toc-tag"><span class="tag green">Build</span></div></a>
+      <a href="#s10" class="toc-row"><div class="toc-num">10</div><div class="toc-title">Phase 6 — Custom Frontend Portal</div><div class="toc-tag"><span class="tag green">Build</span></div></a>
+      <a href="#s11" class="toc-row"><div class="toc-num">11</div><div class="toc-title">End-to-End Incident Flow</div><div class="toc-tag"><span class="tag orange">Demo</span></div></a>
+      <a href="#s12" class="toc-row"><div class="toc-num">12</div><div class="toc-title">Timeline, Team &amp; Success Metrics</div><div class="toc-tag"><span class="tag blue">Planning</span></div></a>
+    </div>
+  </div>
+</div>
+
+<!-- S01: SCOPE -->
+<div class="section" id="s01">
+  <div class="container">
+    <div class="section-num">Section 01</div>
+    <h2>Scope &amp; Infrastructure Coverage</h2>
+    <p class="section-intro">The platform will ingest and unify alerts from every layer of Tucows Domains infrastructure. Today, monitoring is siloed: each business unit runs its own tooling independently.</p>
+
+    <h3>Current Monitoring Sources (7 independent instances)</h3>
+    <table>
+      <thead><tr><th>Instance</th><th>Tool</th><th>Scope</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Zabbix — OpenSRS</strong></td><td>Zabbix</td><td>OpenSRS platform servers, services, network devices</td></tr>
+        <tr><td><strong>Zabbix — Ascio</strong></td><td>Zabbix</td><td>Ascio platform servers and services</td></tr>
+        <tr><td><strong>Zabbix — Enom</strong></td><td>Zabbix</td><td>Enom platform servers and services</td></tr>
+        <tr><td><strong>Zabbix — Infrastructure</strong></td><td>Zabbix</td><td>Core network, routers, switches, firewalls, bare-metal, shared infra</td></tr>
+        <tr><td><strong>Grafana — OpenSRS</strong></td><td>Grafana OSS</td><td>OpenSRS application metrics, Prometheus dashboards and alerts</td></tr>
+        <tr><td><strong>Grafana — TRS</strong></td><td>Grafana OSS</td><td>Tucows Registry Services metrics, dashboards and alerts</td></tr>
+        <tr><td><strong>Icinga — TRS</strong></td><td>Icinga</td><td>Tucows Registry Services infrastructure and service checks</td></tr>
+      </tbody>
+    </table>
+    <p>In addition to these 7 instances, Prometheus/Alertmanager runs underneath the Grafana instances, and AWS CloudWatch monitors cloud-native services. <strong>That's 9+ distinct alert-producing systems with no unified view.</strong></p>
+
+    <h3>Infrastructure at Scale</h3>
+    <div class="card-grid">
+      <div class="card">
+        <div class="card-icon">🌐</div>
+        <h4>Domain Operations</h4>
+        <p>~24 million domains under management across OpenSRS, Enom, Ascio, and Hover. Hundreds of thousands of EPP transactions daily across registrations, renewals, transfers, and WHOIS/RDAP queries. 35,000+ reseller network.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">🏛️</div>
+        <h4>Registry Services (TRS)</h4>
+        <p>~17 million domains on the registry platform. 41+ gTLDs, 7 ccTLDs, 130+ SLDs. 350+ node global Anycast DNS network. EPP, RDAP, WHOIS, DNS resolution at scale for .in, .online, .store, .tech, and others.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">🖥️</div>
+        <h4>Network &amp; Physical</h4>
+        <p>Core/edge routers, switches, firewalls across data centers. Bare-metal servers. Load balancers. Monitored by the Infrastructure Zabbix instance.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">☁️</div>
+        <h4>Cloud &amp; Containers</h4>
+        <p>AWS (EC2, RDS, ElastiCache, S3, Route53). OpenStack clusters. Kubernetes-based deployments for containerized applications. CloudWatch alarms and AWS Health events.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">🔧</div>
+        <h4>Supporting Services</h4>
+        <p>Databases (MySQL/PostgreSQL — replication lag, connection pools). Message queues (consumer lag). CI/CD pipelines. Security events (WAF, IDS). Certificate expiry monitoring.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">🤖</div>
+        <h4>GPU Compute</h4>
+        <p>H200 GPU cluster currently available and underutilized. Will be leveraged for self-hosted LLM inference powering the alert analysis pipeline — zero incremental cost for AI capabilities.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- S02: ARCHITECTURE -->
+<div class="section" id="s02">
+  <div class="container">
+    <div class="section-num">Section 02</div>
+    <h2>Platform Architecture</h2>
+    <p class="section-intro">A four-layer composable architecture. Each layer is independently replaceable. Click the <span style="display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;background:var(--accent);color:#fff;font-size:9px;font-weight:700;">i</span> button on any component for details.</p>
+
+    <div class="diagram">
+      <div class="diagram-title">System Architecture — Click any ⓘ for details</div>
+      <div class="arch">
+
+        <div class="arch-layer operator">
+          <div class="arch-layer-label">Layer 1 — Operator Experience</div>
+          <div class="arch-boxes">
+            <div class="arch-box" id="ab-slack"><strong>Slack</strong><small>Primary during incidents</small><button class="info-btn" onclick="toggleInfo('slack')">i</button><div class="info-panel" id="info-slack"><h5>Slack — Workspace Hub</h5><p>The primary interface during incidents. Engineers receive alert notifications, acknowledge/escalate/resolve via buttons, declare incidents with slash commands, and coordinate in dedicated incident channels — all without leaving Slack.</p><p><strong>Interacts with:</strong> Keep (alert posts), GoAlert (ack/escalate), n8n (slash commands, buttons, automations), Uptime Kuma (status updates).</p><div class="info-link"><a href="https://slack.com" target="_blank">slack.com →</a></div></div></div>
+            <div class="arch-box" id="ab-grafana"><strong>Grafana OSS</strong><small>Dashboards &amp; investigation</small><button class="info-btn" onclick="toggleInfo('grafana')">i</button><div class="info-panel" id="info-grafana"><h5>Grafana OSS — Visualization</h5><p>The dashboarding and investigation layer. Queries Prometheus (metrics), Loki (logs), and other data sources. Engineers click through from Slack alerts directly into relevant Grafana dashboards for deep investigation.</p><p><strong>Interacts with:</strong> Prometheus, Loki, Zabbix (data sources). Keep + Slack (linked from alerts). Portal (embedded panels).</p><p><strong>Already in stack:</strong> OpenSRS and TRS Grafana instances exist. This project unifies them.</p><div class="info-link"><a href="https://grafana.com/oss/grafana/" target="_blank">grafana.com/oss →</a></div></div></div>
+            <div class="arch-box" id="ab-portal"><strong>Custom Portal</strong><small>Phase 6 — React app</small><button class="info-btn" onclick="toggleInfo('portal')">i</button><div class="info-panel" id="info-portal"><h5>Custom Portal — Command Center</h5><p>A React/Next.js frontend built in Phase 6 that consumes APIs from Keep, GoAlert, Grafana, and Uptime Kuma to provide a unified "mission control" view. Includes incident management, on-call scheduling, service catalog, and analytics.</p><p><strong>Interacts with:</strong> All tools via their REST/GraphQL APIs. n8n (triggers actions).</p><div class="info-link">Built in-house · Phase 6</div></div></div>
+          </div>
+        </div>
+
+        <div class="arch-arrow">↕</div>
+
+        <div class="arch-layer orchestration">
+          <div class="arch-layer-label">Layer 2 — Orchestration &amp; Intelligence</div>
+          <div class="arch-boxes">
+            <div class="arch-box" style="flex:2;" id="ab-keep"><strong>Keep</strong><small>Alert aggregation · dedup · AI correlation · workflows</small><button class="info-btn" onclick="toggleInfo('keep')">i</button><div class="info-panel" id="info-keep"><h5>Keep — AIOps Alert Platform</h5><p>Open-source alert management platform (MIT license, ~10.8k GitHub stars). The "brain" of the system. Ingests alerts from all 7+ monitoring instances via native providers (Zabbix, Prometheus, Grafana, Icinga). Deduplicates, correlates with AI, groups into incidents, and triggers downstream workflows.</p><p><strong>Interacts with:</strong> All monitoring sources (inbound). GoAlert (outbound paging). n8n (webhook triggers). Slack (alert notifications). LLM (enrichment).</p><div class="info-link"><a href="https://www.keephq.dev/" target="_blank">keephq.dev →</a> · <a href="https://github.com/keephq/keep" target="_blank">GitHub →</a></div></div></div>
+          </div>
+          <div class="arch-boxes" style="margin-top:10px;">
+            <div class="arch-box" id="ab-goalert"><strong>GoAlert</strong><small>On-call · schedules · paging</small><button class="info-btn" onclick="toggleInfo('goalert')">i</button><div class="info-panel" id="info-goalert"><h5>GoAlert — On-Call Management</h5><p>Open-source on-call scheduling and notification system by Target (Apache 2.0, single Go binary + PostgreSQL). Manages rotations, escalation policies, and delivers SMS/voice notifications via Twilio. Used in production at Target for 3,500+ services.</p><p><strong>Interacts with:</strong> Keep (receives paging triggers). Twilio (SMS/voice delivery). Slack (notification webhook). n8n (GraphQL API for schedule queries).</p><div class="info-link"><a href="https://goalert.me/" target="_blank">goalert.me →</a> · <a href="https://github.com/target/goalert" target="_blank">GitHub →</a></div></div></div>
+            <div class="arch-box" id="ab-n8n"><strong>n8n</strong><small>Escalation · Slack bots · comms</small><button class="info-btn" onclick="toggleInfo('n8n')">i</button><div class="info-panel" id="info-n8n"><h5>n8n — Workflow Automation</h5><p>Self-hosted workflow automation platform (fair-code license, 400+ integrations). The "nervous system" connecting all tools. Powers Slack slash commands, interactive buttons, escalation logic, LLM analysis pipeline, vendor contact automation, mass notifications, and status page updates.</p><p><strong>Interacts with:</strong> Every other tool. Slack (commands/buttons), Keep (API), GoAlert (GraphQL), Twilio, SMTP, Claude/Ollama (LLM), Uptime Kuma (status).</p><div class="info-link"><a href="https://n8n.io/" target="_blank">n8n.io →</a> · <a href="https://github.com/n8n-io/n8n" target="_blank">GitHub →</a></div></div></div>
+            <div class="arch-box" id="ab-llm"><strong>Ollama on H200s</strong><small>Self-hosted LLM analysis</small><button class="info-btn" onclick="toggleInfo('llm')">i</button><div class="info-panel" id="info-llm"><h5>Ollama — Self-Hosted LLM</h5><p>Runs on the existing H200 GPU cluster. Hosts large language models (Llama 3.1 405B, Qwen 2.5 72B, etc.) for alert analysis, postmortem generation, and runbook matching. Zero incremental cost — uses existing underutilized hardware. H200s provide ~4x the inference throughput of A100s.</p><p><strong>Interacts with:</strong> n8n (HTTP API calls). Keep (enrichment). Slack (analysis posted via n8n).</p><div class="info-link"><a href="https://ollama.com/" target="_blank">ollama.com →</a> · <a href="https://github.com/ollama/ollama" target="_blank">GitHub →</a></div></div></div>
+          </div>
+        </div>
+
+        <div class="arch-arrow">↕</div>
+
+        <div class="arch-layer incident">
+          <div class="arch-layer-label">Layer 3 — Incident Communication &amp; Ticketing</div>
+          <div class="arch-boxes">
+            <div class="arch-box" id="ab-jira"><strong>Jira</strong><small>Incident tickets (auto)</small><button class="info-btn" onclick="toggleInfo('jira')">i</button><div class="info-panel" id="info-jira"><h5>Jira — Incident Ticketing</h5><p>n8n auto-creates Jira incident tickets for all P1, P2, and P3 alerts. Tickets include alert summary, correlated alerts from Keep, affected service, Grafana links, and LLM analysis. Tickets are auto-updated on resolution. Provides an audit trail and feeds into incident metrics/reporting.</p><p><strong>Interacts with:</strong> n8n (creates/updates tickets via Jira API). Keep (incident ID linked). Slack (ticket link posted in alert messages).</p><div class="info-link"><a href="https://www.atlassian.com/software/jira" target="_blank">atlassian.com/jira →</a></div></div></div>
+            <div class="arch-box" id="ab-uptime"><strong>Uptime Kuma</strong><small>Status page + monitoring</small><button class="info-btn" onclick="toggleInfo('uptime')">i</button><div class="info-panel" id="info-uptime"><h5>Uptime Kuma — Status Page</h5><p>Self-hosted monitoring + status page (MIT license). Monitors HTTP(s), TCP, DNS, Docker containers with 20-second intervals. Beautiful UI. Provides both internal and external status pages for customer-facing services.</p><p><strong>Interacts with:</strong> n8n (API updates during incidents). Slack (notifications). Keep (alert source for external checks).</p><div class="info-link"><a href="https://github.com/louislam/uptime-kuma" target="_blank">GitHub →</a></div></div></div>
+            <div class="arch-box" id="ab-twilio"><strong>Twilio</strong><small>SMS + voice delivery</small><button class="info-btn" onclick="toggleInfo('twilio')">i</button><div class="info-panel" id="info-twilio"><h5>Twilio — Notification Delivery</h5><p>Cloud service for SMS and voice call delivery. GoAlert uses Twilio to page on-call engineers when critical alerts fire. Supports bidirectional SMS (engineers can acknowledge alerts by replying "1").</p><p><strong>Interacts with:</strong> GoAlert (primary consumer). n8n (mass notification workflows).</p><div class="info-link"><a href="https://www.twilio.com/" target="_blank">twilio.com →</a></div></div></div>
+            <div class="arch-box" id="ab-smtp"><strong>SMTP / SES</strong><small>Email notifications</small><button class="info-btn" onclick="toggleInfo('smtp')">i</button><div class="info-panel" id="info-smtp"><h5>SMTP — Email Delivery</h5><p>Existing internal SMTP relay or AWS SES for email notifications. Used by n8n for vendor contact automation, mass stakeholder notifications, and postmortem distribution.</p><p><strong>Interacts with:</strong> n8n (sends emails). GoAlert (optional email notifications).</p><div class="info-link">Uses existing infrastructure</div></div></div>
+          </div>
+        </div>
+
+        <div class="arch-arrow">↕</div>
+
+        <div class="arch-layer data">
+          <div class="arch-layer-label">Layer 4 — Data &amp; Collection (Existing Monitoring)</div>
+          <div class="arch-boxes">
+            <div class="arch-box"><strong>Zabbix ×4</strong><small>OpenSRS · Ascio · Enom · Infra</small><button class="info-btn" onclick="toggleInfo('zabbix')">i</button><div class="info-panel" id="info-zabbix"><h5>Zabbix — Infrastructure Monitoring</h5><p>Four independent Zabbix instances, one per business unit (OpenSRS, Ascio, Enom) plus a shared Infrastructure instance. Each connects to Keep via the native Zabbix provider, which auto-configures a webhook media type. No changes to existing Zabbix configurations required beyond adding the Keep media type.</p><p><strong>Interacts with:</strong> Keep (sends alerts via webhook). Grafana (optional data source).</p><div class="info-link"><a href="https://www.zabbix.com/" target="_blank">zabbix.com →</a></div></div></div>
+            <div class="arch-box"><strong>Grafana ×2</strong><small>OpenSRS · TRS</small><button class="info-btn" onclick="toggleInfo('grafana-oss')">i</button><div class="info-panel" id="info-grafana-oss"><h5>Grafana OSS Instances (Existing)</h5><p>Two existing Grafana OSS instances for OpenSRS and TRS. Each has Prometheus data sources with alerting rules. Connect to Keep by adding a webhook contact point in each Grafana instance targeting Keep's Grafana alert endpoint.</p><p><strong>Interacts with:</strong> Keep (sends alerts). Prometheus (data source). Loki (new data source in Phase 4).</p><div class="info-link">Existing infrastructure</div></div></div>
+            <div class="arch-box"><strong>Icinga — TRS</strong><small>Registry checks</small><button class="info-btn" onclick="toggleInfo('icinga')">i</button><div class="info-panel" id="info-icinga"><h5>Icinga — TRS Monitoring</h5><p>Single Icinga instance for Tucows Registry Services. Monitors TRS-specific infrastructure and service checks. Connects to Keep via a custom webhook notification command — Icinga does not have a native Keep provider, so a lightweight integration script is needed.</p><p><strong>Interacts with:</strong> Keep (sends alerts via webhook).</p><div class="info-link"><a href="https://icinga.com/" target="_blank">icinga.com →</a></div></div></div>
+            <div class="arch-box"><strong>CloudWatch</strong><small>AWS native</small><button class="info-btn" onclick="toggleInfo('cw')">i</button><div class="info-panel" id="info-cw"><h5>AWS CloudWatch</h5><p>Native AWS monitoring for EC2, RDS, ElastiCache, S3, Route53, ALB. Connects to Keep either via the native CloudWatch provider (pull alarms) or by routing SNS → Lambda → Keep webhook. Alternatively, use YACE exporter to bring CloudWatch metrics into Prometheus.</p><p><strong>Interacts with:</strong> Keep (alert source). Optionally Prometheus (via YACE exporter).</p><div class="info-link"><a href="https://aws.amazon.com/cloudwatch/" target="_blank">aws.amazon.com/cloudwatch →</a></div></div></div>
+          </div>
+          <div class="arch-boxes" style="margin-top:10px;">
+            <div class="arch-box"><strong>Grafana Loki</strong><small>Log aggregation (new)</small><button class="info-btn" onclick="toggleInfo('loki')">i</button><div class="info-panel" id="info-loki"><h5>Grafana Loki — Log Storage</h5><p>Deployed in Phase 4. Cost-effective log aggregation — indexes only labels, not full content. Stores on S3/MinIO. Queried via LogQL in Grafana. Also consumed by the LLM analysis pipeline (n8n queries Loki API for recent error logs during incidents).</p><p><strong>Interacts with:</strong> Fluent Bit/OTel Collector (ingestion). Grafana (query/visualization). n8n → LLM (log context for analysis).</p><div class="info-link"><a href="https://grafana.com/oss/loki/" target="_blank">grafana.com/oss/loki →</a></div></div></div>
+            <div class="arch-box"><strong>Fluent Bit + OTel</strong><small>Log shipping (new)</small><button class="info-btn" onclick="toggleInfo('fluent')">i</button><div class="info-panel" id="info-fluent"><h5>Fluent Bit + OpenTelemetry Collector</h5><p>Fluent Bit: lightweight log collector (~4MB), deployed as DaemonSet on K8s and agents on VMs. CNCF graduated project. OpenTelemetry Collector: vendor-neutral telemetry pipeline for logs, metrics, and traces. Together they ship all logs to Loki.</p><p><strong>Interacts with:</strong> All servers/containers (collection). Loki (output destination).</p><div class="info-link"><a href="https://fluentbit.io/" target="_blank">fluentbit.io →</a> · <a href="https://opentelemetry.io/" target="_blank">opentelemetry.io →</a></div></div></div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <div class="callout success">
+      <strong>Key Design Principle</strong>
+      During an active incident, an engineer should only need two tools: <strong>Slack</strong> (for coordination, context, and actions) and <strong>Grafana</strong> (for investigation). Every other tool operates behind the scenes through API integrations, surfacing information into Slack automatically.
+    </div>
+  </div>
+</div>
+
+<!-- S03: SEVERITY MODEL -->
+<div class="section" id="s03">
+  <div class="container">
+    <div class="section-num">Section 03</div>
+    <h2>Alert Severity Model &amp; Response Tiers</h2>
+    <p class="section-intro">Not every alert is an incident, and not every incident requires the same response. The platform routes alerts through a four-tier severity model with context-aware behavior that adapts to business hours vs. on-call periods.</p>
+
+    <div class="callout" style="border-color:var(--cyan);background:var(--cyan-dim);margin-bottom:32px;">
+      <strong>A Note on On-Call and Response Times</strong>
+      A well-instrumented alerting platform with proper aggregation, correlation, and automated paging does not produce slower response times when the SRE team is on-call vs. when they are sitting at their desks. The entire purpose of this platform is to ensure that the right alert, with the right context, reaches the right person within seconds — regardless of whether that person is in the office, at home, or asleep. An on-call SRE receiving a P1 page with correlated alerts, LLM analysis, linked dashboards, and a suggested runbook will begin effective investigation faster than a team of engineers staring at six disconnected monitoring dashboards waiting for something to turn red. <strong>More eyes on screens is not a substitute for proper tooling and monitoring aggregation.</strong> Investing in the tooling described in this document is what drives MTTD and MTTR down — not staffing levels during off-hours. The data will prove this: we will measure TTA and MTTR across business-hours and on-call periods to demonstrate that the platform delivers consistent response times regardless of operational mode.
+    </div>
+
+    <h3>Four-Tier Severity Model</h3>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:24px 0;">
+      <div class="sev-card p1">
+        <h4 style="color:var(--red);">P1 — Critical</h4>
+        <p>Active customer impact. Service outage or severe degradation affecting domain registration, DNS resolution, registry operations, or data integrity. Revenue-impacting.</p>
+        <div class="sev-actions">
+          <strong>Who is paged:</strong> SRE + Engineering<br><br>
+          <strong>Automated actions:</strong><br>
+          ✓ Keep correlates and groups alerts<br>
+          ✓ GoAlert pages SRE + Engineering on-call (SMS + voice)<br>
+          ✓ n8n creates dedicated Slack incident channel<br>
+          ✓ LLM analysis generated and posted<br>
+          ✓ Jira incident ticket created automatically<br>
+          ✓ Status page updated<br>
+          ✓ Leadership notified via #incidents-p1<br>
+          ✓ During business hours: Slack notification replaces paging for on-desk teams
+        </div>
+      </div>
+      <div class="sev-card p2" style="background:var(--orange-dim);border:1px solid rgba(253,203,110,0.3);">
+        <h4 style="color:var(--orange);">P2 — Major</h4>
+        <p>Likely customer impact. Significant degradation, partial outage, elevated error rates across a service, failover triggered, redundancy lost.</p>
+        <div class="sev-actions">
+          <strong>Who is paged:</strong> SRE + Engineering<br><br>
+          <strong>Automated actions:</strong><br>
+          ✓ Keep correlates and groups alerts<br>
+          ✓ GoAlert pages SRE + Engineering on-call<br>
+          ✓ Posted to team-specific Slack channel<br>
+          ✓ Jira incident ticket created automatically<br>
+          ✓ LLM analysis generated and posted<br>
+          ✗ <em>No incident channel unless manually declared</em><br>
+          ✗ <em>No status page update unless manually triggered</em><br>
+          ✓ During business hours: Slack notification replaces paging for on-desk teams
+        </div>
+      </div>
+      <div class="sev-card" style="background:var(--blue-dim);border:1px solid rgba(116,185,255,0.3);">
+        <h4 style="color:var(--blue);">P3 — Medium</h4>
+        <p>Potential or minor impact. Replication lag, resource nearing capacity, single-node degradation with redundancy intact, elevated but non-critical error rates.</p>
+        <div class="sev-actions">
+          <strong>Who is paged:</strong> SRE only<br><br>
+          <strong>Automated actions:</strong><br>
+          ✓ Keep correlates and groups alerts<br>
+          ✓ GoAlert pages SRE on-call (SMS)<br>
+          ✓ Posted to team-specific Slack channel<br>
+          ✓ Jira incident ticket created automatically<br>
+          ✗ <em>No engineering paging</em><br>
+          ✗ <em>No incident channel</em><br>
+          ✗ <em>No status page update</em><br>
+          ○ SRE resolves or escalates to engineering manually<br>
+          ✓ During business hours: Slack notification only — no page
+        </div>
+      </div>
+      <div class="sev-card" style="background:rgba(100,100,140,0.1);border:1px solid rgba(100,100,140,0.25);">
+        <h4 style="color:var(--text-muted);">P4 — Informational</h4>
+        <p>Non-impacting. Disk usage trends, certificate expiry > 30 days, non-critical service health, maintenance reminders, capacity planning data points.</p>
+        <div class="sev-actions">
+          <strong>Who is paged:</strong> Nobody<br><br>
+          <strong>Automated actions:</strong><br>
+          ✓ Logged in Keep for tracking and trending<br>
+          ✓ Posted to #alerts-noise channel<br>
+          ✗ <em>No paging — ever</em><br>
+          ✗ <em>No Jira ticket</em><br>
+          ✗ <em>No individual notifications</em><br>
+          ○ SRE triages in batch during next business day
+        </div>
+      </div>
+    </div>
+
+    <h3>Business Hours vs. On-Call Behavior</h3>
+    <p>The platform adapts its notification strategy based on whether the SRE team is working (business hours) or on-call (evenings, weekends, holidays). This is not about reducing response quality during on-call — it's about using the right notification channel for the context.</p>
+
+    <table>
+      <thead><tr><th>Severity</th><th style="width:38%;">Business Hours (Team at Desk)</th><th style="width:38%;">On-Call (Evenings / Weekends)</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><span class="tag red">P1</span></td>
+          <td>Slack channel notification + Slack DM to team leads. <strong>No SMS/voice page needed</strong> — team is already at their desks and monitoring Slack. Incident channel still created. Jira ticket created.</td>
+          <td>Full GoAlert paging: <strong>SMS + voice call</strong> to SRE + Engineering on-call. Incident channel created. Jira ticket created. LLM analysis. Status page.</td>
+        </tr>
+        <tr>
+          <td><span class="tag orange">P2</span></td>
+          <td>Slack channel notification + Slack DM. No page. Jira ticket created. SRE investigates from desk.</td>
+          <td><strong>SMS + voice page</strong> to SRE + Engineering on-call. Jira ticket created. LLM analysis.</td>
+        </tr>
+        <tr>
+          <td><span class="tag blue">P3</span></td>
+          <td>Slack channel notification only. Jira ticket created. SRE picks up during regular workflow.</td>
+          <td><strong>SMS page to SRE on-call only.</strong> Jira ticket created. No engineering notification.</td>
+        </tr>
+        <tr>
+          <td><span class="tag" style="background:rgba(100,100,140,0.15);color:var(--text-muted);">P4</span></td>
+          <td>Slack #alerts-noise. Triaged in batch.</td>
+          <td>Slack #alerts-noise. <strong>No page. No notification.</strong> Handled next business day.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <strong>How Business Hours Are Determined</strong>
+      n8n workflows check a schedule configuration (a simple JSON object or GoAlert schedule API) before deciding whether to trigger GoAlert paging or Slack-only notification. This is not hardcoded — it respects holidays, schedule overrides, and timezone for distributed team members. If the schedule says someone is on-desk, Slack is sufficient. If the schedule says on-call, GoAlert pages via SMS/voice. The same alert, same severity, same response — just a different notification channel.
+    </div>
+
+    <h3>Jira Integration — Automatic Incident Ticketing</h3>
+    <p>For P1, P2, and P3 alerts, the platform automatically creates a Jira incident ticket via n8n workflow. This ensures every significant alert has a tracking artifact, even if it is resolved quickly by the SRE team without engineering involvement.</p>
+
+    <table>
+      <thead><tr><th>Severity</th><th>Jira Ticket?</th><th>Jira Priority</th><th>Auto-Assign</th></tr></thead>
+      <tbody>
+        <tr><td><span class="tag red">P1</span></td><td style="color:var(--green);font-weight:600;">✓ Yes — auto-created</td><td>Blocker</td><td>Current on-call (SRE + Engineering)</td></tr>
+        <tr><td><span class="tag orange">P2</span></td><td style="color:var(--green);font-weight:600;">✓ Yes — auto-created</td><td>Critical</td><td>Current on-call (SRE + Engineering)</td></tr>
+        <tr><td><span class="tag blue">P3</span></td><td style="color:var(--green);font-weight:600;">✓ Yes — auto-created</td><td>Major</td><td>Current SRE on-call</td></tr>
+        <tr><td><span class="tag" style="background:rgba(100,100,140,0.15);color:var(--text-muted);">P4</span></td><td style="color:var(--text-dim);">✗ No</td><td>—</td><td>—</td></tr>
+      </tbody>
+    </table>
+
+    <p>The Jira ticket includes: alert summary, correlated alerts (from Keep), affected service, source monitoring tool, Grafana dashboard link, LLM analysis (if generated), and the Keep incident URL. When the incident is resolved in Keep, n8n updates the Jira ticket status automatically and attaches resolution notes.</p>
+
+    <h3>Keep Workflow — Severity-Based Routing</h3>
+    <div class="code-block">workflow:
+  id: severity-routing
+  description: Route alerts by severity with business-hours awareness
+  triggers:
+    - type: alert
+  actions:
+    # ── P1 — Critical ──────────────────────────
+    - name: p1-slack-notify
+      if: "'{{ alert.severity }}' == 'critical'"
+      provider:
+        type: slack
+        config: "{{ providers.slack-incidents }}"
+      with:
+        message: "🔴 *P1 CRITICAL* — {{ alert.name }} ..."
+
+    - name: p1-page-oncall          # n8n checks business hours
+      if: "'{{ alert.severity }}' == 'critical'"
+      provider:
+        type: webhook
+      with:
+        url: "https://n8n.internal/webhook/severity-router"
+        body: '{"severity":"P1","alert":"{{ alert }}"}'
+        # n8n decides: GoAlert page (on-call) or Slack DM (business hours)
+        # n8n also creates Jira ticket + incident channel
+
+    # ── P2 — Major ─────────────────────────────
+    - name: p2-slack-notify
+      if: "'{{ alert.severity }}' == 'high'"
+      provider:
+        type: slack
+        config: "{{ providers.slack-team-channel }}"
+      with:
+        message: "🟠 *P2 MAJOR* — {{ alert.name }} ..."
+
+    - name: p2-page-and-ticket
+      if: "'{{ alert.severity }}' == 'high'"
+      provider:
+        type: webhook
+      with:
+        url: "https://n8n.internal/webhook/severity-router"
+        body: '{"severity":"P2","alert":"{{ alert }}"}'
+
+    # ── P3 — Medium ────────────────────────────
+    - name: p3-slack-notify
+      if: "'{{ alert.severity }}' == 'warning'"
+      provider:
+        type: slack
+        config: "{{ providers.slack-team-channel }}"
+      with:
+        message: "🟡 *P3 MEDIUM* — {{ alert.name }} — SRE investigating"
+
+    - name: p3-page-sre-and-ticket
+      if: "'{{ alert.severity }}' == 'warning'"
+      provider:
+        type: webhook
+      with:
+        url: "https://n8n.internal/webhook/severity-router"
+        body: '{"severity":"P3","alert":"{{ alert }}"}'
+
+    # ── P4 — Informational ─────────────────────
+    - name: p4-noise-channel
+      if: "'{{ alert.severity }}' in ['info', 'low']"
+      provider:
+        type: slack
+        config: "{{ providers.slack-noise }}"
+      with:
+        message: "🔵 *P4 INFO* — {{ alert.name }}"</div>
+
+    <div class="callout success">
+      <strong>The n8n Severity Router — The Intelligence Layer</strong>
+      All P1–P3 alerts route through an n8n webhook (<code>/webhook/severity-router</code>) that acts as the decision engine. It checks: (1) Is the affected team currently in business hours or on-call? (2) Based on severity + schedule, should this be a GoAlert page or Slack-only? (3) Create the Jira ticket with appropriate priority. (4) For P1: also create the incident channel, trigger LLM analysis, and update the status page. This single n8n workflow is the "brain" that adapts alert behavior to context.
+    </div>
+  </div>
+</div>
+
+<!-- S04: REQUIREMENTS -->
+<div class="section" id="s04">
+  <div class="container">
+    <div class="section-num">Section 04</div>
+    <h2>Infrastructure Requirements</h2>
+    <p class="section-intro">Sized for Tucows Domains' operational scale: ~24 million domains under management, ~17 million on the registry platform, hundreds of thousands of EPP transactions daily, 350+ Anycast DNS nodes, and 7+ monitoring instances generating thousands of alerts per day.</p>
+
+    <h3>Compute Requirements</h3>
+    <table>
+      <thead><tr><th>Component</th><th>vCPU</th><th>RAM</th><th>Storage</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Keep</strong></td><td>4–8</td><td>8–16 GB</td><td>50 GB (PostgreSQL)</td><td>Sized for 7+ alert sources, thousands of daily alerts, AI correlation engine</td></tr>
+        <tr><td><strong>GoAlert</strong></td><td>2</td><td>2–4 GB</td><td>20 GB (PostgreSQL)</td><td>Lightweight even at scale. 12+ services, 30+ engineers on rotations</td></tr>
+        <tr><td><strong>n8n</strong></td><td>4–8</td><td>8–16 GB</td><td>20 GB (PostgreSQL)</td><td>8+ concurrent workflows, high-frequency webhook processing</td></tr>
+        <tr><td><strong>Grafana Loki</strong></td><td>8–16</td><td>16–32 GB</td><td>S3/MinIO object store</td><td>Hundreds of GBs/day of logs from 4 Zabbix + K8s + VMs + network devices</td></tr>
+        <tr><td><strong>Fluent Bit</strong> <small>(per node)</small></td><td>0.2</td><td>128 MB</td><td>Minimal</td><td>DaemonSet. Multiply by node count (~100s of nodes)</td></tr>
+        <tr><td><strong>OTel Collector</strong> <small>(gateway)</small></td><td>4</td><td>4 GB</td><td>Minimal</td><td>2 gateway instances for HA</td></tr>
+        <tr><td><strong>Uptime Kuma</strong></td><td>1</td><td>1 GB</td><td>10 GB (SQLite)</td><td>100+ monitors for all customer-facing endpoints</td></tr>
+        <tr><td><strong>Ollama</strong></td><td colspan="3" style="color:var(--green);font-weight:500;">Runs on existing H200 GPU cluster — no new compute required</td><td>50–100 GB model storage on cluster</td></tr>
+        <tr style="background:var(--surface2);font-weight:600;">
+          <td>Total (new, excluding LLM)</td><td>~23–43</td><td>~40–72 GB</td><td>~100 GB + object store</td><td>Fits in a dedicated K8s namespace</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>External Dependencies &amp; Costs</h3>
+    <table>
+      <thead><tr><th>Service</th><th>Purpose</th><th>Monthly Cost</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Twilio</strong></td><td>SMS + voice for GoAlert paging</td><td>$100–300</td></tr>
+        <tr><td><strong>LLM Inference</strong></td><td>Alert analysis, postmortems, runbook matching</td><td style="color:var(--green);font-weight:600;">$0 — H200 cluster</td></tr>
+        <tr><td><strong>S3 / MinIO</strong></td><td>Loki log storage</td><td>$0.023/GB on S3 (or $0 on-prem MinIO)</td></tr>
+        <tr><td><strong>SMTP</strong></td><td>Email notifications</td><td>~$0 (existing relay)</td></tr>
+        <tr style="background:var(--surface2);font-weight:600;">
+          <td>Total incremental</td><td></td><td>$100–300/mo + infra compute</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Slack Configuration</h3>
+    <table>
+      <thead><tr><th>Channel</th><th>Purpose</th><th>Alert Tier</th></tr></thead>
+      <tbody>
+        <tr><td><code>#incidents</code></td><td>All declared incidents — command center</td><td><span class="tag red">P1 only</span></td></tr>
+        <tr><td><code>#incidents-p1</code></td><td>P1/critical only — leadership visibility</td><td><span class="tag red">P1 only</span></td></tr>
+        <tr><td><code>#alerts-infra</code></td><td>Network, bare-metal, DNS (Infra Zabbix)</td><td><span class="tag orange">P1+P2</span></td></tr>
+        <tr><td><code>#alerts-opensrs</code></td><td>OpenSRS platform alerts (OpenSRS Zabbix + Grafana)</td><td><span class="tag orange">P1+P2</span></td></tr>
+        <tr><td><code>#alerts-registry</code></td><td>TRS alerts (TRS Grafana + TRS Icinga)</td><td><span class="tag orange">P1+P2</span></td></tr>
+        <tr><td><code>#alerts-cloud</code></td><td>AWS, OpenStack, Kubernetes</td><td><span class="tag orange">P1+P2</span></td></tr>
+        <tr><td><code>#alerts-enom</code></td><td>Enom platform alerts (Enom Zabbix)</td><td><span class="tag orange">P1+P2</span></td></tr>
+        <tr><td><code>#alerts-ascio</code></td><td>Ascio platform alerts (Ascio Zabbix)</td><td><span class="tag orange">P1+P2</span></td></tr>
+        <tr><td><code>#alerts-noise</code></td><td>P4 informational — next business day triage</td><td><span class="tag" style="background:rgba(100,100,140,0.15);color:var(--text-muted);">P4</span></td></tr>
+        <tr><td><code>#oncall-log</code></td><td>Handoffs, schedule changes</td><td>—</td></tr>
+        <tr><td><code>#inc-YYYY-MMDD-*</code></td><td>Per-incident channels (created by n8n on P1 only)</td><td><span class="tag red">P1 only</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- S05: PHASE 1 -->
+<div class="section" id="s05">
+  <div class="container">
+    <div class="phase-badge"><div class="pb-dot" style="background:var(--accent);"></div> Phase 1 · Weeks 1–4</div>
+    <div class="section-num">Section 05</div>
+    <h2>Phase 1 — Alert Unification with Keep</h2>
+    <p class="section-intro">Deploy Keep and connect all 7+ monitoring instances. The goal: a single pane of glass for every alert across Tucows Domains, with deduplication and correlation reducing noise from day one.</p>
+
+    <h3>Alert Source → Keep Integration Map</h3>
+    <table>
+      <thead><tr><th>Source</th><th>Integration</th><th>Effort</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Zabbix — OpenSRS</strong></td><td>Native Keep Zabbix provider. Auto-configures webhook media type.</td><td><span class="tag green">Low</span></td></tr>
+        <tr><td><strong>Zabbix — Ascio</strong></td><td>Native Keep Zabbix provider. Separate provider instance per Zabbix.</td><td><span class="tag green">Low</span></td></tr>
+        <tr><td><strong>Zabbix — Enom</strong></td><td>Native Keep Zabbix provider.</td><td><span class="tag green">Low</span></td></tr>
+        <tr><td><strong>Zabbix — Infrastructure</strong></td><td>Native Keep Zabbix provider.</td><td><span class="tag green">Low</span></td></tr>
+        <tr><td><strong>Grafana — OpenSRS</strong></td><td>Native Keep Grafana provider. Add webhook contact point.</td><td><span class="tag green">Low</span></td></tr>
+        <tr><td><strong>Grafana — TRS</strong></td><td>Native Keep Grafana provider. Add webhook contact point.</td><td><span class="tag green">Low</span></td></tr>
+        <tr><td><strong>Icinga — TRS</strong></td><td>Custom webhook notification command → Keep generic endpoint.</td><td><span class="tag orange">Medium</span></td></tr>
+        <tr><td><strong>Prometheus/Alertmanager</strong></td><td>Native Keep Prometheus provider. Add Keep as webhook receiver.</td><td><span class="tag green">Low</span></td></tr>
+        <tr><td><strong>AWS CloudWatch</strong></td><td>Keep CloudWatch provider (pull) or SNS → Keep webhook.</td><td><span class="tag orange">Medium</span></td></tr>
+      </tbody>
+    </table>
+
+    <h3>Phase 1 Deliverables</h3>
+    <ul class="checklist">
+      <li><div class="check-icon"></div>Keep deployed on K8s namespace and accessible at internal URL</li>
+      <li><div class="check-icon"></div>All 9 monitoring sources connected as Keep providers</li>
+      <li><div class="check-icon"></div>Severity-based routing workflows sending P1/P2/P3 to correct Slack channels</li>
+      <li><div class="check-icon"></div>Deduplication reducing alert noise by 30–60% across all sources</li>
+      <li><div class="check-icon"></div>AI correlation grouping related alerts (e.g., Zabbix Infra + TRS Grafana) into single incidents</li>
+      <li><div class="check-icon"></div>Source tagging — every alert in Keep shows which Zabbix/Grafana/Icinga instance it came from</li>
+    </ul>
+  </div>
+</div>
+
+<!-- S06: PHASE 2 -->
+<div class="section" id="s06">
+  <div class="container">
+    <div class="phase-badge"><div class="pb-dot" style="background:var(--green);"></div> Phase 2 · Weeks 3–6</div>
+    <div class="section-num">Section 06</div>
+    <h2>Phase 2 — On-Call &amp; Escalation with GoAlert</h2>
+    <p class="section-intro">Deploy GoAlert for on-call scheduling and paging. Define services mapped to Tucows Domains business units. GoAlert is triggered only for P1 alerts — P2 alerts are handled by SRE without paging.</p>
+
+    <h3>GoAlert Service Map</h3>
+    <table>
+      <thead><tr><th>Service</th><th>Alert Sources</th><th>Team</th></tr></thead>
+      <tbody>
+        <tr><td><code>dns-anycast-global</code></td><td>Zabbix-Infra, TRS Grafana</td><td>DNS / Network</td></tr>
+        <tr><td><code>registry-epp</code></td><td>TRS Grafana, TRS Icinga</td><td>Registry Platform</td></tr>
+        <tr><td><code>registry-rdap-whois</code></td><td>TRS Grafana, TRS Icinga</td><td>Registry Platform</td></tr>
+        <tr><td><code>opensrs-platform</code></td><td>Zabbix-OpenSRS, Grafana-OpenSRS</td><td>OpenSRS</td></tr>
+        <tr><td><code>enom-platform</code></td><td>Zabbix-Enom</td><td>Enom</td></tr>
+        <tr><td><code>ascio-platform</code></td><td>Zabbix-Ascio</td><td>Ascio</td></tr>
+        <tr><td><code>hover-platform</code></td><td>Grafana-OpenSRS (shared)</td><td>Hover</td></tr>
+        <tr><td><code>aws-infrastructure</code></td><td>CloudWatch, Prometheus</td><td>Cloud / SRE</td></tr>
+        <tr><td><code>openstack-infra</code></td><td>Prometheus, Zabbix-Infra</td><td>Cloud / SRE</td></tr>
+        <tr><td><code>kubernetes-clusters</code></td><td>Prometheus</td><td>Cloud / SRE</td></tr>
+        <tr><td><code>network-core</code></td><td>Zabbix-Infra</td><td>Network</td></tr>
+        <tr><td><code>databases</code></td><td>Zabbix-Infra, Prometheus</td><td>DBA / SRE</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Escalation Policy — DNS Critical Example</h3>
+    <div class="diagram" style="padding:24px;">
+      <div style="display:flex;flex-direction:column;gap:10px;">
+        <div style="display:flex;align-items:center;gap:12px;"><div style="width:80px;text-align:right;font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;">t+0 min</div><div style="width:12px;height:12px;border-radius:50%;background:var(--green);flex-shrink:0;"></div><div style="font-size:14px;">Notify on-call from <strong>DNS Primary Rotation</strong></div></div>
+        <div style="display:flex;align-items:center;gap:12px;"><div style="width:80px;text-align:right;font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;">t+5 min</div><div style="width:12px;height:12px;border-radius:50%;background:var(--orange);flex-shrink:0;"></div><div style="font-size:14px;">Notify on-call from <strong>DNS Secondary Rotation</strong></div></div>
+        <div style="display:flex;align-items:center;gap:12px;"><div style="width:80px;text-align:right;font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;">t+15 min</div><div style="width:12px;height:12px;border-radius:50%;background:var(--red);flex-shrink:0;"></div><div style="font-size:14px;">Notify <strong>SRE Manager Rotation</strong></div></div>
+        <div style="display:flex;align-items:center;gap:12px;"><div style="width:80px;text-align:right;font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;">t+30 min</div><div style="width:12px;height:12px;border-radius:50%;background:var(--accent);flex-shrink:0;"></div><div style="font-size:14px;">Notify <strong>VP Engineering</strong> — loop back to step 1</div></div>
+      </div>
+    </div>
+
+    <div class="callout">
+      <strong>Paging Behavior Adapts to Context</strong>
+      GoAlert paging is triggered for <strong>P1, P2, and P3</strong> — but the who and how adapts. P1 and P2 page both SRE and Engineering. P3 pages SRE only. During business hours, when teams are at their desks, Slack notifications replace SMS/voice pages — there is no need to page someone who is already monitoring their channels. The n8n severity router checks the schedule before deciding which notification path to use. Engineers can always manually escalate from any severity level using the "Escalate" button in Slack.
+    </div>
+  </div>
+</div>
+
+<!-- S07: PHASE 3 -->
+<div class="section" id="s07">
+  <div class="container">
+    <div class="phase-badge"><div class="pb-dot" style="background:var(--orange);"></div> Phase 3 · Weeks 5–10</div>
+    <div class="section-num">Section 07</div>
+    <h2>Phase 3 — Automation &amp; Slack Workflows</h2>
+    <p class="section-intro">Deploy n8n as the automation backbone. Build workflows that power slash commands, interactive buttons, LLM analysis, severity-aware escalation, vendor contact, and mass notifications.</p>
+
+    <div class="card-grid">
+      <div class="card"><div class="card-icon">🚨</div><h4>WF1: Incident Declaration</h4><p><code>/incident</code> — Creates incident in Keep, spins up Slack channel, invites on-call. <strong>Only triggered for P1</strong> — manually or automatically via severity routing. Jira ticket auto-created for P1–P3.</p></div>
+      <div class="card"><div class="card-icon">🤖</div><h4>WF2: LLM Alert Analysis</h4><p>On P1/P2/P3: queries Prometheus + Loki + deploy API → sends to Ollama on H200 cluster → posts structured analysis to Slack. Context-rich root cause hypothesis in under 3 seconds.</p></div>
+      <div class="card"><div class="card-icon">✅</div><h4>WF3: Slack Action Buttons</h4><p>Acknowledge (SRE handles), Escalate (promotes severity / triggers additional paging), Resolve (closes Keep + GoAlert + updates Jira + status page), Silence (mute 1hr).</p></div>
+      <div class="card"><div class="card-icon">📅</div><h4>WF4: On-Call Query</h4><p><code>/oncall</code> — queries GoAlert GraphQL API, replies with current on-call for each service.</p></div>
+      <div class="card"><div class="card-icon">📊</div><h4>WF5: Status Page</h4><p><code>/status</code> for queries. Auto-updates Uptime Kuma on P1 incident state changes. No updates for P2/P3.</p></div>
+      <div class="card"><div class="card-icon">📞</div><h4>WF6: Vendor Contact</h4><p>Upstream issue → look up vendor NOC → send templated email → create tracking ticket → post to incident channel.</p></div>
+      <div class="card"><div class="card-icon">📢</div><h4>WF7: Mass Notification</h4><p>Tiered fan-out. Tier 1: SRE (Slack). Tier 2: Engineering (Slack + page). Tier 3: Leadership + customer teams (email + status page).</p></div>
+      <div class="card"><div class="card-icon">📝</div><h4>WF8: Postmortem Draft</h4><p>On P1 resolve: gather timeline + Slack conversation → Ollama → structured postmortem document auto-generated in wiki.</p></div>
+    </div>
+
+    <h3>What a P1 Slack Alert Looks Like</h3>
+    <div class="slack-mock">
+      <div class="sm-header"><div class="sm-avatar">🔔</div><div><span class="sm-name">Keep Alert Platform</span> <span class="sm-time">2:23 PM</span></div></div>
+      <div class="sm-body">
+        🔴 <strong>P1 CRITICAL — DNS query error rate > 5% (EU region)</strong>
+        <hr class="sm-divider">
+        <strong>Correlated Incident:</strong> INC-2026-0142 (3 alerts from Zabbix-Infra, TRS Grafana, TRS Icinga)<br>
+        <strong>Service:</strong> dns-anycast-global · <strong>On-Call:</strong> @john.smith<br>
+        <hr class="sm-divider">
+        <a class="sm-link" href="#">📊 Grafana</a> · <a class="sm-link" href="#">📖 Runbook</a> · <a class="sm-link" href="#">🔍 Keep</a>
+      </div>
+      <div class="sm-buttons">
+        <div class="sm-btn primary">✓ Acknowledge</div>
+        <div class="sm-btn">⬆ Escalate</div>
+        <div class="sm-btn danger">📢 Declare Incident</div>
+      </div>
+    </div>
+
+    <h3>What a P2 (Major) Slack Alert Looks Like</h3>
+    <div class="slack-mock">
+      <div class="sm-header"><div class="sm-avatar">🔔</div><div><span class="sm-name">Keep Alert Platform</span> <span class="sm-time">9:47 AM</span></div></div>
+      <div class="sm-body">
+        🟠 <strong>P2 MAJOR — OpenSRS API error rate > 2% across EU endpoints</strong>
+        <hr class="sm-divider">
+        <strong>Source:</strong> Grafana-OpenSRS, Zabbix-OpenSRS · <strong>Jira:</strong> <a class="sm-link" href="#">INC-4821</a> (auto-created)<br>
+        <strong>On-Call:</strong> SRE: @sarah.chen · Eng: @mike.torres
+      </div>
+      <div class="sm-buttons">
+        <div class="sm-btn primary">✓ Acknowledge</div>
+        <div class="sm-btn">⬆ Escalate to P1</div>
+        <div class="sm-btn">🔇 Silence 1hr</div>
+      </div>
+    </div>
+
+    <h3>What a P3 (Medium) Slack Alert Looks Like</h3>
+    <div class="slack-mock">
+      <div class="sm-header"><div class="sm-avatar">🔔</div><div><span class="sm-name">Keep Alert Platform</span> <span class="sm-time">3:12 PM</span></div></div>
+      <div class="sm-body">
+        🟡 <strong>P3 MEDIUM — MySQL replication lag > 10s on opensrs-db-replica-03</strong>
+        <hr class="sm-divider">
+        <strong>Source:</strong> Zabbix-OpenSRS · <strong>SRE:</strong> @sarah.chen · <strong>Jira:</strong> <a class="sm-link" href="#">INC-4823</a> (auto-created)<br>
+        <em>SRE investigating — no engineering escalation unless manually triggered.</em>
+      </div>
+      <div class="sm-buttons">
+        <div class="sm-btn primary">✓ Acknowledge</div>
+        <div class="sm-btn">⬆ Escalate to Engineering</div>
+        <div class="sm-btn">🔇 Silence 1hr</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- S08: PHASE 4 -->
+<div class="section" id="s08">
+  <div class="container">
+    <div class="phase-badge"><div class="pb-dot" style="background:var(--blue);"></div> Phase 4 · Weeks 8–12</div>
+    <div class="section-num">Section 08</div>
+    <h2>Phase 4 — Log Consolidation with Grafana Loki</h2>
+    <p class="section-intro">Deploy Loki as the centralized log backend. Ship logs from Kubernetes, bare-metal, VMs, and network devices via Fluent Bit. Logs become queryable in Grafana and power the LLM analysis pipeline.</p>
+
+    <div class="diagram">
+      <div class="diagram-title">Log Pipeline — Collection → Storage → Consumption</div>
+      <div class="arch">
+        <div class="arch-layer data"><div class="arch-layer-label">Sources</div><div class="arch-boxes"><div class="arch-box"><strong>K8s Pods</strong><small>stdout/stderr</small></div><div class="arch-box"><strong>VMs &amp; Bare-Metal</strong><small>syslog, app logs</small></div><div class="arch-box"><strong>Network Devices</strong><small>syslog forward</small></div><div class="arch-box"><strong>Applications</strong><small>Structured JSON</small></div></div></div>
+        <div class="arch-arrow">↓</div>
+        <div class="arch-layer incident"><div class="arch-layer-label">Shipping</div><div class="arch-boxes"><div class="arch-box"><strong>Fluent Bit</strong><small>DaemonSet + VM agents</small></div><div class="arch-box"><strong>OTel Collector</strong><small>Gateway for traces/logs</small></div></div></div>
+        <div class="arch-arrow">↓</div>
+        <div class="arch-layer orchestration"><div class="arch-layer-label">Storage</div><div class="arch-boxes"><div class="arch-box" style="flex:2;"><strong>Grafana Loki</strong><small>Label-indexed · S3/MinIO backend</small></div></div></div>
+        <div class="arch-arrow">↓</div>
+        <div class="arch-layer operator"><div class="arch-layer-label">Consumption</div><div class="arch-boxes"><div class="arch-box"><strong>Grafana</strong><small>LogQL queries</small></div><div class="arch-box"><strong>n8n → Ollama</strong><small>Log context for LLM</small></div><div class="arch-box"><strong>Keep</strong><small>Alert enrichment</small></div></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- S09: PHASE 5 — LLM on H200 -->
+<div class="section" id="s09">
+  <div class="container">
+    <div class="phase-badge"><div class="pb-dot" style="background:var(--cyan);"></div> Phase 5 · Weeks 10–14</div>
+    <div class="section-num">Section 09</div>
+    <h2>Phase 5 — LLM Integration on H200 Cluster</h2>
+    <p class="section-intro">Deploy Ollama on the existing H200 GPU cluster for self-hosted LLM inference. Zero incremental cost. Full data sovereignty — no alert data leaves your network. H200s provide massive throughput for real-time alert analysis.</p>
+
+    <h3>Why H200s Change the Equation</h3>
+    <table>
+      <thead><tr><th>Factor</th><th>H200 Cluster (Self-Hosted)</th><th>Cloud LLM API (for comparison)</th></tr></thead>
+      <tbody>
+        <tr><td>Cost</td><td style="color:var(--green);font-weight:600;">$0 incremental — hardware exists</td><td>$50–200+/mo</td></tr>
+        <tr><td>Data privacy</td><td style="color:var(--green);font-weight:600;">100% on-premises</td><td>Data leaves network</td></tr>
+        <tr><td>Model capability</td><td>Llama 3.1 405B fits in H200 memory (141 GB HBM3e per GPU). Can run the largest open-weight models.</td><td>Proprietary models (GPT-4, Claude)</td></tr>
+        <tr><td>Latency</td><td><strong>~1–3 seconds</strong> for 1K output tokens on 405B. Sub-second on 70B models.</td><td>2–5 seconds</td></tr>
+        <tr><td>Throughput</td><td>H200 provides ~2x A100 on FP8 inference. Can handle dozens of concurrent analysis requests.</td><td>Rate limited by API quotas</td></tr>
+        <tr><td>Availability</td><td>Independent of external services — works during internet outages (when you need it most)</td><td>Depends on provider uptime</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Recommended Model Stack</h3>
+    <table>
+      <thead><tr><th>Use Case</th><th>Model</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Alert analysis (real-time)</strong></td><td>Qwen 2.5 72B or Llama 3.1 70B</td><td>Fast inference (~1s on H200). Excellent reasoning. Good balance of speed and quality for real-time Slack responses.</td></tr>
+        <tr><td><strong>Postmortem generation</strong></td><td>Llama 3.1 405B</td><td>Highest quality for long-form structured writing. Latency less critical (generated after incident resolution). Fits in H200 HBM3e memory.</td></tr>
+        <tr><td><strong>Runbook matching</strong></td><td>Qwen 2.5 72B with RAG</td><td>Pair with a vector database (Chroma or Qdrant, also self-hosted) for retrieval-augmented generation over your runbook repository.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Deployment</h3>
+    <div class="code-block"># Deploy Ollama on H200 cluster (GPU-enabled container)
+docker run -d \
+  --name ollama \
+  --gpus all \
+  --restart unless-stopped \
+  -p 11434:11434 \
+  -v /data/ollama:/root/.ollama \
+  ollama/ollama
+
+# Pull models
+docker exec ollama ollama pull qwen2.5:72b      # Real-time analysis
+docker exec ollama ollama pull llama3.1:405b     # Postmortems
+
+# n8n calls Ollama via HTTP:
+# POST http://ollama-host:11434/api/generate
+# { "model": "qwen2.5:72b", "prompt": "...", "stream": false }</div>
+
+    <h3>LLM Use Cases</h3>
+    <div class="card-grid">
+      <div class="card"><div class="card-icon">🔍</div><h4>Alert Analysis</h4><p>Assemble alert + metrics + logs + deploy context → Ollama → root cause hypothesis, confidence, first step, blast radius. Posted to Slack in &lt;3 seconds.</p></div>
+      <div class="card"><div class="card-icon">📝</div><h4>Postmortem Drafts</h4><p>After P1 resolution: incident timeline + Slack conversation + resolution → Llama 405B → structured postmortem document in wiki.</p></div>
+      <div class="card"><div class="card-icon">📖</div><h4>Runbook Matching</h4><p>Alert pattern → RAG search over runbook repository → suggest relevant runbook with specific steps highlighted.</p></div>
+      <div class="card"><div class="card-icon">⚠️</div><h4>Change Risk Assessment</h4><p>Pre-deploy: change description + system health → risk assessment considering current alert state and recent incident history.</p></div>
+    </div>
+
+    <div class="callout warn">
+      <strong>Safety Principle</strong>
+      LLM output is always "suggested analysis" — never auto-remediation. A human engineer reviews and acts on every recommendation. The LLM accelerates diagnosis; it doesn't replace judgment.
+    </div>
+  </div>
+</div>
+
+<!-- S10: PHASE 6 -->
+<div class="section" id="s10">
+  <div class="container">
+    <div class="phase-badge"><div class="pb-dot" style="background:var(--red);"></div> Phase 6 · Weeks 14–22</div>
+    <div class="section-num">Section 10</div>
+    <h2>Phase 6 — Custom Frontend Portal</h2>
+    <p class="section-intro">Build a React/Next.js "command center" that consumes APIs from all backend tools. Provides a unified web interface for proactive monitoring, incident management, and analytics — complementing the Slack-centric workflow.</p>
+
+    <table>
+      <thead><tr><th>Page</th><th>Data Sources</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Command Center</strong></td><td>Keep, GoAlert, Uptime Kuma, Grafana</td><td>Real-time: active incidents, on-call, service health grid, alert volume</td></tr>
+        <tr><td><strong>Incident Detail</strong></td><td>Keep, Grafana (embed), Ollama</td><td>Full timeline, correlated alerts, LLM analysis, responders, dashboards</td></tr>
+        <tr><td><strong>On-Call Management</strong></td><td>GoAlert GraphQL</td><td>View/edit schedules, overrides, rotations</td></tr>
+        <tr><td><strong>Service Catalog</strong></td><td>Keep, Grafana, GoAlert</td><td>All services with health, SLO burn rate, incidents, runbooks</td></tr>
+        <tr><td><strong>Alert Explorer</strong></td><td>Keep REST API</td><td>Search/filter all alerts by source, severity, service, time</td></tr>
+        <tr><td><strong>Analytics</strong></td><td>Keep, Grafana</td><td>MTTD, MTTA, MTTR trends. Noise metrics. SLO dashboards.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- S11: E2E FLOW -->
+<div class="section" id="s11">
+  <div class="container">
+    <div class="section-num">Section 11</div>
+    <h2>End-to-End Incident Flow</h2>
+    <p class="section-intro">A P1 scenario: BGP route leak causes 3 EU Anycast DNS nodes to become unreachable. The engineer resolves it in 23 minutes without leaving Slack. Contrast with a P2 scenario handled entirely by SRE.</p>
+
+    <h3>P1 Scenario — DNS EU Anycast BGP Route Leak</h3>
+    <div class="diagram" style="padding:24px;">
+      <div class="diagram-title">Incident Timeline</div>
+      <div style="display:flex;flex-direction:column;gap:0;">
+        <div class="flow-step"><div class="flow-time">14:23:00</div><div class="flow-dot-col"><div class="flow-dot red"></div><div class="flow-line"></div></div><div class="flow-content"><div class="flow-label" style="color:var(--red);">Alert Sources</div><p>Zabbix-Infra: 3 EU nodes unreachable. TRS Grafana: DNS error rate > 5%. TRS Icinga: BGP session down on fra-edge-01. <strong>Three alerts from three different monitoring tools.</strong></p></div></div>
+        <div class="flow-step"><div class="flow-time">14:23:02</div><div class="flow-dot-col"><div class="flow-dot"></div><div class="flow-line"></div></div><div class="flow-content"><div class="flow-label" style="color:var(--accent-light);">Keep</div><p>All 3 arrive in Keep. <strong>Deduplicates, correlates into INC-2026-0142.</strong> Severity: Critical → P1 workflow fires.</p></div></div>
+        <div class="flow-step"><div class="flow-time">14:23:05</div><div class="flow-dot-col"><div class="flow-dot green"></div><div class="flow-line"></div></div><div class="flow-content"><div class="flow-label" style="color:var(--green);">GoAlert</div><p>Keep triggers GoAlert for dns-anycast-global. GoAlert pages John (DNS primary) via SMS. Simultaneously posts to #alerts-registry.</p></div></div>
+        <div class="flow-step"><div class="flow-time">14:24:30</div><div class="flow-dot-col"><div class="flow-dot" style="background:var(--cyan);"></div><div class="flow-line"></div></div><div class="flow-content"><div class="flow-label" style="color:var(--cyan);">Ollama on H200</div><p>n8n queries Prometheus + Loki + deploy API → sends to Qwen 72B on H200 cluster → analysis in <strong>1.2 seconds</strong>: "BGP route leak. 3/12 EU PoPs. ~30% of global DNS volume. Check BGP on fra-edge-01."</p></div></div>
+        <div class="flow-step"><div class="flow-time">14:25:30</div><div class="flow-dot-col"><div class="flow-dot orange"></div><div class="flow-line"></div></div><div class="flow-content"><div class="flow-label" style="color:var(--orange);">Engineer</div><p>John opens Slack. Sees alert + LLM analysis. Clicks <strong>Acknowledge</strong>. Types <code>/incident DNS EU Anycast BGP leak P1</code>. n8n creates #inc-2026-0225-dns-eu-bgp.</p></div></div>
+        <div class="flow-step"><div class="flow-time">14:30:00</div><div class="flow-dot-col"><div class="flow-dot orange"></div><div class="flow-line"></div></div><div class="flow-content"><div class="flow-label" style="color:var(--orange);">Vendor Contact</div><p>John confirms upstream BGP issue. n8n sends templated email to provider NOC. Uptime Kuma updated: "DNS — Degraded."</p></div></div>
+        <div class="flow-step"><div class="flow-time">14:45:00</div><div class="flow-dot-col"><div class="flow-dot green"></div></div><div class="flow-content"><p><strong style="color:var(--green);">Resolved in 23 minutes. Engineer never left Slack. Postmortem draft auto-generated via Llama 405B.</strong></p></div></div>
+      </div>
+    </div>
+
+    <h3>P3 Scenario — MySQL Replication Lag (SRE Handles, Business Hours)</h3>
+    <div class="diagram" style="padding:24px;">
+      <div class="diagram-title">SRE-Handled Alert — No Engineering Involvement</div>
+      <div style="display:flex;flex-direction:column;gap:0;">
+        <div class="flow-step"><div class="flow-time">15:12:00</div><div class="flow-dot-col"><div class="flow-dot orange"></div><div class="flow-line"></div></div><div class="flow-content"><p>Zabbix-OpenSRS fires: replication lag > 10s on opensrs-db-replica-03. Keep receives, classifies as P3 Medium.</p></div></div>
+        <div class="flow-step"><div class="flow-time">15:12:02</div><div class="flow-dot-col"><div class="flow-dot blue"></div><div class="flow-line"></div></div><div class="flow-content"><p>Keep posts to <strong>#alerts-opensrs</strong> with buttons. n8n severity router checks schedule: <strong>business hours → Slack notification only, no SMS page.</strong> Jira ticket INC-4823 auto-created (Priority: Major). SRE on-call Sarah sees it in Slack.</p></div></div>
+        <div class="flow-step"><div class="flow-time">15:13:00</div><div class="flow-dot-col"><div class="flow-dot orange"></div><div class="flow-line"></div></div><div class="flow-content"><p>Sarah clicks Acknowledge. Checks Grafana (linked from alert). Sees replica had a write spike during batch job. Lag recovering.</p></div></div>
+        <div class="flow-step"><div class="flow-time">15:20:00</div><div class="flow-dot-col"><div class="flow-dot green"></div></div><div class="flow-content"><p><strong style="color:var(--green);">Auto-resolves as lag drops below threshold. n8n updates Jira ticket to Resolved. No engineering team was bothered. SRE handled in 8 minutes. Same alert at 2 AM would have paged SRE via SMS — same response, different notification channel.</strong></p></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- S12: TIMELINE & METRICS -->
+<div class="section" id="s12">
+  <div class="container">
+    <div class="section-num">Section 12</div>
+    <h2>Timeline, Team &amp; Success Metrics</h2>
+
+    <h3>22-Week Implementation Roadmap</h3>
+    <div class="diagram" style="padding:32px 16px;">
+      <div class="timeline">
+        <div class="tl-item"><div class="tl-dot" style="background:var(--accent);"></div><div class="tl-label">Phase 1</div><div class="tl-weeks">Wk 1–4</div><div class="tl-desc">Alert Unification<br>(Keep)</div></div>
+        <div class="tl-item"><div class="tl-dot" style="background:var(--green);"></div><div class="tl-label">Phase 2</div><div class="tl-weeks">Wk 3–6</div><div class="tl-desc">On-Call<br>(GoAlert)</div></div>
+        <div class="tl-item"><div class="tl-dot" style="background:var(--orange);"></div><div class="tl-label">Phase 3</div><div class="tl-weeks">Wk 5–10</div><div class="tl-desc">Automation<br>(n8n + Slack)</div></div>
+        <div class="tl-item"><div class="tl-dot" style="background:var(--blue);"></div><div class="tl-label">Phase 4</div><div class="tl-weeks">Wk 8–12</div><div class="tl-desc">Logs<br>(Loki)</div></div>
+        <div class="tl-item"><div class="tl-dot" style="background:var(--cyan);"></div><div class="tl-label">Phase 5</div><div class="tl-weeks">Wk 10–14</div><div class="tl-desc">LLM on H200s<br>(Ollama)</div></div>
+        <div class="tl-item"><div class="tl-dot" style="background:var(--red);"></div><div class="tl-label">Phase 6</div><div class="tl-weeks">Wk 14–22</div><div class="tl-desc">Portal<br>(React)</div></div>
+      </div>
+    </div>
+
+    <div class="callout success">
+      <strong>Key Milestone</strong>
+      Full Slack-centric operational capability at <strong>Week 10</strong> (~2.5 months). The custom portal is additive — the team operates fully from Slack while it's being built.
+    </div>
+
+    <h3>Team Requirements</h3>
+    <table>
+      <thead><tr><th>Role</th><th>Allocation</th><th>Phases</th></tr></thead>
+      <tbody>
+        <tr><td><strong>SRE Lead</strong></td><td>60–80%</td><td>All — architecture, integration design, testing</td></tr>
+        <tr><td><strong>SRE Engineer #1</strong></td><td>80–100%</td><td>Phases 1–4 — deployment, 9 monitoring source integrations</td></tr>
+        <tr><td><strong>SRE Engineer #2</strong></td><td>50–80%</td><td>Phase 3 — n8n workflows, Slack app, LLM pipeline</td></tr>
+        <tr><td><strong>Frontend Engineer</strong></td><td>80–100%</td><td>Phase 6 — React portal</td></tr>
+        <tr><td><strong>ML/Infra Engineer</strong></td><td>20–30%</td><td>Phase 5 — Ollama on H200, model selection, prompt tuning</td></tr>
+        <tr><td><strong>Each service team</strong></td><td>5–10%</td><td>Phases 1–2 — validate alerts, define escalation policies</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Success Metrics</h3>
+    <div class="metric-grid">
+      <div class="metric-card"><div class="mc-label">Tools During Incident</div><div class="mc-current">4–6 tools</div><div class="mc-target">1–2</div><div class="mc-note">Slack + Grafana</div></div>
+      <div class="metric-card"><div class="mc-label">Time to Acknowledge</div><div class="mc-current">10–30 min</div><div class="mc-target">&lt; 5 min</div><div class="mc-note">Auto-page + Slack buttons</div></div>
+      <div class="metric-card"><div class="mc-label">Alert Noise Reduction</div><div class="mc-current">High duplication</div><div class="mc-target">60–80%</div><div class="mc-note">Keep dedup across 9 sources</div></div>
+      <div class="metric-card"><div class="mc-label">MTTR Improvement</div><div class="mc-current">Varies</div><div class="mc-target">-30%</div><div class="mc-note">LLM + faster context</div></div>
+      <div class="metric-card"><div class="mc-label">Unnecessary Eng Pages</div><div class="mc-current">Frequent false pages</div><div class="mc-target">P1+P2 only</div><div class="mc-note">P3 = SRE only. P4 = nobody.</div></div>
+      <div class="metric-card"><div class="mc-label">Jira Ticket Coverage</div><div class="mc-current">Manual / inconsistent</div><div class="mc-target">100% P1–P3</div><div class="mc-note">Auto-created with full context</div></div>
+      <div class="metric-card"><div class="mc-label">On-Call vs Business TTA</div><div class="mc-current">Not measured</div><div class="mc-target">Parity (&lt;5min both)</div><div class="mc-note">Proves tooling, not headcount</div></div>
+      <div class="metric-card"><div class="mc-label">Postmortem Completion</div><div class="mc-current">Inconsistent</div><div class="mc-target">100%</div><div class="mc-note">Auto-generated drafts (P1)</div></div>
+      <div class="metric-card"><div class="mc-label">LLM Inference Cost</div><div class="mc-current">N/A</div><div class="mc-target">$0/mo</div><div class="mc-note">H200 cluster</div></div>
+      <div class="metric-card"><div class="mc-label">Cost vs. Grafana Cloud</div><div class="mc-current">Cloud pricing</div><div class="mc-target">80–90% lower</div><div class="mc-note">Infra + Twilio only</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- FOOTER -->
+<div style="padding:60px 0;border-top:1px solid var(--border);text-align:center;">
+  <div class="container">
+    <p style="color:var(--text-dim);font-size:13px;margin:0;">Tucows Domains · SRE Team · Unified Incident Management Platform · February 2026</p>
+  </div>
+</div>
+
+<script>
+function toggleInfo(id){
+  const p=document.getElementById('info-'+id);
+  const wasActive=p.classList.contains('active');
+  document.querySelectorAll('.info-panel').forEach(el=>el.classList.remove('active'));
+  if(!wasActive)p.classList.add('active');
+}
+document.addEventListener('click',function(e){
+  if(!e.target.closest('.arch-box'))document.querySelectorAll('.info-panel').forEach(el=>el.classList.remove('active'));
+});
+</script>
+</body>
+</html>
