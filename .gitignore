@@ -1,0 +1,21 @@
+# Environment and secrets
+.env
+*.pem
+*.key
+id_*
+
+# Node
+node_modules/
+.next/
+out/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/

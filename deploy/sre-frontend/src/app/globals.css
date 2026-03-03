@@ -1,0 +1,42 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background: #0a0a0f;
+  color: #ccd6f6;
+  font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', monospace;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #12121a;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a2a3e;
+  border-radius: 3px;
+}
+
+@layer components {
+  .stat-card {
+    @apply bg-surface border border-border rounded-lg p-5 transition-all hover:border-accent/40;
+  }
+  .severity-dot {
+    @apply inline-block w-2.5 h-2.5 rounded-full mr-2;
+  }
+  .table-header {
+    @apply text-xs uppercase tracking-wider text-muted font-medium px-4 py-3 text-left;
+  }
+  .table-cell {
+    @apply px-4 py-3 text-sm;
+  }
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border;
+  }
+  .noise-bar {
+    @apply h-2 rounded-full;
+  }
+}
