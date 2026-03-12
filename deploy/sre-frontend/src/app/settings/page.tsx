@@ -28,7 +28,7 @@ export default function SettingsPage() {
   const [jiraLoading, setJiraLoading] = useState(false);
 
   useEffect(() => {
-    fetch('/api/runbook/auth/me')
+    fetch('/api/auth/me')
       .then((r) => r.json())
       .then((data) => {
         if (data.username) {
@@ -53,7 +53,7 @@ export default function SettingsPage() {
     }
     setPwLoading(true);
     try {
-      const res = await fetch('/api/runbook/auth/change-password', {
+      const res = await fetch('/api/auth/change-password', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ current_password: currentPw, new_password: newPw }),
@@ -79,7 +79,7 @@ export default function SettingsPage() {
     setJiraMsg(null);
     setJiraLoading(true);
     try {
-      const res = await fetch('/api/runbook/auth/jira-config', {
+      const res = await fetch('/api/auth/jira-config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ jira_email: jiraEmail, jira_api_token: jiraToken }),
