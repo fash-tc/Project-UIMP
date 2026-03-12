@@ -1,6 +1,31 @@
-import { Alert, AIEnrichment, AlertStats, SREFeedback } from './types';
+import { Alert, AIEnrichment, AlertStats, SREFeedback, RunbookEntry, AIInstruction, AIFeedbackSummary, AlertState } from './types';
 
 const API_BASE = '/api/keep';
+
+const SOURCE_LABELS: Record<string, string> = {
+  zabbix: 'Zabbix',
+  'domains-shared': 'Domains Shared Zabbix',
+  'ascio': 'Ascio Zabbix',
+  'hostedemail': 'HostedEmail Zabbix',
+  'enom': 'Enom Zabbix',
+  'iaas': 'IAAS Zabbix',
+  prometheus: 'Prometheus',
+  grafana: 'Grafana',
+  datadog: 'Datadog',
+  cloudwatch: 'CloudWatch',
+};
+
+function formatSource(raw: string): string {
+  return SOURCE_LABELS[raw.toLowerCase()] || raw.charAt(0).toUpperCase() + raw.slice(1);
+}
+
+export function getSourceLabel(alert: Alert): string {
+  if (alert.zabbixInstance) {
+    return SOURCE_LABELS[alert.zabbixInstance] || alert.zabbixInstance + ' Zabbix';
+  }
+  const src = Array.isArray(alert.source) ? alert.source : [alert.source || 'unknown'];
+  return src.map(s => formatSource(String(s))).join(', ');
+}
 
 async function keepFetch(path: string) {
   const res = await fetch(`${API_BASE}${path}`);
@@ -128,6 +153,7 @@ export function timeAgo(dateStr: string): string {
   if (dateStr.includes('T')) {
     date = new Date(dateStr);
   } else {
+    // Handle "2026-03-03 06:00:27.953000" format
     date = new Date(dateStr.replace(/\./g, '-').replace(' ', 'T') + 'Z');
   }
   if (isNaN(date.getTime())) return '';
@@ -141,6 +167,12 @@ export function timeAgo(dateStr: string): string {
   if (hrs < 24) return `${hrs}h ago`;
   const days = Math.floor(hrs / 24);
   return `${days}d ago`;
+}
+
+/** Pick the best "when did this alert start" timestamp.
+ *  lastReceived resets every poller cycle so prefer startedAt/firingStartTime. */
+export function alertStartTime(alert: { startedAt?: string; firingStartTime?: string; lastReceived: string }): string {
+  return alert.firingStartTime || alert.startedAt || alert.lastReceived;
 }
 
 export function parseSREFeedback(note: string | undefined | null): SREFeedback | null {
@@ -225,4 +257,321 @@ export async function submitFeedback(
     }),
   });
   return res.ok;
+}
+
+// ── Runbook API ──────────────────────────────────────
+
+const RUNBOOK_BASE = '/api/runbook';
+
+export async function fetchRunbookMatches(
+  alertName: string,
+  hostname?: string,
+  service?: string,
+): Promise<RunbookEntry[]> {
+  const params = new URLSearchParams({ alert_name: alertName });
+  if (hostname) params.set('hostname', hostname);
+  if (service) params.set('service', service);
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/match?${params}`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function submitRunbookEntry(entry: {
+  alert_name: string;
+  alert_fingerprint?: string;
+  hostname?: string;
+  service?: string;
+  severity?: string;
+  remediation: string;
+  sre_user?: string;
+}): Promise<boolean> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/entries`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(entry),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function deleteRunbookEntry(id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/entries/${id}`, { method: 'DELETE' });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ── Alert Actions ──────────────────────────────────────
+
+export async function resolveAlert(fingerprint: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/alerts/enrich`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fingerprint,
+        enrichments: { status: 'resolved' },
+      }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function silenceAlert(
+  alertName: string,
+  durationSeconds: number,
+  hostname?: string,
+): Promise<boolean> {
+  const escapedName = alertName.replace(/"/g, '\\"');
+  let celQuery = `name == "${escapedName}"`;
+  if (hostname) {
+    celQuery += ` && hostname == "${hostname.replace(/"/g, '\\"')}"`;
+  }
+  try {
+    const res = await fetch(`${API_BASE}/maintenance`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: `Silenced: ${alertName.substring(0, 60)}`,
+        description: 'Silenced from SRE Command Center',
+        cel_query: celQuery,
+        duration_seconds: durationSeconds,
+        start_time: new Date().toISOString(),
+        enabled: true,
+      }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ── Jira Integration ──────────────────────────────────
+
+export async function createJiraIncident(details: {
+  summary: string;
+  description: string;
+  classId: string;
+  operationalServiceId?: string;
+  alertLink?: string;
+  attachments?: { data: string; filename: string }[];
+}): Promise<{ ok: boolean; issueKey?: string; issueUrl?: string; error?: string }> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/jira/incident`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(details),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      return { ok: true, issueKey: data.issue_key, issueUrl: data.issue_url };
+    }
+    return { ok: false, error: data.error || 'Failed to create incident' };
+  } catch {
+    return { ok: false, error: 'Network error' };
+  }
+}
+
+// ── Registry Health (Loki) ───────────────────────────
+
+export interface RegistryHealthOperator {
+  status: 'healthy' | 'degraded' | 'down' | 'no_data';
+  request_count: number;
+  avg_response_ms: number;
+  avg_sendrecv_ms: number;
+  p95_response_ms: number;
+  error_rate: number;
+  resp_codes: Record<string, number>;
+  epp_error_rate: number;
+  epp_codes: Record<string, number>;
+  top_operations: Record<string, number>;
+}
+
+export interface RegistryHealthData {
+  last_updated: string | null;
+  query_window_seconds: number;
+  poll_interval_seconds: number;
+  loki_error: string | null;
+  operators: Record<string, RegistryHealthOperator>;
+  unmapped_agents: string[];
+}
+
+export async function fetchRegistryHealth(): Promise<RegistryHealthData | null> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/registry-health`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+// ── Loki Logs ────────────────────────────────────────
+
+export interface LogEntry {
+  timestamp: string;
+  labels: Record<string, string>;
+  message: string;
+}
+
+export interface LogQueryResult {
+  entries: LogEntry[];
+  total: number;
+  query: string;
+  range_seconds: number;
+}
+
+export async function queryLokiLogs(
+  query: string,
+  limit = 200,
+  range = 3600,
+): Promise<LogQueryResult> {
+  const res = await fetch(`${RUNBOOK_BASE}/logs/query`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, limit, range }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Query failed');
+  return data;
+}
+
+// ── AI Instructions ──────────────────────────────────
+
+export async function fetchAIInstructions(): Promise<AIInstruction[]> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/ai-instructions`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function createAIInstruction(instruction: string, sre_user?: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/ai-instructions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ instruction, sre_user }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function updateAIInstruction(id: number, updates: { instruction?: string; active?: boolean }): Promise<boolean> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/ai-instructions/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function deleteAIInstruction(id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/ai-instructions/${id}`, { method: 'DELETE' });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function fetchAIFeedbackSummary(): Promise<AIFeedbackSummary | null> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/ai-feedback-summary`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+// ── Alert State (Investigating / Acknowledge) ─────────
+
+export async function fetchAlertStates(): Promise<AlertState[]> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/alert-states`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function toggleInvestigating(
+  fingerprint: string,
+  alertName: string,
+): Promise<{ status: string; investigating_user: string | null } | null> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/alert-states/investigate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fingerprint, alert_name: alertName }),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function acknowledgeAlerts(
+  fingerprints: string[],
+  alertNames: Record<string, string>,
+  firingStarts: Record<string, string>,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/alert-states/acknowledge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fingerprints, alert_names: alertNames, firing_starts: firingStarts }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function unacknowledgeAlerts(fingerprints: string[]): Promise<boolean> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/alert-states/unacknowledge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fingerprints }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function markAlertsUpdated(fingerprints: string[]): Promise<boolean> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/alert-states/mark-updated`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fingerprints }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }

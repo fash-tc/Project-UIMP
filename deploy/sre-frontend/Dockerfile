@@ -5,6 +5,8 @@ RUN npm install --frozen-lockfile 2>/dev/null || npm install
 
 FROM node:20-alpine AS builder
 WORKDIR /app
+ARG AUTH_SECRET
+ENV AUTH_SECRET=${AUTH_SECRET}
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run build

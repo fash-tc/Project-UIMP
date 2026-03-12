@@ -47,6 +47,9 @@ Zabbix Production
 | **Alert Enricher** | AI-powered alert analysis and enrichment | `python:3.12-slim` |
 | **Zabbix Poller** | Polls Zabbix for active problems, forwards to Keep | `python:3.12-slim` |
 | **SRE Frontend** | Custom Next.js command center for SRE teams | Custom Dockerfile |
+| **Runbook API** | Runbook management and retrieval service | `python:3.12-slim` |
+| **Health Checker** | Service health monitoring and status reporting | `python:3.12-slim` |
+| **Maint Sync** | Maintenance window synchronization | `python:3.12-slim` |
 | **n8n** | Workflow automation (severity routing, Slack integration) | `n8n:latest` |
 | **Nginx** | Reverse proxy, API gateway, landing page | `nginx:alpine` |
 
@@ -69,6 +72,39 @@ Zabbix Production
 - Real metric values from Zabbix items
 - SRE feedback panel — rate AI accuracy, provide corrections, add context
 - Feedback is ingested by the enricher and applied to future similar alerts
+
+### Health Dashboard (`/portal/health`)
+- Service health monitoring across all UIP components
+- Status indicators and uptime tracking
+
+### Logs Viewer (`/portal/logs`)
+- Centralized log viewing for platform services
+- Search and filter capabilities
+
+### Maintenance Windows (`/portal/maintenance`)
+- Maintenance window management and scheduling
+- Sync with Zabbix maintenance periods
+
+### AI Management (`/portal/ai-manage`)
+- LLM model configuration and management
+- Enrichment tuning and prompt management
+
+### Settings (`/portal/settings`)
+- Platform configuration and user preferences
+
+### Registry Contacts (`/portal/registry-contacts`)
+- Domain registry contact directory for SRE escalation
+
+### Authentication
+- Session-based auth with login page and middleware
+- User menu with session management
+
+## Zabbix Integration
+
+UIP connects to Zabbix instances via two methods:
+
+- **Polling** (`poller.py`): Periodically queries Zabbix API for active problems and forwards to Keep
+- **Webhooks** (`zabbix_webhook_setup.py`): Idempotent setup script that configures Zabbix to push alerts in real-time via webhook — creates media type, dedicated webhook user, and action with proper filter conditions
 
 ## AI Enrichment
 
@@ -95,15 +131,32 @@ deploy/
   nginx-default.conf          # Reverse proxy + landing page
   poller.py                   # Zabbix -> Keep alert forwarder
   enricher.py                 # AI enrichment engine
+  health-checker.py           # Service health monitoring
+  zabbix_webhook_setup.py     # Idempotent Zabbix webhook configuration
+  runbook-api/
+    runbook-api.py            # Runbook management service
+  maint-sync/
+    maint-sync.py             # Maintenance window sync
   sre-frontend/
     src/app/
       command-center/page.tsx  # Dashboard
       alerts/page.tsx          # Alert list
       alerts/[fingerprint]/    # Alert detail + feedback
+      health/page.tsx          # Health dashboard
+      logs/page.tsx            # Log viewer
+      maintenance/page.tsx     # Maintenance windows
+      ai-manage/page.tsx       # AI/LLM management
+      settings/page.tsx        # Platform settings
+      registry-contacts/       # Registry contact directory
+      login/page.tsx           # Authentication
       layout.tsx               # Navigation shell
+      UserMenu.tsx             # User session menu
     src/lib/
       types.ts                 # TypeScript interfaces
       keep-api.ts              # API client functions
+      auth.ts                  # Auth utilities
+      registry-contacts.ts     # Registry contacts client
+    src/middleware.ts           # Auth middleware
 ```
 
 ## Deployment
@@ -140,4 +193,4 @@ npm install
 npm run dev
 ```
 
-The Python services (`poller.py`, `enricher.py`) are single-file scripts with no external dependencies beyond the Python standard library.
+The Python services (`poller.py`, `enricher.py`, `health-checker.py`, `zabbix_webhook_setup.py`) are single-file scripts with no external dependencies beyond the Python standard library.

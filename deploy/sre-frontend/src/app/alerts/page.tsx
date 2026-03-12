@@ -8,6 +8,8 @@ import {
   severityColor,
   severityBg,
   timeAgo,
+  alertStartTime,
+  getSourceLabel,
 } from '@/lib/keep-api';
 
 type SortField = 'severity' | 'name' | 'host' | 'noise' | 'time';
@@ -25,6 +27,8 @@ export default function AlertExplorer() {
   const [statusFilter, setStatusFilter] = useState<string>('active');
   const [sortField, setSortField] = useState<SortField>('time');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
+  const [pageSize, setPageSize] = useState(25);
+  const [currentPage, setCurrentPage] = useState(0);
 
   const load = useCallback(async () => {
     try {
@@ -96,12 +100,21 @@ export default function AlertExplorer() {
             cmp = (a.enrichment?.noise_score ?? 5) - (b.enrichment?.noise_score ?? 5);
             break;
           case 'time':
-            cmp = (a.alert.lastReceived || '').localeCompare(b.alert.lastReceived || '');
+            cmp = (alertStartTime(a.alert) || '').localeCompare(alertStartTime(b.alert) || '');
             break;
         }
         return sortDir === 'desc' ? -cmp : cmp;
       });
   }, [enrichedAlerts, search, sevFilter, statusFilter, sortField, sortDir]);
+
+  const totalPages = pageSize === 0 ? 1 : Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePage = Math.min(currentPage, totalPages - 1);
+  const paginatedAlerts = pageSize === 0
+    ? filtered
+    : filtered.slice(safePage * pageSize, (safePage + 1) * pageSize);
+
+  // Reset to page 0 when filters or page size change
+  useEffect(() => { setCurrentPage(0); }, [search, sevFilter, statusFilter, pageSize]);
 
   function toggleSort(field: SortField) {
     if (sortField === field) {
@@ -186,19 +199,17 @@ export default function AlertExplorer() {
               </tr>
             </thead>
             <tbody>
-              {filtered.length === 0 ? (
+              {paginatedAlerts.length === 0 ? (
                 <tr>
                   <td colSpan={7} className="table-cell text-center text-muted py-8">
                     No matching alerts
                   </td>
                 </tr>
               ) : (
-                filtered.map(({ alert, enrichment }) => {
+                paginatedAlerts.map(({ alert, enrichment }) => {
                   const sev = enrichment?.assessed_severity ?? 'unknown';
                   const host = alert.hostName || alert.hostname || '';
-                  const source = Array.isArray(alert.source)
-                    ? alert.source.join(', ')
-                    : String(alert.source || '');
+                  const source = getSourceLabel(alert);
 
                   return (
                     <tr
@@ -244,7 +255,7 @@ export default function AlertExplorer() {
                         {enrichment?.summary || '--'}
                       </td>
                       <td className="table-cell text-xs text-muted whitespace-nowrap">
-                        {timeAgo(alert.lastReceived)}
+                        {timeAgo(alertStartTime(alert))}
                       </td>
                     </tr>
                   );
@@ -253,7 +264,78 @@ export default function AlertExplorer() {
             </tbody>
           </table>
         </div>
+
+        {/* Pagination Controls */}
+        <div className="flex items-center justify-between px-4 py-3 border-t border-border">
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-muted">
+              {pageSize === 0
+                ? `Showing all ${filtered.length} alerts`
+                : filtered.length > 0
+                  ? `Showing ${safePage * pageSize + 1}\u2013${Math.min((safePage + 1) * pageSize, filtered.length)} of ${filtered.length}`
+                  : 'No alerts'}
+            </span>
+            <select
+              value={pageSize}
+              onChange={e => setPageSize(Number(e.target.value))}
+              className="bg-surface border border-border rounded px-2 py-1 text-xs text-muted focus:outline-none focus:ring-1 focus:ring-accent"
+            >
+              <option value={25}>25 per page</option>
+              <option value={50}>50 per page</option>
+              <option value={100}>100 per page</option>
+              <option value={0}>All</option>
+            </select>
+          </div>
+          {pageSize > 0 && totalPages > 1 && (
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setCurrentPage(p => Math.max(0, p - 1))}
+                disabled={safePage === 0}
+                className="px-2 py-1 text-xs text-muted hover:text-text hover:bg-surface-hover rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                &lsaquo; Prev
+              </button>
+              {paginationRange(safePage, totalPages).map((p, i) =>
+                p === -1 ? (
+                  <span key={`ellipsis-${i}`} className="px-1 text-xs text-muted">&hellip;</span>
+                ) : (
+                  <button
+                    key={p}
+                    onClick={() => setCurrentPage(p)}
+                    className={`w-7 h-7 rounded text-xs font-medium transition-colors ${
+                      p === safePage
+                        ? 'bg-accent text-bg'
+                        : 'text-muted hover:text-text hover:bg-surface-hover'
+                    }`}
+                  >
+                    {p + 1}
+                  </button>
+                )
+              )}
+              <button
+                onClick={() => setCurrentPage(p => Math.min(totalPages - 1, p + 1))}
+                disabled={safePage >= totalPages - 1}
+                className="px-2 py-1 text-xs text-muted hover:text-text hover:bg-surface-hover rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                Next &rsaquo;
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
+}
+
+function paginationRange(current: number, total: number): number[] {
+  if (total <= 7) return Array.from({ length: total }, (_, i) => i);
+  const pages: number[] = [];
+  pages.push(0);
+  if (current > 2) pages.push(-1);
+  for (let i = Math.max(1, current - 1); i <= Math.min(total - 2, current + 1); i++) {
+    pages.push(i);
+  }
+  if (current < total - 3) pages.push(-1);
+  pages.push(total - 1);
+  return pages;
 }

@@ -20,6 +20,14 @@ body {
   border-radius: 3px;
 }
 
+@keyframes spin-once {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.animate-spin-once {
+  animation: spin-once 0.5s ease-in-out;
+}
+
 @layer components {
   .stat-card {
     @apply bg-surface border border-border rounded-lg p-5 transition-all hover:border-accent/40;

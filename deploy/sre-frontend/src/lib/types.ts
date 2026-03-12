@@ -9,10 +9,13 @@ export interface Alert {
   hostname?: string;
   description?: string;
   lastReceived: string;
+  startedAt?: string;
+  firingStartTime?: string;
   note?: string;
   tags?: Tag[];
   url?: string;
   triggerId?: string;
+  zabbixInstance?: string;
 }
 
 export interface Tag {
@@ -50,4 +53,43 @@ export interface AlertStats {
   warning: number;
   low: number;
   noise: number;
+}
+
+export interface RunbookEntry {
+  id: number;
+  alert_name: string;
+  alert_fingerprint?: string;
+  hostname?: string;
+  service?: string;
+  severity?: string;
+  remediation: string;
+  sre_user?: string;
+  created_at: string;
+  score?: number;
+}
+
+export interface AIInstruction {
+  id: number;
+  instruction: string;
+  sre_user?: string;
+  active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AIFeedbackSummary {
+  total_runbook_entries: number;
+  recent_entries: RunbookEntry[];
+  active_instructions: number;
+}
+
+export interface AlertState {
+  alert_fingerprint: string;
+  alert_name: string;
+  investigating_user: string | null;
+  investigating_since: string | null;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+  ack_firing_start: string | null;
+  is_updated: number;
 }
