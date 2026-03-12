@@ -25,6 +25,9 @@ import {
   markAlertsUpdated,
   getSourceLabel,
   forceEnrich,
+  fetchEscalationTeams,
+  fetchEscalationUsers,
+  escalateAlert,
 } from '@/lib/keep-api';
 import { getClientUsername } from '@/lib/auth';
 import { detectRegistryFromAlert, buildRegistryMailto } from '@/lib/registry';
@@ -763,6 +766,15 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
   const [silenceError, setSilenceError] = useState(false);
   const [showIncidentForm, setShowIncidentForm] = useState(false);
   const [incidentResult, setIncidentResult] = useState<{ key: string; url: string } | null>(null);
+  const [showEscalation, setShowEscalation] = useState(false);
+  const [escalationType, setEscalationType] = useState<'team' | 'user'>('team');
+  const [escalationTarget, setEscalationTarget] = useState('');
+  const [escalationMessage, setEscalationMessage] = useState('');
+  const [escalating, setEscalating] = useState(false);
+  const [escalated, setEscalated] = useState(false);
+  const [escalationError, setEscalationError] = useState('');
+  const [teams, setTeams] = useState<{id: string; name: string}[]>([]);
+  const [users, setUsers] = useState<{id: string; name: string; email: string}[]>([]);
 
   const host = alert.hostName || alert.hostname || '';
   const registryMatch = detectRegistryFromAlert(alert.name, host, alert.description);
@@ -875,6 +887,30 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
           </button>
         )}
 
+        {/* Escalate (Grafana IRM) */}
+        <button
+          onClick={() => {
+            setShowEscalation(!showEscalation);
+            if (!showEscalation && teams.length === 0) {
+              fetchEscalationTeams().then(setTeams);
+              fetchEscalationUsers().then(setUsers);
+            }
+          }}
+          disabled={escalated}
+          className={`px-3 py-1.5 rounded-md border text-xs font-medium transition-all inline-flex items-center gap-1 ${
+            escalated
+              ? 'border-green/40 bg-green/10 text-green cursor-default'
+              : showEscalation
+                ? 'border-red/40 bg-red/10 text-red'
+                : 'border-border text-muted hover:border-red/50 hover:text-red hover:bg-red/5'
+          }`}
+        >
+          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+          </svg>
+          {escalated ? '✓ Escalated' : 'Escalate'}
+        </button>
+
         {/* Contact Registry */}
         {registryMailto && (
           <a
@@ -947,6 +983,78 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
           }}
           onCancel={() => setShowIncidentForm(false)}
         />
+      )}
+
+      {/* Escalation Form */}
+      {showEscalation && !escalated && (
+        <div className="bg-surface border border-red/20 rounded-lg p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <h4 className="text-sm font-medium text-red">Escalate via Grafana IRM</h4>
+            <button onClick={() => setShowEscalation(false)} className="text-muted hover:text-text text-xs">✕</button>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => { setEscalationType('team'); setEscalationTarget(''); }}
+              className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                escalationType === 'team' ? 'bg-red/10 text-red border border-red/30' : 'text-muted border border-border hover:text-text'
+              }`}
+            >Team</button>
+            <button
+              onClick={() => { setEscalationType('user'); setEscalationTarget(''); }}
+              className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                escalationType === 'user' ? 'bg-red/10 text-red border border-red/30' : 'text-muted border border-border hover:text-text'
+              }`}
+            >User</button>
+          </div>
+          <select
+            value={escalationTarget}
+            onChange={e => setEscalationTarget(e.target.value)}
+            className="w-full bg-bg border border-border rounded px-3 py-2 text-sm text-text focus:outline-none focus:ring-1 focus:ring-red/50"
+          >
+            <option value="">Select {escalationType}...</option>
+            {escalationType === 'team'
+              ? teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)
+              : users.map(u => <option key={u.id} value={u.id}>{u.name} ({u.email})</option>)
+            }
+          </select>
+          <textarea
+            value={escalationMessage}
+            onChange={e => setEscalationMessage(e.target.value)}
+            placeholder="Additional context (optional)"
+            rows={2}
+            className="w-full bg-bg border border-border rounded px-3 py-2 text-sm text-text placeholder:text-muted focus:outline-none focus:ring-1 focus:ring-red/50 resize-none"
+          />
+          {escalationError && (
+            <div className="text-xs text-red bg-red/10 border border-red/20 rounded px-2 py-1">{escalationError}</div>
+          )}
+          <button
+            onClick={async () => {
+              if (!escalationTarget) return;
+              setEscalating(true);
+              setEscalationError('');
+              const result = await escalateAlert({
+                team_id: escalationType === 'team' ? escalationTarget : undefined,
+                user_ids: escalationType === 'user' ? [escalationTarget] : undefined,
+                alert_name: alert.name || 'Unknown',
+                severity: enrichment?.assessed_severity || alert.severity || 'unknown',
+                summary: enrichment?.summary || alert.description || '',
+                message: escalationMessage,
+                uip_link: typeof window !== 'undefined' ? window.location.href : '',
+              });
+              setEscalating(false);
+              if (result.success) {
+                setEscalated(true);
+                setShowEscalation(false);
+              } else {
+                setEscalationError(result.error || 'Escalation failed');
+              }
+            }}
+            disabled={!escalationTarget || escalating}
+            className="w-full px-3 py-2 rounded-md bg-red/80 hover:bg-red text-white text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {escalating ? 'Sending...' : 'Send Escalation'}
+          </button>
+        </div>
       )}
     </div>
   );

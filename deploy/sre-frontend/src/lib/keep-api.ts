@@ -617,6 +617,47 @@ export async function markAlertsUpdated(fingerprints: string[]): Promise<boolean
   }
 }
 
+// ── Escalation API ───────────────────────────────────
+
+const ESCALATION_BASE = '/api/escalation';
+
+export async function fetchEscalationTeams(): Promise<{id: string; name: string}[]> {
+  try {
+    const res = await fetch(`${ESCALATION_BASE}/teams`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch { return []; }
+}
+
+export async function fetchEscalationUsers(): Promise<{id: string; name: string; email: string}[]> {
+  try {
+    const res = await fetch(`${ESCALATION_BASE}/users`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch { return []; }
+}
+
+export async function escalateAlert(data: {
+  team_id?: string;
+  user_ids?: string[];
+  alert_name: string;
+  severity: string;
+  summary: string;
+  message: string;
+  uip_link: string;
+}): Promise<{success: boolean; error?: string}> {
+  try {
+    const res = await fetch(`${ESCALATION_BASE}/escalate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return await res.json();
+  } catch {
+    return { success: false, error: 'Network error' };
+  }
+}
+
 export async function forceEnrich(fingerprint: string): Promise<boolean> {
   try {
     const res = await fetch(`${ALERT_STATE_BASE}/force-enrich`, {
