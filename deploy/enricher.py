@@ -208,7 +208,7 @@ class FeedbackTracker:
 feedback_tracker = FeedbackTracker()
 
 RUNBOOK_API_URL = os.environ.get("RUNBOOK_API_URL", "http://runbook-api:8090")
-LOKI_GATEWAY_URL = os.environ.get('LOKI_GATEWAY_URL', 'http://loki-gateway:8091')
+
 
 
 def fetch_runbook_entries(alert_name, hostname, service=None):
@@ -243,62 +243,6 @@ def fetch_ai_instructions():
         return []
 
 
-def fetch_log_context(alert_name, hostname):
-    """Fetch log correlation context from the runbook API (cached Loki data)."""
-    from urllib.parse import quote
-    params = f"alert_name={quote(alert_name)}"
-    if hostname and hostname.lower() not in ("unknown", "n/a", ""):
-        params += f"&hostname={quote(hostname)}"
-    url = f"{LOKI_GATEWAY_URL}/api/loki/log-context?{params}"
-    try:
-        req = Request(url, headers={"Accept": "application/json"})
-        resp = urlopen(req, timeout=5)
-        data = json.loads(resp.read())
-        if data.get("has_context"):
-            return data
-        return None
-    except Exception as e:
-        log.debug(f"Log context fetch failed (non-fatal): {e}")
-        return None
-
-
-def format_log_context(log_ctx):
-    """Format log context data into LLM prompt text."""
-    if not log_ctx:
-        return ""
-
-    lines = ["\nINFRASTRUCTURE LOG CONTEXT (live Loki logs, last hour — use for correlation):"]
-
-    total = log_ctx.get("total_operators", 0)
-    healthy = log_ctx.get("healthy_count", 0)
-    degraded = log_ctx.get("degraded_count", 0)
-    down = log_ctx.get("down_count", 0)
-
-    lines.append(f"  Overall: {total} registry operators — {healthy} healthy, {degraded} degraded, {down} down")
-
-    issues = log_ctx.get("operator_issues", [])
-    if issues:
-        lines.append("  OPERATORS WITH ISSUES:")
-        for op in issues:
-            op_line = f"    - {op['operator']}: {op['status'].upper()}"
-            op_line += f" | avg {op.get('avg_response_ms', 0):.0f}ms"
-            op_line += f" | {op.get('request_count', 0)} requests/hr"
-            if op.get("error_rate", 0) > 0:
-                op_line += f" | {op['error_rate']*100:.1f}% HTTP errors"
-            if op.get("epp_error_rate", 0) > 0:
-                op_line += f" | {op['epp_error_rate']*100:.1f}% EPP errors"
-            lines.append(op_line)
-            for err in op.get("recent_errors", [])[:3]:
-                lines.append(f"      Error sample: {err['agent']} {err['op']} → HTTP {err['resp']} ({err['ms']}ms)")
-            for err in op.get("recent_epp_errors", [])[:3]:
-                lines.append(f"      EPP error: {err['agent']} → code {err['epp_code']}")
-            for slow in op.get("slow_requests", [])[:2]:
-                lines.append(f"      Slow request: {slow['agent']} {slow['op']} → {slow['ms']}ms")
-    elif log_ctx.get("all_healthy"):
-        lines.append("  All registry operators are currently HEALTHY — no log anomalies detected.")
-
-    lines.append("  Correlate the current alert with this registry infrastructure health data.\n")
-    return "\n".join(lines)
 
 
 def infer_service(alert):
@@ -379,7 +323,7 @@ def keep_request(path, method="GET", data=None):
         return None
 
 
-def ollama_generate(prompt, timeout=120):
+def ollama_generate(prompt, timeout=45):
     body = json.dumps({
         "model": OLLAMA_MODEL,
         "prompt": prompt,
@@ -394,13 +338,18 @@ def ollama_generate(prompt, timeout=120):
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    try:
-        resp = urlopen(req, timeout=timeout)
-        data = json.loads(resp.read())
-        return data.get("response", "").strip()
-    except Exception as e:
-        log.error(f"Ollama error: {e}")
-        return None
+    for attempt in range(2):
+        try:
+            resp = urlopen(req, timeout=timeout)
+            data = json.loads(resp.read())
+            return data.get("response", "").strip()
+        except Exception as e:
+            if attempt == 0:
+                log.warning(f"Ollama timeout/error (attempt 1), retrying: {e}")
+                time.sleep(2)
+            else:
+                log.error(f"Ollama failed after 2 attempts: {e}")
+    return None
 
 
 def wait_for_ollama():
@@ -476,9 +425,8 @@ def build_enrichment_prompt(alert, similar_alerts):
 
     service_context = find_service_context(alert)
 
-    # Log correlation context (from cached Loki data — no extra queries)
-    log_ctx = fetch_log_context(name, host)
-    log_context = format_log_context(log_ctx)
+    # Log correlation is on-demand only (via UI) — Loki is too resource-heavy for auto-queries
+    log_context = ""
 
     dedup_context = ""
     if similar_alerts:
@@ -678,6 +626,14 @@ def enrich_alert(alert, similar_alerts):
     prompt = build_enrichment_prompt(alert, similar_alerts)
     response = ollama_generate(prompt)
     if not response:
+        # Tag alert as pending so it gets retried next cycle
+        fingerprint = alert.get("fingerprint", "")
+        if fingerprint:
+            pending_note = "ENRICHMENT_PENDING: LLM timeout — will retry next cycle"
+            keep_request("/alerts/enrich", method="POST", data={
+                "fingerprint": fingerprint,
+                "enrichments": {"note": pending_note},
+            })
         return None
 
     enrichment = parse_enrichment(response)
@@ -781,6 +737,11 @@ def poll_and_enrich():
         note = alert.get("note", "") or ""
         if "---AI-ENRICHMENT-V2---" in note or note.startswith("AI Summary:"):
             enriched_cache.add(fingerprint)
+            continue
+        # Allow retry of pending alerts (don't cache them)
+        if note.startswith("ENRICHMENT_PENDING:"):
+            log.info(f"Retrying pending enrichment: {alert.get('name', '')[:60]}")
+        elif fingerprint in enriched_cache:
             continue
 
         name = alert.get("name", "unknown")

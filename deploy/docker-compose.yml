@@ -105,7 +105,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 8192M
+          memory: 4096M
           cpus: "4.0"
     networks:
       - uip-net
@@ -122,17 +122,18 @@ services:
       - ./enricher/enricher.py:/app/enricher.py:ro
     environment:
       OLLAMA_URL: http://ollama:11434
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
       KEEP_URL: http://keep-api:8080
       KEEP_API_KEY: ${KEEP_API_KEY}
       POLL_INTERVAL: "60"
       RUNBOOK_API_URL: http://runbook-api:8090
-      LOKI_GATEWAY_URL: http://loki-gateway:8091
+      FLAP_WINDOW_SECONDS: "${FLAP_WINDOW_SECONDS:-600}"
+      DEDUP_WINDOW_SECONDS: "${DEDUP_WINDOW_SECONDS:-1800}"
+      NOISE_THRESHOLD: "${NOISE_THRESHOLD:-8}"
+      ALERT_STATE_API_URL: "http://alert-state-api:8092"
     depends_on:
       keep-api:
         condition: service_healthy
-      loki-gateway:
-        condition: service_started
     deploy:
       resources:
         limits:
