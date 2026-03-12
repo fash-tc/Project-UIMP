@@ -15,7 +15,7 @@ import hmac as hmac_mod
 import time
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
@@ -468,18 +468,22 @@ class RunbookHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "summary is required"})
                 return
 
-            # Per-user Jira credentials
+            # Per-user Jira credentials (users table now lives in auth-api's DB,
+            # so this lookup will fail — fall back to global Jira creds)
             user_jira_email, user_jira_token = None, None
             username = _get_username_from_request(self)
             if username:
-                user_row = db.execute(
-                    "SELECT jira_email, jira_api_token FROM users WHERE username = ?",
-                    (username,),
-                ).fetchone()
-                if user_row and user_row["jira_email"] and user_row["jira_api_token"]:
-                    user_jira_email = user_row["jira_email"]
-                    user_jira_token = user_row["jira_api_token"]
-                    log.info(f"Using per-user Jira creds for {username}")
+                try:
+                    user_row = db.execute(
+                        "SELECT jira_email, jira_api_token FROM users WHERE username = ?",
+                        (username,),
+                    ).fetchone()
+                    if user_row and user_row["jira_email"] and user_row["jira_api_token"]:
+                        user_jira_email = user_row["jira_email"]
+                        user_jira_token = user_row["jira_api_token"]
+                        log.info(f"Using per-user Jira creds for {username}")
+                except sqlite3.OperationalError:
+                    pass  # users table not in this DB, use global creds
 
             result, error = create_jira_incident(data, user_jira_email, user_jira_token)
             if error:
