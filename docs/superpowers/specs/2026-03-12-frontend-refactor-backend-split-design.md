@@ -14,6 +14,17 @@ Five coordinated changes to the UIP platform:
 4. **Decompose runbook-api monolith** into focused services
 5. **Remove Zabbix poller** (replaced by webhooks) and other cleanup
 
+## Constraint: No Automatic Loki Queries
+
+**All Loki/log queries must be user-initiated.** The Loki infrastructure is currently unstable. No automatic polling, no scheduled health checks, no periodic fetches against Loki. This applies to:
+
+- Registry health polling — disabled
+- Registry trends — on-demand only (already designed this way)
+- Logs page — manual query only (already designed this way)
+- Log context for alerts — fetched only when user opens alert detail
+
+This constraint can be lifted once the Loki setup is stable.
+
 ## 1. Backend Decomposition
 
 ### Current State
@@ -225,7 +236,7 @@ New "View Trends" button in the `OperatorDetailModal`:
 - Registry-related alerts banner with auto-detection
 - Search and TLD filter
 - Detail modal with contacts, EPP codes, top operations
-- Health polling (existing 5-minute interval for snapshot data stays)
+- ~~Health polling~~ — **DISABLED** until Loki infrastructure is stable. No automatic Loki queries of any kind. All Loki interactions (trends, logs, health) are strictly manual/on-demand.
 
 ## 4. Logs Page — Re-enable
 
