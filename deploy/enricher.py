@@ -19,8 +19,15 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
 KEEP_URL = os.environ.get("KEEP_URL", "http://keep-api:8080")
 KEEP_API_KEY = os.environ.get("KEEP_API_KEY", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
+FLAP_WINDOW = int(os.environ.get("FLAP_WINDOW_SECONDS", "600"))
+DEDUP_WINDOW = int(os.environ.get("DEDUP_WINDOW_SECONDS", "1800"))
+NOISE_THRESHOLD = int(os.environ.get("NOISE_THRESHOLD", "8"))
+ALERT_STATE_API_URL = os.environ.get("ALERT_STATE_API_URL", "http://alert-state-api:8092")
 
 enriched_cache = set()
+
+# In-memory tracking for noise suppression
+recent_enrichments = {}  # fingerprint -> {alert_name, host, enrichment_text, noise_score, enriched_at, resolve_count, last_resolved_at}
 
 # === Service Dependency Map ===
 SERVICE_DEPS = {
@@ -724,6 +731,63 @@ def post_enrichment_to_keep(alert, enrichment):
     return False
 
 
+def check_suppression(alert):
+    """Check if alert should be suppressed from enrichment. Returns (suppress: bool, reason: str, copied_enrichment: str|None)."""
+    fp = alert.get("fingerprint", "")
+    name = alert.get("name", "")
+    host = get_host(alert)
+    now = time.time()
+
+    # Evict stale entries (older than 2 hours)
+    stale = [k for k, v in recent_enrichments.items() if now - v["enriched_at"] > 7200]
+    for k in stale:
+        del recent_enrichments[k]
+
+    # Rule 1: Flapping detection
+    if fp in recent_enrichments:
+        entry = recent_enrichments[fp]
+        if entry.get("last_resolved_at") and (now - entry["last_resolved_at"]) < FLAP_WINDOW:
+            count = entry.get("resolve_count", 0)
+            return True, f"NOISE: FLAPPING — same alert resolved and re-fired {count} times in last hour. Enrichment suppressed.", None
+
+    # Rule 2: Recent duplicate (same name+host already enriched)
+    for efp, entry in recent_enrichments.items():
+        if efp == fp:
+            continue
+        if entry["alert_name"] == name and entry["host"] == host:
+            if (now - entry["enriched_at"]) < DEDUP_WINDOW:
+                return True, f"ENRICHMENT (copied from {efp[:16]} at {time.strftime('%H:%M', time.localtime(entry['enriched_at']))}): duplicate suppressed.", entry["enrichment_text"]
+
+    # Rule 3: High noise pattern
+    for efp, entry in recent_enrichments.items():
+        if entry["alert_name"] == name and entry.get("noise_score", 0) >= NOISE_THRESHOLD:
+            return True, f"NOISE: Score {entry['noise_score']}/10 from previous instance. Enrichment reused.", entry["enrichment_text"]
+
+    return False, "", None
+
+
+def fetch_force_enrich_fingerprints():
+    """Get fingerprints that SREs have manually requested enrichment for."""
+    try:
+        req = Request(f"{ALERT_STATE_API_URL}/api/alert-states?force_enrich=true")
+        resp = urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        return {item["alert_fingerprint"] for item in data}
+    except Exception:
+        return set()
+
+
+def clear_force_enrich(fingerprint):
+    """Clear the force_enrich flag after enrichment."""
+    try:
+        body = json.dumps({"fingerprint": fingerprint}).encode()
+        req = Request(f"{ALERT_STATE_API_URL}/api/alert-states/clear-force-enrich",
+                      data=body, headers={"Content-Type": "application/json"})
+        urlopen(req, timeout=5)
+    except Exception:
+        pass
+
+
 def poll_and_enrich():
     alerts_data = keep_request("/alerts?limit=250")
     if not alerts_data:
@@ -758,10 +822,18 @@ def poll_and_enrich():
             fp = alert.get("fingerprint", "")
             if fp:
                 enriched_cache.add(fp)
+                # Track resolve counts for flapping detection
+                if fp in recent_enrichments:
+                    recent_enrichments[fp]["resolve_count"] = recent_enrichments[fp].get("resolve_count", 0) + 1
+                    recent_enrichments[fp]["last_resolved_at"] = time.time()
             continue
         active_alerts.append(alert)
 
     log.info(f"Found {len(active_alerts)} active alerts (skipped {len(items) - len(active_alerts)} resolved)")
+
+    # Fetch force-enrich requests from SREs
+    force_enrich_fps = fetch_force_enrich_fingerprints()
+    suppressed_count = 0
 
     enriched_count = 0
     for alert in active_alerts:
@@ -780,6 +852,27 @@ def poll_and_enrich():
             continue
 
         name = alert.get("name", "unknown")
+
+        # Check noise suppression (skip if force-enriched)
+        if fingerprint not in force_enrich_fps:
+            suppress, reason, copied = check_suppression(alert)
+            if suppress:
+                # Write suppression note to Keep
+                note_text = reason
+                if copied:
+                    note_text = copied  # Use the copied enrichment
+                keep_request("/alerts/enrich", method="POST", data={
+                    "fingerprint": fingerprint,
+                    "enrichments": {"note": note_text},
+                })
+                enriched_cache.add(fingerprint)
+                suppressed_count += 1
+                log.info(f"  Suppressed: {name[:40]} — {reason[:60]}")
+                continue
+        else:
+            log.info(f"  Force-enriching: {name[:40]} (requested by SRE)")
+            clear_force_enrich(fingerprint)
+
         log.info(f"Enriching: {name[:60]} (fp: {fingerprint[:16]}...)")
 
         similar = pattern_tracker.find_similar(alert)
@@ -790,6 +883,25 @@ def poll_and_enrich():
                 enriched_cache.add(fingerprint)
                 pattern_tracker.add(alert)
                 enriched_count += 1
+                # Track for noise suppression
+                recent_enrichments[fingerprint] = {
+                    "alert_name": name,
+                    "host": get_host(alert),
+                    "enrichment_text": (
+                        f"---AI-ENRICHMENT-V2---\n"
+                        f"ASSESSED_SEVERITY: {enrichment['assessed_severity']}\n"
+                        f"LIKELY_CAUSE: {enrichment['likely_cause']}\n"
+                        f"REMEDIATION: {enrichment['remediation']}\n"
+                        f"IMPACT_SCOPE: {enrichment['impact_scope']}\n"
+                        f"NOISE_SCORE: {enrichment['noise_score']}\n"
+                        f"SUMMARY: {enrichment['summary']}\n"
+                        f"---END-AI-ENRICHMENT---"
+                    ),
+                    "noise_score": int(enrichment.get("noise_score", 0)),
+                    "enriched_at": time.time(),
+                    "resolve_count": 0,
+                    "last_resolved_at": None,
+                }
                 log.info(
                     f"  -> severity={enrichment['assessed_severity']} "
                     f"noise={enrichment['noise_score']}/10 "
@@ -800,6 +912,9 @@ def poll_and_enrich():
                 log.warning("  -> Failed to post enrichment to Keep")
         else:
             log.warning("  -> LLM returned no response")
+
+    if suppressed_count:
+        log.info(f"Suppressed {suppressed_count} alerts (noise/flapping/dedup)")
 
     return enriched_count
 
