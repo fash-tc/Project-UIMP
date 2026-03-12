@@ -46,6 +46,13 @@ def _init_db():
         )
     """)
     db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_as_fingerprint ON alert_states(alert_fingerprint)")
+    # Add force_enrich column if it doesn't exist (migration)
+    try:
+        db.execute("ALTER TABLE alert_states ADD COLUMN force_enrich INTEGER DEFAULT 0")
+        db.commit()
+        log.info("Added force_enrich column to alert_states")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     db.commit()
     log.info(f"Database initialized at {DB_PATH}")
     return db
@@ -118,14 +125,22 @@ class AlertStateHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/")
 
         if path == "/api/alert-states":
+            qs = parse_qs(parsed.query)
             with _db_lock:
-                cursor = db.execute("""
-                    SELECT * FROM alert_states
-                    WHERE investigating_user IS NOT NULL
-                       OR acknowledged_by IS NOT NULL
-                       OR is_updated = 1
-                    ORDER BY updated_at DESC
-                """)
+                if qs.get("force_enrich", [""])[0].lower() == "true":
+                    cursor = db.execute("""
+                        SELECT * FROM alert_states
+                        WHERE force_enrich = 1
+                        ORDER BY updated_at DESC
+                    """)
+                else:
+                    cursor = db.execute("""
+                        SELECT * FROM alert_states
+                        WHERE investigating_user IS NOT NULL
+                           OR acknowledged_by IS NOT NULL
+                           OR is_updated = 1
+                        ORDER BY updated_at DESC
+                    """)
                 rows = [dict(r) for r in cursor.fetchall()]
             self._send_json(200, rows)
 
@@ -262,6 +277,45 @@ class AlertStateHandler(BaseHTTPRequestHandler):
             if fingerprints:
                 log.info(f"Marked {len(fingerprints)} alert(s) as updated (re-fired)")
             self._send_json(200, {"status": "marked_updated", "count": len(fingerprints)})
+
+        elif path == "/api/alert-states/force-enrich":
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            fingerprint = (data.get("fingerprint") or "").strip()
+            if not fingerprint:
+                self._send_json(400, {"error": "fingerprint is required"})
+                return
+            with _db_lock:
+                db.execute("""
+                    INSERT INTO alert_states (alert_fingerprint, force_enrich)
+                    VALUES (?, 1)
+                    ON CONFLICT(alert_fingerprint) DO UPDATE SET
+                        force_enrich = 1, updated_at = datetime('now')
+                """, (fingerprint,))
+                db.commit()
+            log.info(f"Force-enrich queued for {fingerprint[:16]}")
+            self._send_json(200, {"status": "queued"})
+
+        elif path == "/api/alert-states/clear-force-enrich":
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            fingerprint = (data.get("fingerprint") or "").strip()
+            if not fingerprint:
+                self._send_json(400, {"error": "fingerprint is required"})
+                return
+            with _db_lock:
+                db.execute("""
+                    UPDATE alert_states SET force_enrich = 0, updated_at = datetime('now')
+                    WHERE alert_fingerprint = ?
+                """, (fingerprint,))
+                db.commit()
+            self._send_json(200, {"status": "cleared"})
 
         else:
             self._send_json(404, {"error": "not found"})
