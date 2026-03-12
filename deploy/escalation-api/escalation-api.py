@@ -62,7 +62,7 @@ def _oncall_request(path, method="GET", data=None):
     """Make an authenticated request to Grafana OnCall API."""
     if not GRAFANA_ONCALL_URL:
         return None, "GRAFANA_ONCALL_URL not configured"
-    url = f"{GRAFANA_ONCALL_URL}{path}"
+    url = f"{GRAFANA_ONCALL_URL}/api/v1{path}"
     body = json.dumps(data).encode() if data else None
     req = Request(url, data=body, method=method, headers={
         "Authorization": GRAFANA_ONCALL_API_KEY,
@@ -84,22 +84,35 @@ def _oncall_request(path, method="GET", data=None):
 
 
 def _cached_get(cache_key, oncall_path):
-    """Fetch from cache or Grafana OnCall."""
+    """Fetch from cache or Grafana OnCall, handling pagination."""
     now = time.time()
     if cache_key in _cache and _cache[cache_key]["expires"] > now:
         return _cache[cache_key]["data"], None
 
-    data, err = _oncall_request(oncall_path)
-    if err:
-        return None, err
+    all_items = []
+    page = 1
+    while True:
+        sep = "&" if "?" in oncall_path else "?"
+        paginated_path = f"{oncall_path}{sep}page={page}&page_size=50"
+        data, err = _oncall_request(paginated_path)
+        if err:
+            if all_items:
+                break  # Return what we have
+            return None, err
 
-    # Handle paginated responses (OnCall may wrap in {results: [...]})
-    items = data
-    if isinstance(data, dict):
-        items = data.get("results", data.get("data", []))
+        items = data
+        if isinstance(data, dict):
+            items = data.get("results", data.get("data", []))
+            all_items.extend(items if isinstance(items, list) else [])
+            if not data.get("next"):
+                break
+            page += 1
+        else:
+            all_items.extend(items if isinstance(items, list) else [])
+            break
 
-    _cache[cache_key] = {"data": items, "expires": now + CACHE_TTL}
-    return items, None
+    _cache[cache_key] = {"data": all_items, "expires": now + CACHE_TTL}
+    return all_items, None
 
 
 # ── HTTP Handler ───────────────────────────────────────
@@ -169,7 +182,7 @@ class EscalationHandler(BaseHTTPRequestHandler):
                 for u in users:
                     result.append({
                         "id": u.get("id", ""),
-                        "name": u.get("name", u.get("username", "")),
+                        "name": u.get("username", u.get("name", "")),
                         "email": u.get("email", ""),
                     })
             self._send_json(200, result)
