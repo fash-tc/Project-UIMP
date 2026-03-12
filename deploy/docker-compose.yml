@@ -331,6 +331,29 @@ services:
       - uip-net
 
   # ============================================
+  # Escalation API — Grafana IRM Integration
+  # ============================================
+  escalation-api:
+    image: python:3.12-slim
+    container_name: uip-escalation-api
+    restart: unless-stopped
+    command: python3 -u /app/escalation-api.py
+    volumes:
+      - ./escalation-api/escalation-api.py:/app/escalation-api.py:ro
+    environment:
+      API_PORT: "8094"
+      AUTH_SECRET: "${AUTH_SECRET}"
+      GRAFANA_ONCALL_URL: "${GRAFANA_ONCALL_URL}"
+      GRAFANA_ONCALL_API_KEY: "${GRAFANA_ONCALL_API_KEY}"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+    networks:
+      - uip-net
+
+  # ============================================
   # Nginx - Reverse Proxy
   # ============================================
   nginx:
@@ -351,6 +374,7 @@ services:
       - auth-api
       - alert-state-api
       - loki-gateway
+      - escalation-api
     deploy:
       resources:
         limits:
