@@ -127,41 +127,16 @@ services:
       KEEP_API_KEY: ${KEEP_API_KEY}
       POLL_INTERVAL: "60"
       RUNBOOK_API_URL: http://runbook-api:8090
+      LOKI_GATEWAY_URL: http://loki-gateway:8091
     depends_on:
       keep-api:
         condition: service_healthy
+      loki-gateway:
+        condition: service_started
     deploy:
       resources:
         limits:
           memory: 128M
-          cpus: "0.25"
-    networks:
-      - uip-net
-
-  # ============================================
-  # Zabbix Poller - Zabbix Prod -> Keep
-  # ============================================
-  zabbix-poller:
-    image: python:3.12-slim
-    container_name: uip-zabbix-poller
-    restart: unless-stopped
-    command: python3 -u /app/poller.py
-    volumes:
-      - ./poller/poller.py:/app/poller.py:ro
-    environment:
-      ZABBIX_URL: ${ZABBIX_URL}
-      ZABBIX_USER: ${ZABBIX_USER}
-      ZABBIX_PASS: ${ZABBIX_PASS}
-      KEEP_URL: http://keep-api:8080/alerts/event/zabbix
-      KEEP_API_KEY: ${KEEP_API_KEY}
-      POLL_INTERVAL: "120"
-    depends_on:
-      keep-api:
-        condition: service_healthy
-    deploy:
-      resources:
-        limits:
-          memory: 64M
           cpus: "0.25"
     networks:
       - uip-net
@@ -275,12 +250,77 @@ services:
       JIRA_BASE_URL: "https://wiki-tucows.atlassian.net"
       JIRA_EMAIL: "${JIRA_EMAIL}"
       JIRA_API_TOKEN: "${JIRA_API_TOKEN}"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+    networks:
+      - uip-net
+
+  # ============================================
+  # Auth API - Authentication Service
+  # ============================================
+  auth-api:
+    image: python:3.12-slim
+    container_name: uip-auth-api
+    restart: unless-stopped
+    command: python3 -u /app/auth-api.py
+    volumes:
+      - ./auth-api/auth-api.py:/app/auth-api.py:ro
+      - auth_data:/data
+    environment:
+      API_PORT: "8093"
+      DB_PATH: /data/auth.db
+      AUTH_SECRET: "${AUTH_SECRET}"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+    networks:
+      - uip-net
+
+  # ============================================
+  # Alert State API - Investigation Tracking
+  # ============================================
+  alert-state-api:
+    image: python:3.12-slim
+    container_name: uip-alert-state-api
+    restart: unless-stopped
+    command: python3 -u /app/alert-state-api.py
+    volumes:
+      - ./alert-state-api/alert-state-api.py:/app/alert-state-api.py:ro
+      - alert_state_data:/data
+    environment:
+      API_PORT: "8092"
+      DB_PATH: /data/alert-states.db
+      AUTH_SECRET: "${AUTH_SECRET}"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+    networks:
+      - uip-net
+
+  # ============================================
+  # Loki Gateway - Log Query Service
+  # ============================================
+  loki-gateway:
+    image: python:3.12-slim
+    container_name: uip-loki-gateway
+    restart: unless-stopped
+    command: python3 -u /app/loki-gateway.py
+    volumes:
+      - ./loki-gateway/loki-gateway.py:/app/loki-gateway.py:ro
+    environment:
+      API_PORT: "8091"
+      AUTH_SECRET: "${AUTH_SECRET}"
       GRAFANA_URL: "https://grafana.prod-domains-shared.bra2.tucows.systems"
       GRAFANA_USER: "${GRAFANA_USER}"
       GRAFANA_PASS: "${GRAFANA_PASS}"
       LOKI_DATASOURCE_ID: "17"
-      LOKI_POLL_INTERVAL: "300"
-      LOKI_QUERY_WINDOW: "3600"
     deploy:
       resources:
         limits:
@@ -307,6 +347,9 @@ services:
       - n8n
       - health-checker
       - runbook-api
+      - auth-api
+      - alert-state-api
+      - loki-gateway
     deploy:
       resources:
         limits:
@@ -321,6 +364,8 @@ volumes:
   ollama_data:
   n8n_data:
   runbook_data:
+  auth_data:
+  alert_state_data:
 
 networks:
   uip-net:

@@ -208,6 +208,7 @@ class FeedbackTracker:
 feedback_tracker = FeedbackTracker()
 
 RUNBOOK_API_URL = os.environ.get("RUNBOOK_API_URL", "http://runbook-api:8090")
+LOKI_GATEWAY_URL = os.environ.get('LOKI_GATEWAY_URL', 'http://loki-gateway:8091')
 
 
 def fetch_runbook_entries(alert_name, hostname, service=None):
@@ -248,7 +249,7 @@ def fetch_log_context(alert_name, hostname):
     params = f"alert_name={quote(alert_name)}"
     if hostname and hostname.lower() not in ("unknown", "n/a", ""):
         params += f"&hostname={quote(hostname)}"
-    url = f"{RUNBOOK_API_URL}/api/runbook/log-context?{params}"
+    url = f"{LOKI_GATEWAY_URL}/api/loki/log-context?{params}"
     try:
         req = Request(url, headers={"Accept": "application/json"})
         resp = urlopen(req, timeout=5)
