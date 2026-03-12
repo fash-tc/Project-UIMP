@@ -24,6 +24,7 @@ import {
   unacknowledgeAlerts,
   markAlertsUpdated,
   getSourceLabel,
+  forceEnrich,
 } from '@/lib/keep-api';
 import { getClientUsername } from '@/lib/auth';
 import { detectRegistryFromAlert, buildRegistryMailto } from '@/lib/registry';
@@ -180,6 +181,7 @@ export default function CommandCenter() {
           onUnacknowledge={handleUnacknowledge}
           onGroupAcknowledge={handleGroupAcknowledge}
           onGroupResolve={handleGroupResolve}
+          onForceEnrich={async (fp: string) => { await forceEnrich(fp); load(); }}
           onRefresh={load}
         />
       ) : (

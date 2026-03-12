@@ -616,3 +616,16 @@ export async function markAlertsUpdated(fingerprints: string[]): Promise<boolean
     return false;
   }
 }
+
+export async function forceEnrich(fingerprint: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/force-enrich`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fingerprint }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}

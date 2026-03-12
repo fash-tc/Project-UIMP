@@ -305,7 +305,14 @@ export interface DashboardViewProps {
   onAcknowledge: (alert: Alert) => void;
   onUnacknowledge: (alert: Alert) => void;
   onGroupAcknowledge: (fingerprints: string[], names: Record<string, string>, starts: Record<string, string>) => void;
+  onGroupResolve: (fingerprints: string[]) => Promise<void>;
+  onForceEnrich?: (fingerprint: string) => Promise<void>;
   onRefresh: () => void;
+}
+
+function isSuppressedNote(note: string | undefined | null): boolean {
+  if (!note) return false;
+  return note.startsWith('NOISE:') || note.startsWith('ENRICHMENT (copied');
 }
 
 export default function DashboardView({
@@ -317,6 +324,8 @@ export default function DashboardView({
   onAcknowledge,
   onUnacknowledge,
   onGroupAcknowledge,
+  onGroupResolve,
+  onForceEnrich,
 }: DashboardViewProps) {
   const [sevFilter, setSevFilter] = useState<string | null>(null);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
@@ -326,12 +335,14 @@ export default function DashboardView({
   const [currentPage, setCurrentPage] = useState(0);
   const [groupView, setGroupView] = useState(true);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
-  const [dashboardTab, setDashboardTab] = useState<'firing' | 'acknowledged'>('firing');
+  const [dashboardTab, setDashboardTab] = useState<'firing' | 'acknowledged' | 'suppressed'>('firing');
 
   const activeAlerts = alerts.filter(a => a.status !== 'resolved' && a.status !== 'ok');
-  const firingAlerts = activeAlerts.filter(a => !alertStates.get(a.fingerprint)?.acknowledged_by);
-  const ackedAlerts = activeAlerts.filter(a => !!alertStates.get(a.fingerprint)?.acknowledged_by);
-  const tabAlerts = dashboardTab === 'firing' ? firingAlerts : ackedAlerts;
+  const suppressedAlerts = activeAlerts.filter(a => isSuppressedNote(a.note));
+  const nonSuppressedAlerts = activeAlerts.filter(a => !isSuppressedNote(a.note));
+  const firingAlerts = nonSuppressedAlerts.filter(a => !alertStates.get(a.fingerprint)?.acknowledged_by);
+  const ackedAlerts = nonSuppressedAlerts.filter(a => !!alertStates.get(a.fingerprint)?.acknowledged_by);
+  const tabAlerts = dashboardTab === 'firing' ? firingAlerts : dashboardTab === 'acknowledged' ? ackedAlerts : suppressedAlerts;
 
   const stats = useMemo(() => computeStats(firingAlerts), [firingAlerts]);
 
@@ -435,6 +446,15 @@ export default function DashboardView({
     onGroupAcknowledge(fps, names, starts);
   }
 
+  const [resolvingGroups, setResolvingGroups] = useState<Set<string>>(new Set());
+
+  async function handleGroupResolve(group: AlertGroup) {
+    if (!confirm(`Resolve all ${group.alerts.length} alerts in "${group.label}"?`)) return;
+    setResolvingGroups(prev => new Set(prev).add(group.key));
+    await onGroupResolve(group.alerts.map(a => a.fingerprint));
+    setResolvingGroups(prev => { const n = new Set(prev); n.delete(group.key); return n; });
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -478,6 +498,18 @@ export default function DashboardView({
         >
           Acknowledged ({ackedAlerts.length})
         </button>
+        {suppressedAlerts.length > 0 && (
+          <button
+            onClick={() => setDashboardTab('suppressed')}
+            className={`px-4 py-1.5 rounded-md text-xs font-medium transition-colors ${
+              dashboardTab === 'suppressed'
+                ? 'bg-accent text-white'
+                : 'text-muted hover:text-text-bright'
+            }`}
+          >
+            Suppressed ({suppressedAlerts.length})
+          </button>
+        )}
       </div>
 
       {/* Active filter indicator */}
@@ -554,7 +586,59 @@ export default function DashboardView({
               </tr>
             </thead>
             <tbody>
-              {groupView ? (
+              {dashboardTab === 'suppressed' ? (
+                sortedAlerts.length === 0 ? (
+                  <tr>
+                    <td colSpan={6} className="table-cell text-center text-muted py-8">
+                      No suppressed alerts
+                    </td>
+                  </tr>
+                ) : (
+                  sortedAlerts.map(alert => {
+                    const host = alert.hostName || alert.hostname || '';
+                    const source = getSourceLabel(alert);
+                    const note = alert.note || '';
+                    const reason = note.startsWith('NOISE:')
+                      ? note.split('\n')[0]
+                      : note.startsWith('ENRICHMENT (copied')
+                        ? note.split('):')[0] + ')'
+                        : note.substring(0, 80);
+                    return (
+                      <tr key={alert.fingerprint || alert.id} className="border-b border-border/50 hover:bg-surface-hover transition-colors">
+                        <td className="table-cell">
+                          <span className="badge bg-surface text-muted border border-border">suppressed</span>
+                        </td>
+                        <td className="table-cell">
+                          <button
+                            onClick={() => onAlertClick(alert)}
+                            className="text-left text-text-bright hover:text-accent transition-colors"
+                          >
+                            {alert.name?.substring(0, 60) || 'Unknown'}
+                          </button>
+                        </td>
+                        <td className="table-cell text-muted text-xs font-mono">{host}</td>
+                        <td className="table-cell text-xs text-muted">{source}</td>
+                        <td className="table-cell text-xs text-yellow max-w-xs">
+                          <div className="truncate">{reason}</div>
+                        </td>
+                        <td className="table-cell text-xs">
+                          <div className="flex items-center gap-2">
+                            <span className="text-muted">{timeAgo(alertStartTime(alert))}</span>
+                            {onForceEnrich && (
+                              <button
+                                onClick={() => onForceEnrich(alert.fingerprint)}
+                                className="text-[10px] px-2 py-0.5 rounded border border-accent/50 text-accent hover:bg-accent/10 transition-colors whitespace-nowrap"
+                              >
+                                Force Enrich
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )
+              ) : groupView ? (
                 alertGroups.length === 0 ? (
                   <tr>
                     <td colSpan={6} className="table-cell text-center text-muted py-8">
@@ -585,12 +669,21 @@ export default function DashboardView({
                                 return t > l ? a : latest;
                               })))}
                               {dashboardTab === 'firing' && (
-                                <button
-                                  onClick={(e) => { e.stopPropagation(); handleGroupAck(group); }}
-                                  className="text-[10px] px-2 py-0.5 rounded border border-border text-muted hover:text-green hover:border-green/50 transition-colors"
-                                >
-                                  Ack Group
-                                </button>
+                                <>
+                                  <button
+                                    onClick={(e) => { e.stopPropagation(); handleGroupAck(group); }}
+                                    className="text-[10px] px-2 py-0.5 rounded border border-border text-muted hover:text-green hover:border-green/50 transition-colors"
+                                  >
+                                    Ack Group
+                                  </button>
+                                  <button
+                                    onClick={(e) => { e.stopPropagation(); handleGroupResolve(group); }}
+                                    disabled={resolvingGroups.has(group.key)}
+                                    className="text-[10px] px-2 py-0.5 rounded border border-border text-muted hover:text-accent hover:border-accent/50 transition-colors disabled:opacity-40"
+                                  >
+                                    {resolvingGroups.has(group.key) ? 'Resolving...' : 'Resolve Group'}
+                                  </button>
+                                </>
                               )}
                             </span>
                           </div>
