@@ -48,8 +48,8 @@ export const TLD_OPERATOR_MAP: Record<string, string> = {
   '.co.in': 'identity-digital',
   '.info': 'identity-digital',
   '.it': 'nicit',
-  '.me': 'identity-digital-me',
-  '.mobi': 'identity-digital-mobi',
+  '.me': 'identity-digital',
+  '.mobi': 'identity-digital',
   '.moe': 'godaddy-registry',
   '.mx': 'nic-mx',
   '.com.mx': 'nic-mx',
@@ -61,7 +61,7 @@ export const TLD_OPERATOR_MAP: Record<string, string> = {
   '.pro': 'registrypro',
   '.shop': 'gmo-registry',
   '.tel': 'godaddy-registry',
-  '.tv': 'godaddy-registry',
+  '.tv': 'verisign',
   '.uk': 'nominet',
   '.co.uk': 'nominet',
   '.me.uk': 'nominet',
@@ -88,26 +88,6 @@ export const REGISTRY_OPERATORS: RegistryOperator[] = [
     notes: 'Afilias is Identity Digital. Passphrase for .INFO: pinkmouse. Passphrase for .IN: pink elephant.',
   },
   {
-    id: 'identity-digital-me',
-    name: 'Identity Digital (.ME)',
-    tlds: ['.me'],
-    type: 'sTLD',
-    contacts: [
-      { role: 'Support', phone: '+1 416.619.3037', email: 'support@registry.me' },
-    ],
-    hours: '24x7x365',
-  },
-  {
-    id: 'identity-digital-mobi',
-    name: 'Identity Digital (.MOBI)',
-    tlds: ['.mobi'],
-    type: 'gTLD',
-    contacts: [
-      { role: 'Tech Support', phone: '+1.416.619.3039', email: 'techsupport@registry.mobi' },
-    ],
-    hours: '24x7x365',
-  },
-  {
     id: 'verisign',
     name: 'Verisign',
     tlds: ['.com', '.net', '.cc', '.name', '.tv'],
@@ -122,7 +102,7 @@ export const REGISTRY_OPERATORS: RegistryOperator[] = [
   {
     id: 'godaddy-registry',
     name: 'GoDaddy Registry (formerly Neustar)',
-    tlds: ['.biz', '.cn', '.com.cn', '.co', '.tel', '.us', '.moe', '.tv'],
+    tlds: ['.biz', '.cn', '.com.cn', '.co', '.tel', '.us', '.moe'],
     type: 'gTLD/ccTLD',
     contacts: [
       { role: 'Support', phone: '+1 (480) 651-9999', notes: 'Help center: https://helpcenter.registry.godaddy/s/' },
