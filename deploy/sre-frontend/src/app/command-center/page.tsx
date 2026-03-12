@@ -24,7 +24,7 @@ import {
   getSourceLabel,
 } from '@/lib/keep-api';
 import { getClientUsername } from '@/lib/auth';
-import { detectRegistryFromAlert, buildRegistryMailto } from '@/lib/registry-contacts';
+import { detectRegistryFromAlert, buildRegistryMailto } from '@/lib/registry';
 import DashboardView from './DashboardView';
 import AlertsTableView from './AlertsTableView';
 

@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { fetchRegistryHealth, RegistryHealthData, RegistryHealthOperator } from '@/lib/keep-api';
-import { REGISTRY_OPERATORS } from '@/lib/registry-contacts';
+import { REGISTRY_OPERATORS } from '@/lib/registry';
 
 interface MaintenanceEvent {
   id: number;
