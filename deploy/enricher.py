@@ -245,6 +245,22 @@ def fetch_ai_instructions():
 
 
 
+def fetch_feedback_matches(alert_name, service=""):
+    """Fetch structured SRE feedback corrections for similar alerts."""
+    from urllib.parse import quote
+    params = f"alert_name={quote(alert_name)}"
+    if service:
+        params += f"&service={quote(service)}"
+    url = f"{RUNBOOK_API_URL}/api/runbook/feedback/match?{params}"
+    req = Request(url, headers={"Content-Type": "application/json"})
+    try:
+        resp = urlopen(req, timeout=5)
+        return json.loads(resp.read())
+    except Exception as e:
+        log.warning(f"Feedback match fetch failed: {e}")
+        return []
+
+
 def infer_service(alert):
     """Infer the service name from alert name/hostname using the service dependency map."""
     name = alert.get("name", "").lower()
@@ -443,7 +459,26 @@ def build_enrichment_prompt(alert, similar_alerts):
     if freq > 1:
         freq_context = f"\nPATTERN: This alert has appeared {freq} times in the recent window.\n"
 
-    # SRE feedback context
+    # Structured SRE feedback from similar alerts
+    service = infer_service(alert)
+    feedback_matches = fetch_feedback_matches(name, service or "")
+    feedback_context = ""
+    if feedback_matches:
+        lines = ["\nSRE CORRECTIONS FOR SIMILAR ALERTS (apply these corrections to your analysis):"]
+        for fb in feedback_matches:
+            lines.append(f'  - Pattern: "{fb["alert_pattern"]}" (by {fb["sre_user"]})')
+            if fb.get("severity_correction"):
+                lines.append(f'    Severity should be: {fb["severity_correction"]}')
+            if fb.get("cause_correction"):
+                lines.append(f'    Cause correction: {fb["cause_correction"]}')
+            if fb.get("remediation_correction"):
+                lines.append(f'    Remediation: {fb["remediation_correction"]}')
+            if fb.get("full_text"):
+                lines.append(f'    Notes: {fb["full_text"][:200]}')
+        lines.append("  IMPORTANT: Apply these SRE corrections to your assessment.\n")
+        feedback_context = "\n".join(lines)
+
+    # Legacy lessons context (secondary signal)
     lessons_context = feedback_tracker.build_lessons_context(alert)
     direct_feedback = parse_sre_feedback(alert.get("note", "") or "")
     direct_fb_context = ""
@@ -458,7 +493,6 @@ def build_enrichment_prompt(alert, similar_alerts):
         direct_fb_context += "  IMPORTANT: Respect the SRE's corrections in your assessment.\n"
 
     # Runbook entries context
-    service = infer_service(alert)
     runbook_entries = fetch_runbook_entries(name, host, service)
     runbook_context = ""
     if runbook_entries:
@@ -524,6 +558,7 @@ def build_enrichment_prompt(alert, similar_alerts):
         f"{log_context}"
         f"{dedup_context}"
         f"{freq_context}"
+        f"{feedback_context}"
         f"{lessons_context}"
         f"{direct_fb_context}"
         f"{runbook_context}"

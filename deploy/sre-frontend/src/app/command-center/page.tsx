@@ -7,6 +7,7 @@ import {
   parseAIEnrichment,
   parseSREFeedback,
   submitFeedback,
+  submitStructuredFeedback,
   severityColor,
   severityBg,
   timeAgo,
@@ -14,6 +15,7 @@ import {
   fetchRunbookMatches,
   submitRunbookEntry,
   resolveAlert,
+  resolveAlerts,
   silenceAlert,
   createJiraIncident,
   fetchAlertStates,
@@ -102,6 +104,11 @@ export default function CommandCenter() {
     load();
   }
 
+  async function handleGroupResolve(fingerprints: string[]) {
+    await resolveAlerts(fingerprints);
+    load();
+  }
+
   function handleAlertRefresh() {
     load();
     if (selectedAlert) {
@@ -172,6 +179,7 @@ export default function CommandCenter() {
           onAcknowledge={handleAcknowledge}
           onUnacknowledge={handleUnacknowledge}
           onGroupAcknowledge={handleGroupAcknowledge}
+          onGroupResolve={handleGroupResolve}
           onRefresh={load}
         />
       ) : (
@@ -404,6 +412,8 @@ function AlertDetailModal({ alert, onClose, onRefresh, alertState, onInvestigate
               existingFeedback={parseSREFeedback(alert.note)}
               enrichment={enrichment}
               onFeedbackSubmitted={onRefresh}
+              alertName={alert.name}
+              hostname={alert.hostName || alert.hostname || ''}
             />
           )}
 
@@ -477,12 +487,16 @@ function ModalFeedbackPanel({
   existingFeedback,
   enrichment,
   onFeedbackSubmitted,
+  alertName,
+  hostname,
 }: {
   fingerprint: string;
   currentNote: string | undefined | null;
   existingFeedback: SREFeedback | null;
   enrichment: { assessed_severity: string; noise_score: number };
   onFeedbackSubmitted?: () => void;
+  alertName: string;
+  hostname: string;
 }) {
   const [rating, setRating] = useState<'positive' | 'negative' | null>(
     existingFeedback?.rating === 'positive' ? 'positive' :
@@ -490,6 +504,8 @@ function ModalFeedbackPanel({
   );
   const [correctedSeverity, setCorrectedSeverity] = useState(existingFeedback?.corrected_severity ?? '');
   const [correctedNoise, setCorrectedNoise] = useState(existingFeedback?.corrected_noise?.toString() ?? '');
+  const [causeCorrection, setCauseCorrection] = useState('');
+  const [remediationCorrection, setRemediationCorrection] = useState('');
   const [comment, setComment] = useState(existingFeedback?.comment ?? '');
   const [sreUser] = useState(() => existingFeedback?.sre_user || getClientUsername() || '');
   const [submitting, setSubmitting] = useState(false);
@@ -512,7 +528,19 @@ function ModalFeedbackPanel({
       sre_user: sreUser || undefined,
     };
 
-    const ok = await submitFeedback(fingerprint, currentNote, feedback);
+    // Submit both legacy (note-based) and structured feedback in parallel
+    const [ok] = await Promise.all([
+      submitFeedback(fingerprint, currentNote, feedback),
+      submitStructuredFeedback({
+        alert_name: alertName,
+        hostname: hostname,
+        service: '',
+        severity_correction: correctedSeverity || '',
+        cause_correction: causeCorrection || '',
+        remediation_correction: remediationCorrection || '',
+        full_text: comment || '',
+      }),
+    ]);
     setSubmitting(false);
     if (ok) {
       setSubmitted(true);
@@ -645,10 +673,37 @@ function ModalFeedbackPanel({
             </div>
           )}
 
+          {rating === 'negative' && (
+            <div className="space-y-2">
+              <div>
+                <label className="text-[10px] text-muted block mb-1">Correct cause (what&apos;s actually wrong?)</label>
+                <textarea
+                  value={causeCorrection}
+                  onChange={(e) => setCauseCorrection(e.target.value)}
+                  maxLength={300}
+                  rows={2}
+                  placeholder='e.g. "This is expected during monthly batch processing"'
+                  className="w-full bg-bg border border-border rounded-md px-2 py-1.5 text-xs text-text placeholder-muted/50 focus:border-accent focus:outline-none resize-y"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] text-muted block mb-1">Correct remediation (what should be done?)</label>
+                <textarea
+                  value={remediationCorrection}
+                  onChange={(e) => setRemediationCorrection(e.target.value)}
+                  maxLength={300}
+                  rows={2}
+                  placeholder='e.g. "No action needed, auto-resolves after batch completes"'
+                  className="w-full bg-bg border border-border rounded-md px-2 py-1.5 text-xs text-text placeholder-muted/50 focus:border-accent focus:outline-none resize-y"
+                />
+              </div>
+            </div>
+          )}
+
           {rating && (
             <div>
               <label className="text-[10px] text-muted block mb-1">
-                {rating === 'positive' ? 'Notes (optional)' : 'What should the AI learn?'}
+                {rating === 'positive' ? 'Notes (optional)' : 'Additional notes'}
               </label>
               <textarea
                 value={comment}
@@ -657,7 +712,7 @@ function ModalFeedbackPanel({
                 rows={2}
                 placeholder={rating === 'positive'
                   ? 'Additional context...'
-                  : 'e.g. "Known maintenance window, noise should be higher"'
+                  : 'Any other context for future enrichments'
                 }
                 className="w-full bg-bg border border-border rounded-md px-2 py-1.5 text-xs text-text placeholder-muted/50 focus:border-accent focus:outline-none resize-y"
               />

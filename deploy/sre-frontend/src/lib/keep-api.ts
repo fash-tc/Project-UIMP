@@ -259,6 +259,27 @@ export async function submitFeedback(
   return res.ok;
 }
 
+export async function submitStructuredFeedback(data: {
+  alert_name: string;
+  hostname: string;
+  service: string;
+  severity_correction: string;
+  cause_correction: string;
+  remediation_correction: string;
+  full_text: string;
+}): Promise<boolean> {
+  try {
+    const res = await fetch('/api/runbook/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 // ── Runbook API ──────────────────────────────────────
 
 const RUNBOOK_BASE = '/api/runbook';
@@ -326,6 +347,17 @@ export async function resolveAlert(fingerprint: string): Promise<boolean> {
       }),
     });
     return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function resolveAlerts(fingerprints: string[]): Promise<boolean> {
+  try {
+    const results = await Promise.all(
+      fingerprints.map(fp => resolveAlert(fp))
+    );
+    return results.every(ok => ok);
   } catch {
     return false;
   }
@@ -420,8 +452,8 @@ export async function fetchRegistryHealth(): Promise<RegistryHealthData | null> 
   }
 }
 
-export async function fetchRegistryTrends(operatorId: string, rangeHours: number = 24) {
-  const res = await fetch(`${LOKI_BASE}/registry-trends?operator=${encodeURIComponent(operatorId)}&range=${rangeHours}`);
+export async function fetchRegistryTrends(operatorId: string, rangeSeconds: number = 86400) {
+  const res = await fetch(`${LOKI_BASE}/registry-trends?operator=${encodeURIComponent(operatorId)}&range_seconds=${rangeSeconds}`);
   if (!res.ok) throw new Error(`Registry trends failed: ${res.status}`);
   return res.json();
 }

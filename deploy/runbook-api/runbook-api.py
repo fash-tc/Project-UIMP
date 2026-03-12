@@ -13,6 +13,7 @@ import base64
 import hashlib
 import hmac as hmac_mod
 import time
+import threading
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -36,6 +37,26 @@ STOP_WORDS = {
     "do", "does", "did", "but", "if", "no", "than", "too", "very",
     "can", "will", "just", "-", "",
 }
+
+_db_lock = threading.Lock()
+
+
+def normalize_alert_pattern(alert_name, hostname=""):
+    """Normalize alert name for feedback matching: lowercase, strip hostname suffix."""
+    pattern = (alert_name or "").lower().strip()
+    if hostname:
+        host_lower = hostname.lower()
+        for sep in [" on ", " for ", " at ", " - ", ": "]:
+            idx = pattern.find(sep + host_lower)
+            if idx != -1:
+                pattern = pattern[:idx].strip()
+                break
+        if pattern.endswith(host_lower):
+            pattern = pattern[:len(pattern) - len(host_lower)].rstrip(" -:")
+    # Strip timestamps
+    pattern = re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?', '', pattern).strip()
+    return pattern
+
 
 # ── Database ──────────────────────────────────────────
 
@@ -70,6 +91,22 @@ def init_db():
             updated_at TEXT DEFAULT (datetime('now'))
         )
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_pattern TEXT NOT NULL,
+            service TEXT DEFAULT '',
+            severity_correction TEXT DEFAULT '',
+            cause_correction TEXT DEFAULT '',
+            remediation_correction TEXT DEFAULT '',
+            full_text TEXT DEFAULT '',
+            sre_user TEXT NOT NULL,
+            usefulness_score REAL DEFAULT 1.0,
+            created_at TEXT DEFAULT (datetime('now')),
+            reinforced_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_feedback_pattern ON feedback(alert_pattern)")
     db.commit()
     log.info(f"Database initialized at {DB_PATH}")
     return db
@@ -382,6 +419,57 @@ class RunbookHandler(BaseHTTPRequestHandler):
                 "active_instructions": instr_count,
             })
 
+        elif path == "/api/runbook/feedback/match":
+            alert_name = params.get("alert_name", [""])[0]
+            service = params.get("service", [""])[0].lower()
+            if not alert_name:
+                self._send_json(400, {"error": "alert_name required"})
+                return
+
+            pattern = normalize_alert_pattern(alert_name)
+            pattern_tokens = set(pattern.lower().split())
+            stop_words = {"the", "a", "an", "is", "on", "for", "at", "in", "to", "of", "and", "or"}
+            pattern_tokens -= stop_words
+
+            with _db_lock:
+                # Apply decay: one-time halve for entries not reinforced in 90 days
+                db.execute(
+                    "UPDATE feedback SET usefulness_score = 0.5 "
+                    "WHERE reinforced_at < datetime('now', '-90 days') AND usefulness_score >= 1.0"
+                )
+                db.commit()
+
+                rows = db.execute(
+                    "SELECT * FROM feedback WHERE usefulness_score >= 0.1 ORDER BY created_at DESC LIMIT 100"
+                ).fetchall()
+
+            results = []
+            for row in rows:
+                row_tokens = set(row["alert_pattern"].lower().split()) - stop_words
+                if not row_tokens:
+                    continue
+                overlap = len(pattern_tokens & row_tokens)
+                if overlap == 0:
+                    continue
+                score = overlap / max(len(pattern_tokens), 1)
+                if service and row["service"] == service:
+                    score += 0.3
+                results.append({
+                    "id": row["id"],
+                    "alert_pattern": row["alert_pattern"],
+                    "service": row["service"],
+                    "severity_correction": row["severity_correction"],
+                    "cause_correction": row["cause_correction"],
+                    "remediation_correction": row["remediation_correction"],
+                    "full_text": row["full_text"],
+                    "sre_user": row["sre_user"],
+                    "score": round(score * row["usefulness_score"], 3),
+                    "created_at": row["created_at"],
+                })
+
+            results.sort(key=lambda x: (-x["score"], x["created_at"]))
+            self._send_json(200, results[:5])
+
         elif path.startswith("/api/runbook/entries/"):
             try:
                 entry_id = int(path.split("/")[-1])
@@ -437,6 +525,55 @@ class RunbookHandler(BaseHTTPRequestHandler):
             entry_id = cursor.lastrowid
             log.info(f"Created runbook entry #{entry_id}: {alert_name[:60]}")
             self._send_json(201, {"id": entry_id, "status": "created"})
+
+        elif path == "/api/runbook/feedback":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "auth required"})
+                return
+
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+
+            alert_pattern = normalize_alert_pattern(
+                data.get("alert_name", ""),
+                data.get("hostname", "")
+            )
+            if not alert_pattern:
+                self._send_json(400, {"error": "alert_name required"})
+                return
+
+            service = (data.get("service") or "").lower().strip()
+            sev = (data.get("severity_correction") or "").strip()
+            cause = (data.get("cause_correction") or "").strip()
+            remed = (data.get("remediation_correction") or "").strip()
+            full = (data.get("full_text") or "").strip()
+
+            with _db_lock:
+                existing = db.execute(
+                    "SELECT id FROM feedback WHERE alert_pattern = ? AND service = ? AND sre_user = ?",
+                    (alert_pattern, service, username)
+                ).fetchone()
+                if existing:
+                    db.execute(
+                        "UPDATE feedback SET reinforced_at = datetime('now'), usefulness_score = 1.0, "
+                        "severity_correction = ?, cause_correction = ?, remediation_correction = ?, full_text = ? "
+                        "WHERE id = ?",
+                        (sev, cause, remed, full, existing["id"])
+                    )
+                    db.commit()
+                    self._send_json(200, {"status": "reinforced", "id": existing["id"]})
+                else:
+                    cursor = db.execute(
+                        "INSERT INTO feedback (alert_pattern, service, severity_correction, cause_correction, "
+                        "remediation_correction, full_text, sre_user) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (alert_pattern, service, sev, cause, remed, full, username)
+                    )
+                    db.commit()
+                    self._send_json(201, {"status": "created", "id": cursor.lastrowid})
 
         elif path == "/api/runbook/ai-instructions":
             try:
