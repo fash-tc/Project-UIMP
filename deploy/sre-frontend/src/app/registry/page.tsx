@@ -513,14 +513,14 @@ function OperatorDetailModal({ operator, alerts, health, onClose }: {
   const [trendsData, setTrendsData] = useState<any>(null);
   const [trendsLoading, setTrendsLoading] = useState(false);
   const [trendsError, setTrendsError] = useState<string | null>(null);
-  const [trendsRange, setTrendsRange] = useState(24);
+  const [trendsRange, setTrendsRange] = useState(86400);
 
-  const loadTrends = async (hours: number) => {
+  const loadTrends = async (seconds: number) => {
     setTrendsLoading(true);
     setTrendsError(null);
-    setTrendsRange(hours);
+    setTrendsRange(seconds);
     try {
-      const data = await fetchRegistryTrends(operator.id, hours);
+      const data = await fetchRegistryTrends(operator.id, seconds);
       setTrendsData(data);
     } catch (err: any) {
       setTrendsError(err.message || 'Failed to load trends');
@@ -689,12 +689,12 @@ function OperatorDetailModal({ operator, alerts, health, onClose }: {
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-medium text-text-bright">Performance Trends</h3>
               <div className="flex gap-1">
-                {[{ label: '6h', hours: 6 }, { label: '24h', hours: 24 }, { label: '7d', hours: 168 }].map(opt => (
+                {[{ label: '5m', secs: 300 }, { label: '15m', secs: 900 }, { label: '30m', secs: 1800 }, { label: '1h', secs: 3600 }, { label: '6h', secs: 21600 }, { label: '24h', secs: 86400 }, { label: '7d', secs: 604800 }].map(opt => (
                   <button
-                    key={opt.hours}
-                    onClick={() => loadTrends(opt.hours)}
+                    key={opt.secs}
+                    onClick={() => loadTrends(opt.secs)}
                     className={`px-2.5 py-1 rounded-md text-[10px] font-medium transition-colors ${
-                      trendsRange === opt.hours && trendsData
+                      trendsRange === opt.secs && trendsData
                         ? 'bg-accent text-bg'
                         : 'border border-border text-muted hover:text-text hover:bg-surface-hover'
                     }`}
@@ -711,7 +711,7 @@ function OperatorDetailModal({ operator, alerts, health, onClose }: {
               <div className="text-xs text-red text-center py-4">{trendsError}</div>
             )}
             {trendsData && trendsData.buckets && !trendsLoading && (
-              <TrendsChart buckets={trendsData.buckets} />
+              <TrendsTable buckets={trendsData.buckets} />
             )}
             {!trendsData && !trendsLoading && !trendsError && (
               <div className="text-xs text-muted text-center py-6 bg-bg/40 border border-border rounded-lg">
@@ -821,40 +821,84 @@ function ContactRow({ operator, contact }: { operator: RegistryOperator; contact
 
 /* ── Trends Chart ── */
 
-function TrendsChart({ buckets }: { buckets: Array<{ timestamp: string; avg_response_ms: number; error_rate: number; request_count: number }> }) {
-  if (!buckets.length) return null;
-  const width = 600;
-  const height = 200;
-  const padding = { top: 20, right: 60, bottom: 30, left: 50 };
-  const chartW = width - padding.left - padding.right;
-  const chartH = height - padding.top - padding.bottom;
+function TrendsTable({ buckets }: { buckets: Array<{ timestamp: string; avg_response_ms: number; error_rate: number; request_count: number }> }) {
+  if (!buckets.length) return <div className="text-xs text-muted text-center py-4">No data for this time range.</div>;
 
-  const maxMs = Math.max(...buckets.map(b => b.avg_response_ms), 1);
-  const maxErr = Math.max(...buckets.map(b => b.error_rate), 0.01);
-  const maxReq = Math.max(...buckets.map(b => b.request_count), 1);
+  // Summary stats across all buckets
+  const totalRequests = buckets.reduce((s, b) => s + b.request_count, 0);
+  const weightedMs = buckets.reduce((s, b) => s + b.avg_response_ms * b.request_count, 0);
+  const avgMs = totalRequests > 0 ? weightedMs / totalRequests : 0;
+  const maxMs = Math.max(...buckets.map(b => b.avg_response_ms));
+  const totalErrors = buckets.reduce((s, b) => s + Math.round(b.error_rate * b.request_count), 0);
+  const overallErrorRate = totalRequests > 0 ? totalErrors / totalRequests : 0;
 
-  const xScale = (i: number) => padding.left + (i / (buckets.length - 1 || 1)) * chartW;
-  const yMs = (v: number) => padding.top + chartH - (v / maxMs) * chartH;
-  const yErr = (v: number) => padding.top + chartH - (v / maxErr) * chartH;
-
-  const msLine = buckets.map((b, i) => `${i === 0 ? 'M' : 'L'}${xScale(i)},${yMs(b.avg_response_ms)}`).join(' ');
-  const errLine = buckets.map((b, i) => `${i === 0 ? 'M' : 'L'}${xScale(i)},${yErr(b.error_rate)}`).join(' ');
-  const barW = Math.max(chartW / buckets.length - 2, 2);
+  const formatTime = (ts: string) => {
+    try {
+      const d = new Date(ts);
+      return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+    } catch { return ts; }
+  };
 
   return (
-    <div className="bg-gray-800/50 rounded-lg p-4">
-      <svg viewBox={`0 0 ${width} ${height}`} className="w-full" style={{ maxHeight: '200px' }}>
-        {buckets.map((b, i) => (
-          <rect key={i} x={xScale(i) - barW / 2} y={padding.top + chartH - (b.request_count / maxReq) * chartH}
-            width={barW} height={(b.request_count / maxReq) * chartH} fill="rgba(139, 92, 246, 0.15)" />
-        ))}
-        <path d={msLine} fill="none" stroke="#a78bfa" strokeWidth="2" />
-        <path d={errLine} fill="none" stroke="#f87171" strokeWidth="2" />
-      </svg>
-      <div className="flex gap-4 mt-2 text-xs text-gray-500 justify-center">
-        <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-purple-400 inline-block" /> Avg Response (ms)</span>
-        <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-red-400 inline-block" /> Error Rate</span>
-        <span className="flex items-center gap-1"><span className="w-3 h-1 bg-purple-400/20 inline-block" /> Requests</span>
+    <div className="space-y-3">
+      {/* Summary Cards */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div className="bg-bg/40 border border-border rounded-lg px-3 py-2 text-center">
+          <div className="text-[10px] text-muted uppercase">Avg Response</div>
+          <div className="text-sm font-bold text-text-bright">{avgMs.toFixed(0)}ms</div>
+          <div className="text-[10px] text-muted">peak: {maxMs.toFixed(0)}ms</div>
+        </div>
+        <div className="bg-bg/40 border border-border rounded-lg px-3 py-2 text-center">
+          <div className="text-[10px] text-muted uppercase">Requests</div>
+          <div className="text-sm font-bold text-text-bright">{totalRequests.toLocaleString()}</div>
+          <div className="text-[10px] text-muted">{buckets.length} buckets</div>
+        </div>
+        <div className="bg-bg/40 border border-border rounded-lg px-3 py-2 text-center">
+          <div className="text-[10px] text-muted uppercase">Error Rate</div>
+          <div className={`text-sm font-bold ${overallErrorRate > 0.1 ? 'text-red' : overallErrorRate > 0.01 ? 'text-orange' : 'text-green'}`}>
+            {(overallErrorRate * 100).toFixed(1)}%
+          </div>
+          <div className="text-[10px] text-muted">{totalErrors} errors</div>
+        </div>
+        <div className="bg-bg/40 border border-border rounded-lg px-3 py-2 text-center">
+          <div className="text-[10px] text-muted uppercase">Status</div>
+          <div className={`text-sm font-bold ${overallErrorRate > 0.1 ? 'text-red' : overallErrorRate > 0.01 ? 'text-orange' : 'text-green'}`}>
+            {overallErrorRate > 0.1 ? 'DEGRADED' : overallErrorRate > 0.01 ? 'WARNING' : 'HEALTHY'}
+          </div>
+        </div>
+      </div>
+
+      {/* Bucket Table */}
+      <div className="bg-bg/40 border border-border rounded-lg overflow-hidden">
+        <div className="max-h-[200px] overflow-y-auto">
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 bg-surface">
+              <tr className="border-b border-border">
+                <th className="text-left px-3 py-1.5 text-muted font-medium">Time</th>
+                <th className="text-right px-3 py-1.5 text-muted font-medium">Avg (ms)</th>
+                <th className="text-right px-3 py-1.5 text-muted font-medium">Requests</th>
+                <th className="text-right px-3 py-1.5 text-muted font-medium">Errors</th>
+              </tr>
+            </thead>
+            <tbody>
+              {buckets.map((b, i) => {
+                const errPct = (b.error_rate * 100);
+                return (
+                  <tr key={i} className="border-b border-border/30 hover:bg-surface-hover/50">
+                    <td className="px-3 py-1 text-muted font-mono">{formatTime(b.timestamp)}</td>
+                    <td className={`px-3 py-1 text-right font-mono ${b.avg_response_ms > avgMs * 2 ? 'text-orange' : 'text-text-bright'}`}>
+                      {b.avg_response_ms.toFixed(0)}
+                    </td>
+                    <td className="px-3 py-1 text-right font-mono text-text-bright">{b.request_count}</td>
+                    <td className={`px-3 py-1 text-right font-mono ${errPct > 10 ? 'text-red' : errPct > 1 ? 'text-orange' : 'text-green'}`}>
+                      {errPct.toFixed(1)}%
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
