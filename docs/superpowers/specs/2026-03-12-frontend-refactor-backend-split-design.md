@@ -34,9 +34,9 @@ Split into 4 focused services. Each is a single-file Python HTTP server (same pa
 ### Design Decisions
 
 - **Jira stays in runbook-api**: Incident creation is triggered from alert context alongside runbook data. Splitting it would require cross-service calls for no benefit.
-- **Auth as separate service**: Every other service can validate tokens by calling auth-api, or auth-api can expose a `/api/auth/verify` endpoint for internal use. This keeps auth logic in one place.
+- **Auth token verification**: Each service shares the `AUTH_SECRET` environment variable and validates tokens locally using the same HMAC-based logic currently in runbook-api. This avoids adding latency and a hard dependency on auth-api for every request. Auth-api owns user management (login, logout, password changes); other services only need the shared secret to verify tokens.
 - **Shared SQLite considerations**: Today everything uses one `runbook.db`. After the split, each service gets its own DB file. The auth-api owns `auth.db` (users table), alert-state-api owns `alert-states.db`, runbook-api keeps `runbook.db` (entries, ai-instructions, feedback tables). Loki-gateway is stateless (queries Grafana/Loki directly).
-- **No API contract changes**: Endpoint paths stay the same (just routed to different services via nginx). Frontend `keep-api.ts` base URLs update to match nginx location blocks.
+- **API path migration**: Endpoints are moving from a single `/api/runbook/*` prefix to service-specific prefixes (`/api/loki/*`, `/api/alert-states/*`, `/api/auth/*`). This is a breaking change to frontend call paths. See the Path Migration Map and Updated Files sections below for the full list of files that need updating.
 
 ### New Endpoint: Registry Trends
 
@@ -65,6 +65,32 @@ Returns hourly buckets for the requested operator:
 
 This is **on-demand only** — no auto-polling, no caching. The frontend calls it when a user explicitly clicks "View Trends" in the registry detail modal. Range options: 6h, 24h, 7d.
 
+### Path Migration Map
+
+All current endpoints live under `/api/runbook/*`. The split moves them to service-specific prefixes:
+
+| Old Path | New Path | Service |
+|----------|----------|---------|
+| `/api/runbook/match` | `/api/runbook/match` | runbook-api (unchanged) |
+| `/api/runbook/entries` | `/api/runbook/entries` | runbook-api (unchanged) |
+| `/api/runbook/ai-instructions` | `/api/runbook/ai-instructions` | runbook-api (unchanged) |
+| `/api/runbook/ai-feedback-summary` | `/api/runbook/ai-feedback-summary` | runbook-api (unchanged) |
+| `/api/runbook/jira/*` | `/api/runbook/jira/*` | runbook-api (unchanged) |
+| `/api/runbook/registry-health` | `/api/loki/registry-health` | loki-gateway |
+| `/api/runbook/log-context` | `/api/loki/log-context` | loki-gateway |
+| `/api/runbook/logs/query` | `/api/loki/logs/query` | loki-gateway |
+| (new) | `/api/loki/registry-trends` | loki-gateway |
+| `/api/runbook/alert-states` | `/api/alert-states` | alert-state-api |
+| `/api/runbook/alert-states/investigate` | `/api/alert-states/investigate` | alert-state-api |
+| `/api/runbook/alert-states/acknowledge` | `/api/alert-states/acknowledge` | alert-state-api |
+| `/api/runbook/alert-states/unacknowledge` | `/api/alert-states/unacknowledge` | alert-state-api |
+| `/api/runbook/alert-states/mark-updated` | `/api/alert-states/mark-updated` | alert-state-api |
+| `/api/runbook/auth/login` | `/api/auth/login` | auth-api |
+| `/api/runbook/auth/logout` | `/api/auth/logout` | auth-api |
+| `/api/runbook/auth/change-password` | `/api/auth/change-password` | auth-api |
+| `/api/runbook/auth/me` | `/api/auth/me` | auth-api |
+| `/api/runbook/auth/jira-config` | `/api/auth/jira-config` | auth-api |
+
 ### Nginx Routing
 
 New location blocks in `nginx-default.conf`:
@@ -76,11 +102,25 @@ location /api/alert-states/ → alert-state-api:8092
 location /api/auth/      → auth-api:8093
 ```
 
+### Database Migration
+
+Today all tables live in a single `runbook.db`. After the split:
+
+1. **One-time migration script** (`migrate-db.sh`): Copies tables from `runbook.db` to per-service databases before starting new services. Specifically:
+   - `users` table → `auth.db`
+   - `alert_states` table → `alert-states.db`
+   - `runbook_entries`, `ai_instructions`, `ai_feedback` tables stay in `runbook.db`
+2. **Startup order**: auth-api and alert-state-api check for their DB files on startup and run `init_db()` if missing (same pattern as current runbook-api). Migration script runs first via docker-compose `depends_on` or an entrypoint wrapper.
+3. **Rollback**: Keep the original `runbook.db` as a backup. The migration is additive (copies, not moves). If the split fails, revert to the monolith container with the original DB intact.
+
 ### Docker Compose Changes
 
 - **Add**: `loki-gateway`, `alert-state-api`, `auth-api` containers (all `python:3.12-slim`)
+- **Add**: Named volumes `auth_data:/data` for auth-api, `alert_state_data:/data` for alert-state-api
+- **Add**: `AUTH_SECRET` env var shared across runbook-api, loki-gateway, alert-state-api, auth-api for token verification
 - **Remove**: `zabbix-poller` service (webhooks replaced polling)
 - **Update**: `runbook-api` volume/env to reflect slimmed scope
+- **Update**: `alert-enricher` env — audit which endpoints it calls and update `RUNBOOK_API_URL` if any moved to new services
 
 ## 2. Command Center — Tabbed Dashboard + Alerts
 
@@ -120,6 +160,8 @@ Full alert explorer, extracted into `AlertsTableView.tsx`:
 
 Both tabs share a single `fetchAlerts(250)` call with 30-second auto-refresh. No duplicate API calls — data is fetched once in the parent `page.tsx` and passed to whichever view is active.
 
+**Note**: The current Command Center fetches only 100 alerts. This increases to 250 to support the All Alerts tab. This is a deliberate tradeoff — the Dashboard tab only displays 30, but the shared fetch avoids a jarring re-fetch when switching tabs. The 30-second refresh interval remains unchanged.
+
 #### File Structure
 
 ```
@@ -132,7 +174,7 @@ command-center/
 #### Removed
 
 - `alerts/page.tsx` — deleted
-- `alerts/[fingerprint]/page.tsx` — stays as-is (alert detail)
+- `alerts/[fingerprint]/page.tsx` — stays as-is, route `/portal/alerts/{fingerprint}` unchanged. All alert links in both DashboardView and AlertsTableView continue to point to this route.
 - Nav link "Alerts" removed from `layout.tsx`
 
 ## 3. Registry Page (renamed from Registry Contacts)
@@ -198,8 +240,8 @@ The page (`src/app/logs/page.tsx`) is fully built with:
 
 ### Changes Needed
 
-1. **Add to navigation** in `layout.tsx` — currently missing from nav links
-2. **Update API base URL** in `keep-api.ts` to point to loki-gateway instead of runbook-api
+1. **Ensure Logs is a top-level nav item** in `layout.tsx` — current layout uses a dropdown menu; the redesigned nav uses flat top-level links (see Section 5, Navigation). Logs must be included as a top-level item.
+2. **Update API base URL** in `keep-api.ts` to point to loki-gateway instead of runbook-api (path changes from `/api/runbook/logs/query` to `/api/loki/logs/query`)
 3. **Verify presets** work with current Loki label structure (`{app="ra"}`)
 
 ### Load Protection (already in place)
@@ -224,14 +266,20 @@ No functional changes to the page itself.
 
 | File | Changes |
 |------|---------|
-| `deploy/docker-compose.yml` | Add loki-gateway, alert-state-api, auth-api; remove poller service |
+| `deploy/docker-compose.yml` | Add loki-gateway, alert-state-api, auth-api; remove poller service; add volumes |
 | `deploy/nginx-default.conf` | Add routing for new services |
-| `deploy/sre-frontend/src/app/layout.tsx` | Update nav: remove Alerts, add Logs, rename Registry Contacts → Registry |
-| `deploy/sre-frontend/src/lib/keep-api.ts` | Update base URLs for split services |
-| `deploy/sre-frontend/src/lib/registry.ts` | Merge Identity Digital duplicates, update TLD map |
+| `deploy/enricher.py` | Audit and update any runbook-api endpoint calls that moved to new services |
+| `deploy/sre-frontend/src/app/layout.tsx` | Redesign nav from dropdown to flat top-level links; remove Alerts, add Logs, rename Registry Contacts → Registry |
+| `deploy/sre-frontend/src/lib/keep-api.ts` | Update base URLs: replace single `RUNBOOK_BASE` with per-service base URLs (`RUNBOOK_BASE`, `LOKI_BASE`, `ALERT_STATE_BASE`, `AUTH_BASE`) |
+| `deploy/sre-frontend/src/app/UserMenu.tsx` | Update hardcoded `/api/runbook/auth/logout` → `/api/auth/logout` |
+| `deploy/sre-frontend/src/app/login/page.tsx` | Update hardcoded `/api/runbook/auth/login` → `/api/auth/login` |
+| `deploy/sre-frontend/src/app/settings/page.tsx` | Update hardcoded `/api/runbook/auth/me`, `/api/runbook/auth/change-password`, `/api/runbook/auth/jira-config` → `/api/auth/*` |
+| `deploy/sre-frontend/src/lib/registry.ts` | Merge Identity Digital duplicates, update TLD map, fix `.tv` mapping (currently maps to godaddy-registry but Verisign lists it) |
 | `README.md` | Reflect new architecture |
 
 ### Navigation (layout.tsx) After Changes
+
+The current dropdown-based navigation is replaced with flat top-level links:
 
 ```
 Command Center  |  Logs  |  Registry  |  Maintenance  |  Health  |  AI Manage  |  Settings
