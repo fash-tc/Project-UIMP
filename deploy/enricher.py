@@ -207,6 +207,109 @@ class FeedbackTracker:
 
 feedback_tracker = FeedbackTracker()
 
+RUNBOOK_API_URL = os.environ.get("RUNBOOK_API_URL", "http://runbook-api:8090")
+
+
+def fetch_runbook_entries(alert_name, hostname, service=None):
+    """Query the runbook API for matching remediation entries."""
+    from urllib.parse import quote
+    params = f"alert_name={quote(alert_name)}"
+    if hostname and hostname.lower() not in ("unknown", "n/a", ""):
+        params += f"&hostname={quote(hostname)}"
+    if service:
+        params += f"&service={quote(service)}"
+    url = f"{RUNBOOK_API_URL}/api/runbook/match?{params}&limit=5"
+    try:
+        req = Request(url, headers={"Accept": "application/json"})
+        resp = urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log.debug(f"Runbook API query failed (non-fatal): {e}")
+        return []
+
+
+def fetch_ai_instructions():
+    """Fetch active global AI instructions from the runbook API."""
+    url = f"{RUNBOOK_API_URL}/api/runbook/ai-instructions"
+    try:
+        req = Request(url, headers={"Accept": "application/json"})
+        resp = urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log.debug(f"AI instructions fetch failed (non-fatal): {e}")
+        return []
+
+
+def fetch_log_context(alert_name, hostname):
+    """Fetch log correlation context from the runbook API (cached Loki data)."""
+    from urllib.parse import quote
+    params = f"alert_name={quote(alert_name)}"
+    if hostname and hostname.lower() not in ("unknown", "n/a", ""):
+        params += f"&hostname={quote(hostname)}"
+    url = f"{RUNBOOK_API_URL}/api/runbook/log-context?{params}"
+    try:
+        req = Request(url, headers={"Accept": "application/json"})
+        resp = urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        if data.get("has_context"):
+            return data
+        return None
+    except Exception as e:
+        log.debug(f"Log context fetch failed (non-fatal): {e}")
+        return None
+
+
+def format_log_context(log_ctx):
+    """Format log context data into LLM prompt text."""
+    if not log_ctx:
+        return ""
+
+    lines = ["\nINFRASTRUCTURE LOG CONTEXT (live Loki logs, last hour — use for correlation):"]
+
+    total = log_ctx.get("total_operators", 0)
+    healthy = log_ctx.get("healthy_count", 0)
+    degraded = log_ctx.get("degraded_count", 0)
+    down = log_ctx.get("down_count", 0)
+
+    lines.append(f"  Overall: {total} registry operators — {healthy} healthy, {degraded} degraded, {down} down")
+
+    issues = log_ctx.get("operator_issues", [])
+    if issues:
+        lines.append("  OPERATORS WITH ISSUES:")
+        for op in issues:
+            op_line = f"    - {op['operator']}: {op['status'].upper()}"
+            op_line += f" | avg {op.get('avg_response_ms', 0):.0f}ms"
+            op_line += f" | {op.get('request_count', 0)} requests/hr"
+            if op.get("error_rate", 0) > 0:
+                op_line += f" | {op['error_rate']*100:.1f}% HTTP errors"
+            if op.get("epp_error_rate", 0) > 0:
+                op_line += f" | {op['epp_error_rate']*100:.1f}% EPP errors"
+            lines.append(op_line)
+            for err in op.get("recent_errors", [])[:3]:
+                lines.append(f"      Error sample: {err['agent']} {err['op']} → HTTP {err['resp']} ({err['ms']}ms)")
+            for err in op.get("recent_epp_errors", [])[:3]:
+                lines.append(f"      EPP error: {err['agent']} → code {err['epp_code']}")
+            for slow in op.get("slow_requests", [])[:2]:
+                lines.append(f"      Slow request: {slow['agent']} {slow['op']} → {slow['ms']}ms")
+    elif log_ctx.get("all_healthy"):
+        lines.append("  All registry operators are currently HEALTHY — no log anomalies detected.")
+
+    lines.append("  Correlate the current alert with this registry infrastructure health data.\n")
+    return "\n".join(lines)
+
+
+def infer_service(alert):
+    """Infer the service name from alert name/hostname using the service dependency map."""
+    name = alert.get("name", "").lower()
+    host = get_host(alert).lower()
+    combined = f"{name} {host}"
+    for svc_key in SERVICE_DEPS:
+        if svc_key in combined:
+            return svc_key
+    return None
+
 
 def parse_sre_feedback(note):
     """Extract SRE feedback from the note field."""
@@ -366,8 +469,15 @@ def build_enrichment_prompt(alert, similar_alerts):
         for t in (tags if isinstance(tags, list) else [])
     ) or "none"
     source_str = ", ".join(source) if isinstance(source, list) else str(source)
+    zabbix_instance = alert.get("zabbixInstance", "")
+    if zabbix_instance:
+        source_str = f"{source_str} ({zabbix_instance})"
 
     service_context = find_service_context(alert)
+
+    # Log correlation context (from cached Loki data — no extra queries)
+    log_ctx = fetch_log_context(name, host)
+    log_context = format_log_context(log_ctx)
 
     dedup_context = ""
     if similar_alerts:
@@ -397,6 +507,34 @@ def build_enrichment_prompt(alert, similar_alerts):
         if direct_feedback.get("comment"):
             direct_fb_context += f'  SRE comment: "{direct_feedback["comment"][:200]}"\n'
         direct_fb_context += "  IMPORTANT: Respect the SRE's corrections in your assessment.\n"
+
+    # Runbook entries context
+    service = infer_service(alert)
+    runbook_entries = fetch_runbook_entries(name, host, service)
+    runbook_context = ""
+    if runbook_entries:
+        lines = ["\nRUNBOOK ENTRIES (real SRE remediation experience for similar alerts — use as authoritative reference):"]
+        for entry in runbook_entries[:5]:
+            date = (entry.get("created_at") or "unknown")[:10]
+            user = entry.get("sre_user") or "unknown"
+            e_name = (entry.get("alert_name") or "")[:60]
+            e_host = entry.get("hostname") or "N/A"
+            rem = (entry.get("remediation") or "")[:300]
+            lines.append(f'  - [{date}, {user}] Alert: "{e_name}" | Host: {e_host}')
+            lines.append(f'    Remediation: "{rem}"')
+        lines.append("  Apply these SRE-validated remediation steps to your REMEDIATION field when relevant.\n")
+        runbook_context = "\n".join(lines)
+
+    # Global AI instructions from SRE team
+    ai_instructions = fetch_ai_instructions()
+    instructions_context = ""
+    if ai_instructions:
+        lines = ["\nGLOBAL SRE DIRECTIVES (instructions from SRE team — follow these):"]
+        for i, instr in enumerate(ai_instructions, 1):
+            text = (instr.get("instruction") or "")[:300]
+            lines.append(f"  {i}. {text}")
+        lines.append("  Apply these directives to your analysis.\n")
+        instructions_context = "\n".join(lines)
 
     return (
         "You are a senior SRE alert analyst for Tucows Domains, a major domain "
@@ -434,10 +572,13 @@ def build_enrichment_prompt(alert, similar_alerts):
         f"- Tags: {tag_str}\n"
         f"- Time: {last_received}\n"
         f"{service_context}"
+        f"{log_context}"
         f"{dedup_context}"
         f"{freq_context}"
         f"{lessons_context}"
-        f"{direct_fb_context}\n"
+        f"{direct_fb_context}"
+        f"{runbook_context}"
+        f"{instructions_context}\n"
         "Respond in this EXACT format. Keep each field concise (1-3 sentences max):\n\n"
         "ASSESSED_SEVERITY: [critical/high/warning/low/info — base this on USER IMPACT "
         "and SLO risk, not just the raw metric. critical=active user-facing outage or "
@@ -514,6 +655,20 @@ def parse_enrichment(response):
                 else:
                     enrichment[key] = val
                 break
+
+    # Fill empty critical fields with fallback values
+    if not enrichment["remediation"]:
+        enrichment["remediation"] = (
+            "1. Check current resource utilization on the affected host. "
+            "2. Review recent changes or deployments. "
+            "3. Escalate to the responsible team if the issue persists."
+        )
+    if not enrichment["likely_cause"]:
+        enrichment["likely_cause"] = "Unable to determine root cause from available context."
+    if not enrichment["impact_scope"]:
+        enrichment["impact_scope"] = "Impact assessment requires manual investigation."
+    if not enrichment["noise_reason"]:
+        enrichment["noise_reason"] = "Insufficient context to determine noise level."
 
     return enrichment
 
