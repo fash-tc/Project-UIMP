@@ -262,6 +262,9 @@ export async function submitFeedback(
 // ── Runbook API ──────────────────────────────────────
 
 const RUNBOOK_BASE = '/api/runbook';
+const AUTH_BASE = '/api/auth';
+const ALERT_STATE_BASE = '/api/alert-states';
+const LOKI_BASE = '/api/loki';
 
 export async function fetchRunbookMatches(
   alertName: string,
@@ -409,12 +412,18 @@ export interface RegistryHealthData {
 
 export async function fetchRegistryHealth(): Promise<RegistryHealthData | null> {
   try {
-    const res = await fetch(`${RUNBOOK_BASE}/registry-health`);
+    const res = await fetch(`${LOKI_BASE}/registry-health`);
     if (!res.ok) return null;
     return await res.json();
   } catch {
     return null;
   }
+}
+
+export async function fetchRegistryTrends(operatorId: string, rangeHours: number = 24) {
+  const res = await fetch(`${LOKI_BASE}/registry-trends?operator=${encodeURIComponent(operatorId)}&range=${rangeHours}`);
+  if (!res.ok) throw new Error(`Registry trends failed: ${res.status}`);
+  return res.json();
 }
 
 // ── Loki Logs ────────────────────────────────────────
@@ -437,7 +446,7 @@ export async function queryLokiLogs(
   limit = 200,
   range = 3600,
 ): Promise<LogQueryResult> {
-  const res = await fetch(`${RUNBOOK_BASE}/logs/query`, {
+  const res = await fetch(`${LOKI_BASE}/logs/query`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, limit, range }),
@@ -508,7 +517,7 @@ export async function fetchAIFeedbackSummary(): Promise<AIFeedbackSummary | null
 
 export async function fetchAlertStates(): Promise<AlertState[]> {
   try {
-    const res = await fetch(`${RUNBOOK_BASE}/alert-states`);
+    const res = await fetch(`${ALERT_STATE_BASE}`);
     if (!res.ok) return [];
     return await res.json();
   } catch {
@@ -521,7 +530,7 @@ export async function toggleInvestigating(
   alertName: string,
 ): Promise<{ status: string; investigating_user: string | null } | null> {
   try {
-    const res = await fetch(`${RUNBOOK_BASE}/alert-states/investigate`, {
+    const res = await fetch(`${ALERT_STATE_BASE}/investigate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fingerprint, alert_name: alertName }),
@@ -539,7 +548,7 @@ export async function acknowledgeAlerts(
   firingStarts: Record<string, string>,
 ): Promise<boolean> {
   try {
-    const res = await fetch(`${RUNBOOK_BASE}/alert-states/acknowledge`, {
+    const res = await fetch(`${ALERT_STATE_BASE}/acknowledge`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fingerprints, alert_names: alertNames, firing_starts: firingStarts }),
@@ -552,7 +561,7 @@ export async function acknowledgeAlerts(
 
 export async function unacknowledgeAlerts(fingerprints: string[]): Promise<boolean> {
   try {
-    const res = await fetch(`${RUNBOOK_BASE}/alert-states/unacknowledge`, {
+    const res = await fetch(`${ALERT_STATE_BASE}/unacknowledge`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fingerprints }),
@@ -565,7 +574,7 @@ export async function unacknowledgeAlerts(fingerprints: string[]): Promise<boole
 
 export async function markAlertsUpdated(fingerprints: string[]): Promise<boolean> {
   try {
-    const res = await fetch(`${RUNBOOK_BASE}/alert-states/mark-updated`, {
+    const res = await fetch(`${ALERT_STATE_BASE}/mark-updated`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fingerprints }),
