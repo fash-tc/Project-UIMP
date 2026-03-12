@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useMemo, useCallback } from 'react';
 import { Alert } from '@/lib/types';
-import { fetchAlerts, parseAIEnrichment, timeAgo, alertStartTime, fetchRegistryHealth, RegistryHealthData, RegistryHealthOperator } from '@/lib/keep-api';
+import { fetchAlerts, parseAIEnrichment, timeAgo, alertStartTime, fetchRegistryHealth, RegistryHealthData, RegistryHealthOperator, fetchRegistryTrends } from '@/lib/keep-api';
 import {
   REGISTRY_OPERATORS,
   TLD_OPERATOR_MAP,
@@ -510,6 +510,26 @@ function OperatorDetailModal({ operator, alerts, health, onClose }: {
     return () => { document.body.style.overflow = ''; };
   }, []);
 
+  const [trendsData, setTrendsData] = useState<any>(null);
+  const [trendsLoading, setTrendsLoading] = useState(false);
+  const [trendsError, setTrendsError] = useState<string | null>(null);
+  const [trendsRange, setTrendsRange] = useState(24);
+
+  const loadTrends = async (hours: number) => {
+    setTrendsLoading(true);
+    setTrendsError(null);
+    setTrendsRange(hours);
+    try {
+      const data = await fetchRegistryTrends(operator.id, hours);
+      setTrendsData(data);
+    } catch (err: any) {
+      setTrendsError(err.message || 'Failed to load trends');
+      setTrendsData(null);
+    } finally {
+      setTrendsLoading(false);
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-[100] flex items-start justify-center">
       <div className="absolute inset-0 bg-bg/80 backdrop-blur-sm" onClick={onClose} />
@@ -664,6 +684,42 @@ function OperatorDetailModal({ operator, alerts, health, onClose }: {
             </div>
           )}
 
+          {/* Performance Trends */}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-medium text-text-bright">Performance Trends</h3>
+              <div className="flex gap-1">
+                {[{ label: '6h', hours: 6 }, { label: '24h', hours: 24 }, { label: '7d', hours: 168 }].map(opt => (
+                  <button
+                    key={opt.hours}
+                    onClick={() => loadTrends(opt.hours)}
+                    className={`px-2.5 py-1 rounded-md text-[10px] font-medium transition-colors ${
+                      trendsRange === opt.hours && trendsData
+                        ? 'bg-accent text-bg'
+                        : 'border border-border text-muted hover:text-text hover:bg-surface-hover'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {trendsLoading && (
+              <div className="text-xs text-muted text-center py-6">Loading trends...</div>
+            )}
+            {trendsError && (
+              <div className="text-xs text-red text-center py-4">{trendsError}</div>
+            )}
+            {trendsData && trendsData.buckets && !trendsLoading && (
+              <TrendsChart buckets={trendsData.buckets} />
+            )}
+            {!trendsData && !trendsLoading && !trendsError && (
+              <div className="text-xs text-muted text-center py-6 bg-bg/40 border border-border rounded-lg">
+                Click a time range above to load performance trends.
+              </div>
+            )}
+          </div>
+
           {/* All Contacts */}
           <div className="space-y-3">
             <h3 className="text-sm font-medium text-text-bright">Contacts</h3>
@@ -758,6 +814,47 @@ function ContactRow({ operator, contact }: { operator: RegistryOperator; contact
             Email
           </a>
         )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Trends Chart ── */
+
+function TrendsChart({ buckets }: { buckets: Array<{ timestamp: string; avg_response_ms: number; error_rate: number; request_count: number }> }) {
+  if (!buckets.length) return null;
+  const width = 600;
+  const height = 200;
+  const padding = { top: 20, right: 60, bottom: 30, left: 50 };
+  const chartW = width - padding.left - padding.right;
+  const chartH = height - padding.top - padding.bottom;
+
+  const maxMs = Math.max(...buckets.map(b => b.avg_response_ms), 1);
+  const maxErr = Math.max(...buckets.map(b => b.error_rate), 0.01);
+  const maxReq = Math.max(...buckets.map(b => b.request_count), 1);
+
+  const xScale = (i: number) => padding.left + (i / (buckets.length - 1 || 1)) * chartW;
+  const yMs = (v: number) => padding.top + chartH - (v / maxMs) * chartH;
+  const yErr = (v: number) => padding.top + chartH - (v / maxErr) * chartH;
+
+  const msLine = buckets.map((b, i) => `${i === 0 ? 'M' : 'L'}${xScale(i)},${yMs(b.avg_response_ms)}`).join(' ');
+  const errLine = buckets.map((b, i) => `${i === 0 ? 'M' : 'L'}${xScale(i)},${yErr(b.error_rate)}`).join(' ');
+  const barW = Math.max(chartW / buckets.length - 2, 2);
+
+  return (
+    <div className="bg-gray-800/50 rounded-lg p-4">
+      <svg viewBox={`0 0 ${width} ${height}`} className="w-full" style={{ maxHeight: '200px' }}>
+        {buckets.map((b, i) => (
+          <rect key={i} x={xScale(i) - barW / 2} y={padding.top + chartH - (b.request_count / maxReq) * chartH}
+            width={barW} height={(b.request_count / maxReq) * chartH} fill="rgba(139, 92, 246, 0.15)" />
+        ))}
+        <path d={msLine} fill="none" stroke="#a78bfa" strokeWidth="2" />
+        <path d={errLine} fill="none" stroke="#f87171" strokeWidth="2" />
+      </svg>
+      <div className="flex gap-4 mt-2 text-xs text-gray-500 justify-center">
+        <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-purple-400 inline-block" /> Avg Response (ms)</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-red-400 inline-block" /> Error Rate</span>
+        <span className="flex items-center gap-1"><span className="w-3 h-1 bg-purple-400/20 inline-block" /> Requests</span>
       </div>
     </div>
   );
