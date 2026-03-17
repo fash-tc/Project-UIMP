@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Alert, AIEnrichment, SREFeedback, RunbookEntry, AlertState } from '@/lib/types';
+import { Alert, AIEnrichment, SREFeedback, RunbookEntry, AlertState, SSEEvent } from '@/lib/types';
+import { useSSE } from '@/hooks/useSSE';
 import {
   fetchAlerts,
   parseAIEnrichment,
@@ -39,7 +40,7 @@ export default function CommandCenter() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [refreshInterval, setRefreshInterval] = useState(30);
+  const [refreshInterval, setRefreshInterval] = useState(60);
   const [refreshing, setRefreshing] = useState(false);
   const [selectedAlert, setSelectedAlert] = useState<Alert | null>(null);
   const [alertStates, setAlertStates] = useState<Map<string, AlertState>>(new Map());
@@ -79,6 +80,61 @@ export default function CommandCenter() {
       setLoading(false);
     }
   }, []);
+
+  const handleSSEEvent = useCallback((event: SSEEvent) => {
+    if (event.type === '_reset') {
+      load();
+      return;
+    }
+
+    setAlertStates(prev => {
+      const next = new Map(prev);
+      const defaultState = (fp: string): AlertState => ({
+        alert_fingerprint: fp, alert_name: '', investigating_user: null,
+        investigating_since: null, acknowledged_by: null, acknowledged_at: null,
+        ack_firing_start: null, is_updated: 0,
+      });
+
+      if (event.fingerprint) {
+        const fp = event.fingerprint;
+        const existing = next.get(fp) || defaultState(fp);
+        switch (event.type) {
+          case 'investigate':
+            next.set(fp, { ...existing, investigating_user: event.active ? (event.user || null) : null, investigating_since: event.active ? event.timestamp : null });
+            break;
+          case 'incident_created':
+            next.set(fp, { ...existing, incident_jira_key: event.jira_key || null, incident_jira_url: event.jira_url || null, incident_created_by: event.user || null, incident_created_at: event.timestamp || null });
+            break;
+          case 'escalated':
+            next.set(fp, { ...existing, escalated_to: event.escalated_to || null, escalated_by: event.user || null, escalated_at: event.timestamp || null });
+            break;
+          case 'force_enrich':
+            break;
+        }
+      }
+
+      if (event.fingerprints) {
+        for (const fp of event.fingerprints) {
+          const existing = next.get(fp) || defaultState(fp);
+          switch (event.type) {
+            case 'acknowledge':
+              next.set(fp, { ...existing, acknowledged_by: event.user || null, acknowledged_at: event.timestamp || null, is_updated: 0 });
+              break;
+            case 'unacknowledge':
+              next.set(fp, { ...existing, acknowledged_by: null, acknowledged_at: null, ack_firing_start: null, is_updated: 0 });
+              break;
+            case 'mark_updated':
+              next.set(fp, { ...existing, acknowledged_by: null, acknowledged_at: null, is_updated: 1 });
+              break;
+          }
+        }
+      }
+
+      return next;
+    });
+  }, [load]);
+
+  const { connected } = useSSE('/api/alert-states/events', handleSSEEvent);
 
   useEffect(() => {
     load();
@@ -134,6 +190,7 @@ export default function CommandCenter() {
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-text-bright">Command Center</h1>
         <div className="flex items-center gap-3">
+          <span className={`inline-block w-2 h-2 rounded-full ${connected ? 'bg-green' : 'bg-red/50'}`} title={connected ? 'Live updates connected' : 'Live updates disconnected'} />
           <RefreshControl
             refreshInterval={refreshInterval}
             onRefreshIntervalChange={setRefreshInterval}
@@ -190,6 +247,7 @@ export default function CommandCenter() {
       ) : (
         <AlertsTableView
           alerts={alerts}
+          alertStates={alertStates}
           loading={false}
           onAlertClick={setSelectedAlert}
         />
