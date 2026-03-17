@@ -92,4 +92,37 @@ export interface AlertState {
   acknowledged_at: string | null;
   ack_firing_start: string | null;
   is_updated: number;
+  // Incident tracking
+  incident_jira_key?: string | null;
+  incident_jira_url?: string | null;
+  incident_created_by?: string | null;
+  incident_created_at?: string | null;
+  // Escalation tracking
+  escalated_to?: string | null;
+  escalated_by?: string | null;
+  escalated_at?: string | null;
+}
+
+export interface SSEEvent {
+  type: string;
+  fingerprint?: string;
+  fingerprints?: string[];
+  user?: string;
+  active?: boolean;
+  jira_key?: string;
+  jira_url?: string;
+  escalated_to?: string;
+  entry_id?: number;
+  vote?: string;
+  timestamp: string;
+}
+
+export interface RunbookFeedback {
+  id: number;
+  alert_fingerprint: string;
+  alert_name: string;
+  runbook_entry_id: number;
+  vote: 'up' | 'down';
+  user: string;
+  created_at: string;
 }
