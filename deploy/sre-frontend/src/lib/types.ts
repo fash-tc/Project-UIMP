@@ -126,3 +126,31 @@ export interface RunbookFeedback {
   user: string;
   created_at: string;
 }
+
+export interface ClusterInfo {
+  cluster_id: string;
+  label?: string;
+  fingerprints?: string[];
+  alert_names?: string[];
+  top_severity?: string;
+  count?: number;
+  hosts?: string[];
+  assessment?: string;
+  priority?: number;
+}
+
+export interface ShiftContext {
+  new_since_last: number;
+  resolved_since_last: number;
+  trend: 'improving' | 'stable' | 'worsening';
+  recurring: string[];
+}
+
+export interface SituationSummary {
+  one_liner: string | null;
+  clusters: ClusterInfo[];
+  shift_context: ShiftContext;
+  recommended_actions: string[];
+  generated_at: string;
+  alert_hash: string;
+}

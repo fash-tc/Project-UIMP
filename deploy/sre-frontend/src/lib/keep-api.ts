@@ -1,4 +1,4 @@
-import { Alert, AIEnrichment, AlertStats, SREFeedback, RunbookEntry, AIInstruction, AIFeedbackSummary, AlertState, RunbookFeedback } from './types';
+import { Alert, AIEnrichment, AlertStats, SREFeedback, RunbookEntry, AIInstruction, AIFeedbackSummary, AlertState, RunbookFeedback, SituationSummary } from './types';
 
 const API_BASE = '/api/keep';
 
@@ -719,4 +719,16 @@ export async function fetchRunbookFeedback(
   });
   if (!res.ok) return [];
   return res.json();
+}
+
+export async function fetchSituationSummary(): Promise<SituationSummary | null> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/situation-summary`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data.one_liner) return null;
+    return data as SituationSummary;
+  } catch {
+    return null;
+  }
 }
