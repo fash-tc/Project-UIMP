@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Alert, AIEnrichment, SREFeedback, RunbookEntry, AlertState, SSEEvent } from '@/lib/types';
+import { Alert, AIEnrichment, SREFeedback, RunbookEntry, AlertState, SSEEvent, RunbookFeedback } from '@/lib/types';
 import { useSSE } from '@/hooks/useSSE';
 import {
   fetchAlerts,
@@ -29,6 +29,10 @@ import {
   fetchEscalationTeams,
   fetchEscalationUsers,
   escalateAlert,
+  storeIncidentState,
+  storeEscalationState,
+  submitRunbookFeedback,
+  fetchRunbookFeedback,
 } from '@/lib/keep-api';
 import { getClientUsername } from '@/lib/auth';
 import { detectRegistryFromAlert, buildRegistryMailto } from '@/lib/registry';
@@ -1101,6 +1105,14 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
               });
               setEscalating(false);
               if (result.success) {
+                const escalatedToName = escalationType === 'team'
+                  ? (teams.find(t => t.id === escalationTarget)?.name || escalationTarget)
+                  : (users.find(u => u.id === escalationTarget)?.name || escalationTarget);
+                try {
+                  await storeEscalationState(alert.fingerprint, escalatedToName);
+                } catch {
+                  // Best-effort — escalation was already sent
+                }
                 setEscalated(true);
                 setShowEscalation(false);
               } else {
@@ -1206,6 +1218,11 @@ function IncidentForm({ alert, enrichment, onCreated, onCancel }: {
 
     setSubmitting(false);
     if (result.ok && result.issueKey) {
+      try {
+        await storeIncidentState(alert.fingerprint, result.issueKey, result.issueUrl || '');
+      } catch {
+        // Best-effort — incident was already created in Jira
+      }
       onCreated(result.issueKey, result.issueUrl || '');
     } else {
       setError(result.error || 'Failed to create incident');
@@ -1323,15 +1340,52 @@ function RunbookPanel({ alert }: { alert: Alert }) {
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [submitError, setSubmitError] = useState(false);
+  const [votes, setVotes] = useState<Map<string, 'up' | 'down'>>(new Map());
 
   const host = alert.hostName || alert.hostname || '';
 
   useEffect(() => {
     setLoadingMatches(true);
     fetchRunbookMatches(alert.name, host || undefined)
-      .then(setMatches)
+      .then((entries) => {
+        setMatches(entries);
+        const entryIds = entries.map((e: RunbookEntry) => e.id).filter(Boolean) as number[];
+        if (entryIds.length > 0) {
+          fetchRunbookFeedback(entryIds).then((feedback: RunbookFeedback[]) => {
+            const voteMap = new Map<string, 'up' | 'down'>();
+            for (const fb of feedback) {
+              voteMap.set(`${fb.runbook_entry_id}`, fb.vote);
+            }
+            setVotes(voteMap);
+          });
+        }
+      })
       .finally(() => setLoadingMatches(false));
   }, [alert.name, host]);
+
+  const handleVote = async (entryId: number, vote: 'up' | 'down') => {
+    const key = `${entryId}`;
+    const currentVote = votes.get(key);
+    const newVote = currentVote === vote ? 'none' : vote;
+
+    setVotes(prev => {
+      const next = new Map(prev);
+      if (newVote === 'none') next.delete(key);
+      else next.set(key, newVote as 'up' | 'down');
+      return next;
+    });
+
+    try {
+      await submitRunbookFeedback(alert.fingerprint, alert.name, entryId, newVote as 'up' | 'down' | 'none');
+    } catch {
+      setVotes(prev => {
+        const next = new Map(prev);
+        if (currentVote) next.set(key, currentVote);
+        else next.delete(key);
+        return next;
+      });
+    }
+  };
 
   async function handleSubmit() {
     if (!remediation.trim()) return;
@@ -1352,7 +1406,19 @@ function RunbookPanel({ alert }: { alert: Alert }) {
     if (ok) {
       setSubmitted(true);
       setRemediation('');
-      fetchRunbookMatches(alert.name, host || undefined).then(setMatches);
+      fetchRunbookMatches(alert.name, host || undefined).then((entries) => {
+        setMatches(entries);
+        const entryIds = entries.map((e: RunbookEntry) => e.id).filter(Boolean) as number[];
+        if (entryIds.length > 0) {
+          fetchRunbookFeedback(entryIds).then((feedback: RunbookFeedback[]) => {
+            const voteMap = new Map<string, 'up' | 'down'>();
+            for (const fb of feedback) {
+              voteMap.set(`${fb.runbook_entry_id}`, fb.vote);
+            }
+            setVotes(voteMap);
+          });
+        }
+      });
     } else {
       setSubmitError(true);
     }
@@ -1373,17 +1439,49 @@ function RunbookPanel({ alert }: { alert: Alert }) {
             Past remediations for similar alerts ({matches.length})
           </div>
           {matches.map((entry) => (
-            <div key={entry.id} className="bg-bg rounded-md p-2.5 border border-border">
-              <div className="flex items-center gap-2 text-[10px] text-muted mb-1">
-                <span>{entry.created_at?.substring(0, 10)}</span>
-                {entry.sre_user && <span>by {entry.sre_user}</span>}
-                {entry.hostname && <span className="font-mono">{entry.hostname}</span>}
-                {entry.score != null && <span className="text-accent">relevance: {entry.score}</span>}
+            <div key={entry.id} className={`${votes.get(`${entry.id}`) === 'down' ? 'opacity-50' : ''} transition-opacity`}>
+              <div className="bg-bg rounded-md p-2.5 border border-border">
+                <div className="flex items-center gap-2 text-[10px] text-muted mb-1">
+                  <span>{entry.created_at?.substring(0, 10)}</span>
+                  {entry.sre_user && <span>by {entry.sre_user}</span>}
+                  {entry.hostname && <span className="font-mono">{entry.hostname}</span>}
+                  {entry.score != null && <span className="text-accent">relevance: {entry.score}</span>}
+                  {entry.id != null && (
+                    <div className="inline-flex items-center gap-1 ml-2">
+                      <button
+                        onClick={() => handleVote(entry.id!, 'up')}
+                        className={`p-0.5 rounded transition-colors ${
+                          votes.get(`${entry.id}`) === 'up'
+                            ? 'text-green'
+                            : 'text-muted/30 hover:text-green/70'
+                        }`}
+                        title="Useful remediation"
+                      >
+                        <svg className="w-3.5 h-3.5" fill={votes.get(`${entry.id}`) === 'up' ? 'currentColor' : 'none'} viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M14 9V5a3 3 0 00-3-3l-4 9v11h11.28a2 2 0 002-1.7l1.38-9a2 2 0 00-2-2.3H14z" />
+                        </svg>
+                      </button>
+                      <button
+                        onClick={() => handleVote(entry.id!, 'down')}
+                        className={`p-0.5 rounded transition-colors ${
+                          votes.get(`${entry.id}`) === 'down'
+                            ? 'text-red'
+                            : 'text-muted/30 hover:text-red/70'
+                        }`}
+                        title="Irrelevant remediation"
+                      >
+                        <svg className="w-3.5 h-3.5" fill={votes.get(`${entry.id}`) === 'down' ? 'currentColor' : 'none'} viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M10 15v4a3 3 0 003 3l4-9V2H5.72a2 2 0 00-2 1.7l-1.38 9a2 2 0 002 2.3H10z" />
+                        </svg>
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <div className="text-[10px] text-muted mb-0.5 truncate">
+                  Alert: {entry.alert_name?.substring(0, 80)}
+                </div>
+                <div className="text-xs text-text whitespace-pre-wrap">{entry.remediation}</div>
               </div>
-              <div className="text-[10px] text-muted mb-0.5 truncate">
-                Alert: {entry.alert_name?.substring(0, 80)}
-              </div>
-              <div className="text-xs text-text whitespace-pre-wrap">{entry.remediation}</div>
             </div>
           ))}
         </div>
