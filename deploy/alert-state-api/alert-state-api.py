@@ -89,6 +89,17 @@ def _init_db():
         )
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_feedback_entry_id ON runbook_feedback(runbook_entry_id)")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS situation_summary (
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            one_liner TEXT,
+            clusters_json TEXT,
+            shift_context_json TEXT,
+            actions_json TEXT,
+            generated_at TEXT,
+            alert_hash TEXT
+        )
+    """)
     db.commit()
     # Add force_enrich column if it doesn't exist (migration)
     try:
@@ -277,6 +288,22 @@ class AlertStateHandler(BaseHTTPRequestHandler):
             with _sse_lock:
                 count = len(_sse_clients)
             self._send_json(200, {"connected_clients": count})
+
+        elif path == "/api/alert-states/situation-summary":
+            with _db_lock:
+                cursor = db.execute("SELECT * FROM situation_summary WHERE id = 1")
+                row = cursor.fetchone()
+            if row:
+                self._send_json(200, {
+                    "one_liner": row["one_liner"],
+                    "clusters": json.loads(row["clusters_json"] or "[]"),
+                    "shift_context": json.loads(row["shift_context_json"] or "{}"),
+                    "recommended_actions": json.loads(row["actions_json"] or "[]"),
+                    "generated_at": row["generated_at"],
+                    "alert_hash": row["alert_hash"],
+                })
+            else:
+                self._send_json(200, {"one_liner": None})
 
         else:
             self._send_json(404, {"error": "not found"})
@@ -564,6 +591,36 @@ class AlertStateHandler(BaseHTTPRequestHandler):
                 "vote": vote, "user": username,
             })
             self._send_json(200, {"status": "stored", "vote": vote})
+
+        elif path == "/api/alert-states/situation-summary":
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            one_liner = (data.get("one_liner") or "").strip()
+            clusters = data.get("clusters", [])
+            shift_context = data.get("shift_context", {})
+            actions = data.get("recommended_actions", [])
+            alert_hash = (data.get("alert_hash") or "").strip()
+            now = datetime.now(timezone.utc).isoformat()
+            with _db_lock:
+                db.execute("""
+                    INSERT INTO situation_summary (id, one_liner, clusters_json, shift_context_json,
+                        actions_json, generated_at, alert_hash)
+                    VALUES (1, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        one_liner = excluded.one_liner,
+                        clusters_json = excluded.clusters_json,
+                        shift_context_json = excluded.shift_context_json,
+                        actions_json = excluded.actions_json,
+                        generated_at = excluded.generated_at,
+                        alert_hash = excluded.alert_hash
+                """, (one_liner, json.dumps(clusters), json.dumps(shift_context),
+                      json.dumps(actions), now, alert_hash))
+                db.commit()
+            _sse_broadcast("situation_update", {"generated_at": now})
+            self._send_json(200, {"status": "stored"})
 
         else:
             self._send_json(404, {"error": "not found"})
