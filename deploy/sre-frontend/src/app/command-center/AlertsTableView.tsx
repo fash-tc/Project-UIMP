@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useMemo, useEffect } from 'react';
-import { Alert } from '@/lib/types';
+import { Alert, AlertState } from '@/lib/types';
 import {
   parseAIEnrichment,
   severityBg,
@@ -19,11 +19,12 @@ const SEVERITY_ORDER: Record<string, number> = {
 
 export interface AlertsTableViewProps {
   alerts: Alert[];
+  alertStates?: Map<string, AlertState>;
   loading: boolean;
   onAlertClick: (alert: Alert) => void;
 }
 
-export default function AlertsTableView({ alerts, loading, onAlertClick }: AlertsTableViewProps) {
+export default function AlertsTableView({ alerts, alertStates, loading, onAlertClick }: AlertsTableViewProps) {
   const [search, setSearch] = useState('');
   const [sevFilter, setSevFilter] = useState<string>('all');
   const [statusFilter, setStatusFilter] = useState<string>('active');
@@ -204,10 +205,39 @@ export default function AlertsTableView({ alerts, loading, onAlertClick }: Alert
                         <span className={`badge ${severityBg(sev)}`}>{sev}</span>
                       </td>
                       <td className="table-cell">
-                        <span className="text-text-bright hover:text-accent transition-colors">
-                          {(alert.name || 'Unknown').substring(0, 50)}
-                          {(alert.name?.length ?? 0) > 50 ? '...' : ''}
-                        </span>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="text-text-bright hover:text-accent transition-colors">
+                            {(alert.name || 'Unknown').substring(0, 50)}
+                            {(alert.name?.length ?? 0) > 50 ? '...' : ''}
+                          </span>
+                          {alertStates?.get(alert.fingerprint)?.incident_jira_key && (
+                            <a
+                              href={alertStates.get(alert.fingerprint)!.incident_jira_url || '#'}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                              title={`Incident created by ${alertStates.get(alert.fingerprint)!.incident_created_by || 'unknown'}${alertStates.get(alert.fingerprint)!.incident_created_at ? ', ' + timeAgo(alertStates.get(alert.fingerprint)!.incident_created_at!) : ''}`}
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-purple/10 border border-purple/30 text-purple whitespace-nowrap hover:bg-purple/20 transition-all duration-200"
+                            >
+                              <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101" />
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M10.172 13.828a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.102 1.101" />
+                              </svg>
+                              {alertStates.get(alert.fingerprint)!.incident_jira_key}
+                            </a>
+                          )}
+                          {alertStates?.get(alert.fingerprint)?.escalated_to && (
+                            <span
+                              title={`Escalated by ${alertStates.get(alert.fingerprint)!.escalated_by || 'unknown'}${alertStates.get(alert.fingerprint)!.escalated_at ? ', ' + timeAgo(alertStates.get(alert.fingerprint)!.escalated_at!) : ''}`}
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-amber/10 border border-amber/30 text-amber whitespace-nowrap transition-all duration-200"
+                            >
+                              <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M5 10l7-7m0 0l7 7m-7-7v18" />
+                              </svg>
+                              {alertStates.get(alert.fingerprint)!.escalated_to}
+                            </span>
+                          )}
+                        </div>
                         {alert.description && alert.description !== alert.name && (
                           <div className="text-xs text-muted mt-0.5 truncate max-w-xs font-mono">
                             {alert.description.substring(0, 80)}
