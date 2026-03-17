@@ -261,6 +261,7 @@ class AlertStateHandler(BaseHTTPRequestHandler):
                         WHERE alert_fingerprint = ?
                     """, (fingerprint,))
                     db.commit()
+                    _sse_broadcast("investigate", {"fingerprint": fingerprint, "user": username, "active": False})
                     self._send_json(200, {"status": "stopped", "investigating_user": None})
                 else:
                     now = datetime.now(timezone.utc).isoformat()
@@ -274,6 +275,7 @@ class AlertStateHandler(BaseHTTPRequestHandler):
                             updated_at = datetime('now')
                     """, (fingerprint, alert_name, username, now))
                     db.commit()
+                    _sse_broadcast("investigate", {"fingerprint": fingerprint, "user": username, "active": True})
                     self._send_json(200, {"status": "investigating", "investigating_user": username})
 
         elif path == "/api/alert-states/acknowledge":
@@ -307,6 +309,7 @@ class AlertStateHandler(BaseHTTPRequestHandler):
                             updated_at = datetime('now')
                     """, (fp, alert_names.get(fp, ""), username, now, firing_starts.get(fp, "")))
                 db.commit()
+            _sse_broadcast("acknowledge", {"fingerprints": fingerprints, "user": username})
             log.info(f"{username} acknowledged {len(fingerprints)} alert(s)")
             self._send_json(200, {"status": "acknowledged", "count": len(fingerprints)})
 
@@ -333,6 +336,7 @@ class AlertStateHandler(BaseHTTPRequestHandler):
                         WHERE alert_fingerprint = ?
                     """, (fp,))
                 db.commit()
+            _sse_broadcast("unacknowledge", {"fingerprints": fingerprints})
             self._send_json(200, {"status": "unacknowledged", "count": len(fingerprints)})
 
         elif path == "/api/alert-states/mark-updated":
@@ -357,6 +361,7 @@ class AlertStateHandler(BaseHTTPRequestHandler):
                         WHERE alert_fingerprint = ?
                     """, (now, fp))
                 db.commit()
+            _sse_broadcast("mark_updated", {"fingerprints": fingerprints})
             if fingerprints:
                 log.info(f"Marked {len(fingerprints)} alert(s) as updated (re-fired)")
             self._send_json(200, {"status": "marked_updated", "count": len(fingerprints)})
@@ -379,6 +384,7 @@ class AlertStateHandler(BaseHTTPRequestHandler):
                         force_enrich = 1, updated_at = datetime('now')
                 """, (fingerprint,))
                 db.commit()
+            _sse_broadcast("force_enrich", {"fingerprint": fingerprint})
             log.info(f"Force-enrich queued for {fingerprint[:16]}")
             self._send_json(200, {"status": "queued"})
 
