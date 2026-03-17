@@ -49,6 +49,7 @@ export default function CommandCenter() {
   const [selectedAlert, setSelectedAlert] = useState<Alert | null>(null);
   const [alertStates, setAlertStates] = useState<Map<string, AlertState>>(new Map());
   const [activeTab, setActiveTab] = useState<'dashboard' | 'alerts'>('dashboard');
+  const [situationTrigger, setSituationTrigger] = useState(0);
 
   const load = useCallback(async () => {
     try {
@@ -88,6 +89,11 @@ export default function CommandCenter() {
   const handleSSEEvent = useCallback((event: SSEEvent) => {
     if (event.type === '_reset') {
       load();
+      return;
+    }
+
+    if (event.type === 'situation_update') {
+      setSituationTrigger(prev => prev + 1);
       return;
     }
 
@@ -247,6 +253,7 @@ export default function CommandCenter() {
           onGroupResolve={handleGroupResolve}
           onForceEnrich={async (fp: string) => { await forceEnrich(fp); load(); }}
           onRefresh={load}
+          sseUpdateTrigger={situationTrigger}
         />
       ) : (
         <AlertsTableView

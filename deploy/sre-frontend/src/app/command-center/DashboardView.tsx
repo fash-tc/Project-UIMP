@@ -11,6 +11,7 @@ import {
   alertStartTime,
   getSourceLabel,
 } from '@/lib/keep-api';
+import SituationCard from './SituationCard';
 
 /* ── Alert Grouping (duplicated from page-level helpers) ── */
 
@@ -335,6 +336,7 @@ export interface DashboardViewProps {
   onGroupResolve: (fingerprints: string[]) => Promise<void>;
   onForceEnrich?: (fingerprint: string) => Promise<void>;
   onRefresh: () => void;
+  sseUpdateTrigger?: number;
 }
 
 function isSuppressedNote(note: string | undefined | null): boolean {
@@ -353,8 +355,10 @@ export default function DashboardView({
   onGroupAcknowledge,
   onGroupResolve,
   onForceEnrich,
+  sseUpdateTrigger,
 }: DashboardViewProps) {
   const [sevFilter, setSevFilter] = useState<string | null>(null);
+  const [clusterFilter, setClusterFilter] = useState<string[] | null>(null);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
   const [sortKey, setSortKey] = useState<'severity' | 'alert' | 'host' | 'source' | 'summary' | 'time'>('time');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
@@ -428,12 +432,16 @@ export default function DashboardView({
 
   const alertGroups = useMemo(() => groupView ? buildAlertGroups(sortedAlerts, sortKey, sortDir) : [], [sortedAlerts, groupView, sortKey, sortDir]);
 
-  const totalPages = Math.max(1, Math.ceil(sortedAlerts.length / pageSize));
-  const safePage = Math.min(currentPage, totalPages - 1);
-  const displayAlerts = sortedAlerts.slice(safePage * pageSize, (safePage + 1) * pageSize);
-  const hasFilter = sevFilter !== null;
+  const displayAlerts = clusterFilter
+    ? filteredAlerts.filter(a => clusterFilter.includes(a.fingerprint))
+    : sortedAlerts;
 
-  useEffect(() => { setCurrentPage(0); }, [sevFilter, pageSize]);
+  const totalPages = Math.max(1, Math.ceil(displayAlerts.length / pageSize));
+  const safePage = Math.min(currentPage, totalPages - 1);
+  const pagedAlerts = displayAlerts.slice(safePage * pageSize, (safePage + 1) * pageSize);
+  const hasFilter = sevFilter !== null || clusterFilter !== null;
+
+  useEffect(() => { setCurrentPage(0); }, [sevFilter, clusterFilter, pageSize]);
 
   function handleSort(key: typeof sortKey) {
     if (sortKey === key) {
@@ -492,6 +500,12 @@ export default function DashboardView({
 
   return (
     <div className="space-y-6">
+      {/* Situation Summary Card */}
+      <SituationCard
+        sseUpdateTrigger={sseUpdateTrigger}
+        onClusterClick={(fps) => setClusterFilter(fps.length > 0 ? fps : null)}
+      />
+
       {/* Stat Cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard label="Active Alerts" value={stats.total} color="text-text-bright" />
@@ -551,8 +565,16 @@ export default function DashboardView({
               {sevFilter} &times;
             </button>
           )}
+          {clusterFilter && (
+            <button
+              onClick={() => setClusterFilter(null)}
+              className="text-xs px-2 py-1 bg-accent/20 text-accent rounded-full hover:bg-accent/30 transition-colors"
+            >
+              Showing cluster · Click to clear
+            </button>
+          )}
           <button
-            onClick={() => setSevFilter(null)}
+            onClick={() => { setSevFilter(null); setClusterFilter(null); }}
             className="text-xs text-muted hover:text-text transition-colors ml-2"
           >
             Clear
@@ -751,14 +773,14 @@ export default function DashboardView({
                   ))
                 )
               ) : (
-                displayAlerts.length === 0 ? (
+                pagedAlerts.length === 0 ? (
                   <tr>
                     <td colSpan={6} className="table-cell text-center text-muted py-8">
                       {hasFilter ? 'No alerts match the selected filters' : 'No active alerts'}
                     </td>
                   </tr>
                 ) : (
-                  displayAlerts.map((alert) => {
+                  pagedAlerts.map((alert) => {
                     const rowId = alert.fingerprint || alert.id;
                     return (
                       <AlertRow
@@ -798,8 +820,8 @@ export default function DashboardView({
             <>
               <div className="flex items-center gap-3">
                 <span className="text-xs text-muted">
-                  {sortedAlerts.length > 0
-                    ? `Showing ${safePage * pageSize + 1}\u2013${Math.min((safePage + 1) * pageSize, sortedAlerts.length)} of ${sortedAlerts.length}`
+                  {displayAlerts.length > 0
+                    ? `Showing ${safePage * pageSize + 1}\u2013${Math.min((safePage + 1) * pageSize, displayAlerts.length)} of ${displayAlerts.length}`
                     : 'No alerts'}
                 </span>
                 <select
