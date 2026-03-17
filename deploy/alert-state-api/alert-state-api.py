@@ -10,7 +10,8 @@ import hmac as hmac_mod
 import threading
 import time
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from collections import deque
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -21,6 +22,35 @@ DB_PATH = os.environ.get("DB_PATH", "/data/alert-states.db")
 AUTH_SECRET = os.environ.get("AUTH_SECRET", "")
 
 _db_lock = threading.Lock()
+
+# ── SSE Infrastructure ────────────────────────────────────
+_sse_lock = threading.Lock()
+_sse_clients = set()          # Set of wfile objects
+_sse_event_counter = 0
+_sse_ring_buffer = deque(maxlen=100)  # Ring buffer for replay
+_SSE_MAX_CLIENTS = 50
+
+
+def _sse_broadcast(event_type, payload):
+    """Broadcast an SSE event to all connected clients."""
+    global _sse_event_counter
+    with _sse_lock:
+        _sse_event_counter += 1
+        event_id = _sse_event_counter
+        payload["timestamp"] = datetime.now(timezone.utc).isoformat()
+        payload["type"] = event_type
+        msg = f"id: {event_id}\nevent: state_change\ndata: {json.dumps(payload, default=str)}\n\n"
+        _sse_ring_buffer.append((event_id, msg))
+        dead = set()
+        for client in _sse_clients:
+            try:
+                client.write(msg.encode())
+                client.flush()
+            except Exception:
+                dead.add(client)
+        _sse_clients -= dead
+        if dead:
+            log.info(f"Removed {len(dead)} dead SSE client(s), {len(_sse_clients)} remaining")
 
 
 # ── Database ───────────────────────────────────────────
@@ -143,6 +173,59 @@ class AlertStateHandler(BaseHTTPRequestHandler):
                     """)
                 rows = [dict(r) for r in cursor.fetchall()]
             self._send_json(200, rows)
+
+        elif path == "/api/alert-states/events":
+            # SSE stream endpoint
+            with _sse_lock:
+                if len(_sse_clients) >= _SSE_MAX_CLIENTS:
+                    self._send_json(503, {"error": "too many SSE connections"})
+                    return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            # Register client and replay missed events atomically to avoid gaps
+            last_id_str = self.headers.get("Last-Event-ID", "")
+            with _sse_lock:
+                _sse_clients.add(self.wfile)
+                if last_id_str:
+                    try:
+                        last_id = int(last_id_str)
+                        found = False
+                        for eid, msg in _sse_ring_buffer:
+                            if eid == last_id:
+                                found = True
+                                continue
+                            if found:
+                                self.wfile.write(msg.encode())
+                        if not found and _sse_ring_buffer:
+                            reset_msg = f"id: {_sse_ring_buffer[-1][0]}\nevent: reset\ndata: {{}}\n\n"
+                            self.wfile.write(reset_msg.encode())
+                    except (ValueError, TypeError):
+                        pass
+            self.wfile.flush()
+            log.info(f"SSE client connected ({len(_sse_clients)} total)")
+            try:
+                while True:
+                    time.sleep(30)
+                    try:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                    except Exception:
+                        break
+            finally:
+                with _sse_lock:
+                    _sse_clients.discard(self.wfile)
+                log.info(f"SSE client disconnected ({len(_sse_clients)} remaining)")
+
+        elif path == "/api/alert-states/sse-status":
+            with _sse_lock:
+                count = len(_sse_clients)
+            self._send_json(200, {"connected_clients": count})
 
         else:
             self._send_json(404, {"error": "not found"})
@@ -328,6 +411,6 @@ if not AUTH_SECRET:
 
 db = _init_db()
 
-server = HTTPServer(("0.0.0.0", API_PORT), AlertStateHandler)
+server = ThreadingHTTPServer(("0.0.0.0", API_PORT), AlertStateHandler)
 log.info(f"alert-state-api listening on port {API_PORT}")
 server.serve_forever()
