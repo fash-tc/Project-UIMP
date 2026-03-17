@@ -209,6 +209,33 @@ function AlertRow({ alert, expanded, onToggleExpand, onOpenDetail, indented, ale
               Acked by {alertState.acknowledged_by} {alertState.acknowledged_at ? timeAgo(alertState.acknowledged_at) : ''}
             </span>
           )}
+          {alertState?.incident_jira_key && (
+            <a
+              href={alertState.incident_jira_url || '#'}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              title={`Incident created by ${alertState.incident_created_by || 'unknown'}${alertState.incident_created_at ? ', ' + timeAgo(alertState.incident_created_at) : ''}`}
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-purple/10 border border-purple/30 text-purple whitespace-nowrap hover:bg-purple/20 transition-all duration-200"
+            >
+              <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M10.172 13.828a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.102 1.101" />
+              </svg>
+              {alertState.incident_jira_key}
+            </a>
+          )}
+          {alertState?.escalated_to && (
+            <span
+              title={`Escalated by ${alertState.escalated_by || 'unknown'}${alertState.escalated_at ? ', ' + timeAgo(alertState.escalated_at) : ''}`}
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-amber/10 border border-amber/30 text-amber whitespace-nowrap transition-all duration-200"
+            >
+              <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 10l7-7m0 0l7 7m-7-7v18" />
+              </svg>
+              {alertState.escalated_to}
+            </span>
+          )}
         </div>
         {description && (
           <div className="text-xs text-muted mt-0.5 font-mono">
