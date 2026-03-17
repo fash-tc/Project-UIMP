@@ -76,6 +76,20 @@ def _init_db():
         )
     """)
     db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_as_fingerprint ON alert_states(alert_fingerprint)")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS runbook_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_fingerprint TEXT NOT NULL,
+            alert_name TEXT NOT NULL,
+            runbook_entry_id INTEGER NOT NULL,
+            vote TEXT NOT NULL,
+            user TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(alert_fingerprint, runbook_entry_id, user)
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_feedback_entry_id ON runbook_feedback(runbook_entry_id)")
+    db.commit()
     # Add force_enrich column if it doesn't exist (migration)
     try:
         db.execute("ALTER TABLE alert_states ADD COLUMN force_enrich INTEGER DEFAULT 0")
@@ -83,6 +97,20 @@ def _init_db():
         log.info("Added force_enrich column to alert_states")
     except sqlite3.OperationalError:
         pass  # Column already exists
+    # Migration: add incident and escalation columns
+    existing = {row[1] for row in db.execute("PRAGMA table_info(alert_states)").fetchall()}
+    for col, default in [
+        ("incident_jira_key", "NULL"),
+        ("incident_jira_url", "NULL"),
+        ("incident_created_by", "NULL"),
+        ("incident_created_at", "NULL"),
+        ("escalated_to", "NULL"),
+        ("escalated_by", "NULL"),
+        ("escalated_at", "NULL"),
+    ]:
+        if col not in existing:
+            db.execute(f"ALTER TABLE alert_states ADD COLUMN {col} TEXT DEFAULT {default}")
+            log.info(f"Migrated: added '{col}' column to alert_states")
     db.commit()
     log.info(f"Database initialized at {DB_PATH}")
     return db
