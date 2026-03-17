@@ -197,8 +197,31 @@ class AlertStateHandler(BaseHTTPRequestHandler):
                         WHERE investigating_user IS NOT NULL
                            OR acknowledged_by IS NOT NULL
                            OR is_updated = 1
+                           OR incident_jira_key IS NOT NULL
+                           OR escalated_to IS NOT NULL
                         ORDER BY updated_at DESC
                     """)
+                rows = [dict(r) for r in cursor.fetchall()]
+            self._send_json(200, rows)
+
+        elif path == "/api/alert-states/runbook-feedback":
+            qs = parse_qs(parsed.query)
+            entry_ids_str = qs.get("entry_ids", [""])[0]
+            if not entry_ids_str:
+                self._send_json(400, {"error": "entry_ids query param required"})
+                return
+            try:
+                entry_ids = [int(x.strip()) for x in entry_ids_str.split(",") if x.strip()]
+            except ValueError:
+                self._send_json(400, {"error": "entry_ids must be comma-separated integers"})
+                return
+            with _db_lock:
+                placeholders = ",".join("?" * len(entry_ids))
+                cursor = db.execute(f"""
+                    SELECT * FROM runbook_feedback
+                    WHERE runbook_entry_id IN ({placeholders})
+                    ORDER BY created_at DESC
+                """, entry_ids)
                 rows = [dict(r) for r in cursor.fetchall()]
             self._send_json(200, rows)
 
@@ -433,6 +456,114 @@ class AlertStateHandler(BaseHTTPRequestHandler):
                 """, (fingerprint,))
                 db.commit()
             self._send_json(200, {"status": "cleared"})
+
+        elif path == "/api/alert-states/incident":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            fingerprint = (data.get("fingerprint") or "").strip()
+            jira_key = (data.get("jira_key") or "").strip()
+            jira_url = (data.get("jira_url") or "").strip()
+            if not fingerprint or not jira_key:
+                self._send_json(400, {"error": "fingerprint and jira_key are required"})
+                return
+            now = datetime.now(timezone.utc).isoformat()
+            with _db_lock:
+                db.execute("""
+                    INSERT INTO alert_states (alert_fingerprint, incident_jira_key, incident_jira_url,
+                        incident_created_by, incident_created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(alert_fingerprint) DO UPDATE SET
+                        incident_jira_key = excluded.incident_jira_key,
+                        incident_jira_url = excluded.incident_jira_url,
+                        incident_created_by = excluded.incident_created_by,
+                        incident_created_at = excluded.incident_created_at,
+                        updated_at = datetime('now')
+                """, (fingerprint, jira_key, jira_url, username, now))
+                db.commit()
+            _sse_broadcast("incident_created", {
+                "fingerprint": fingerprint, "user": username,
+                "jira_key": jira_key, "jira_url": jira_url,
+            })
+            log.info(f"{username} created incident {jira_key} for {fingerprint[:16]}")
+            self._send_json(200, {"status": "stored", "jira_key": jira_key})
+
+        elif path == "/api/alert-states/escalation":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            fingerprint = (data.get("fingerprint") or "").strip()
+            escalated_to = (data.get("escalated_to") or "").strip()
+            if not fingerprint or not escalated_to:
+                self._send_json(400, {"error": "fingerprint and escalated_to are required"})
+                return
+            now = datetime.now(timezone.utc).isoformat()
+            with _db_lock:
+                db.execute("""
+                    INSERT INTO alert_states (alert_fingerprint, escalated_to, escalated_by, escalated_at, updated_at)
+                    VALUES (?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(alert_fingerprint) DO UPDATE SET
+                        escalated_to = excluded.escalated_to,
+                        escalated_by = excluded.escalated_by,
+                        escalated_at = excluded.escalated_at,
+                        updated_at = datetime('now')
+                """, (fingerprint, escalated_to, username, now))
+                db.commit()
+            _sse_broadcast("escalated", {
+                "fingerprint": fingerprint, "user": username, "escalated_to": escalated_to,
+            })
+            log.info(f"{username} escalated {fingerprint[:16]} to {escalated_to}")
+            self._send_json(200, {"status": "stored", "escalated_to": escalated_to})
+
+        elif path == "/api/alert-states/runbook-feedback":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            fingerprint = (data.get("fingerprint") or "").strip()
+            alert_name = (data.get("alert_name") or "").strip()
+            entry_id = data.get("entry_id")
+            vote = (data.get("vote") or "").strip()
+            if not fingerprint or not entry_id or vote not in ("up", "down", "none"):
+                self._send_json(400, {"error": "fingerprint, entry_id, and vote (up/down/none) required"})
+                return
+            now = datetime.now(timezone.utc).isoformat()
+            with _db_lock:
+                if vote == "none":
+                    db.execute("""
+                        DELETE FROM runbook_feedback
+                        WHERE alert_fingerprint = ? AND runbook_entry_id = ? AND user = ?
+                    """, (fingerprint, entry_id, username))
+                else:
+                    db.execute("""
+                        INSERT INTO runbook_feedback (alert_fingerprint, alert_name, runbook_entry_id, vote, user, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(alert_fingerprint, runbook_entry_id, user) DO UPDATE SET
+                            vote = excluded.vote, created_at = excluded.created_at
+                    """, (fingerprint, alert_name, entry_id, vote, username, now))
+                db.commit()
+            _sse_broadcast("runbook_feedback", {
+                "fingerprint": fingerprint, "entry_id": entry_id,
+                "vote": vote, "user": username,
+            })
+            self._send_json(200, {"status": "stored", "vote": vote})
 
         else:
             self._send_json(404, {"error": "not found"})
