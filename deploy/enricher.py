@@ -237,6 +237,22 @@ def fetch_runbook_entries(alert_name, hostname, service=None):
         return []
 
 
+def fetch_runbook_feedback(entry_ids):
+    """Fetch SRE feedback on runbook entries from alert-state-api."""
+    if not entry_ids:
+        return []
+    ids_str = ",".join(str(i) for i in entry_ids)
+    url = f"{ALERT_STATE_API_URL}/api/alert-states/runbook-feedback?entry_ids={ids_str}"
+    try:
+        req = Request(url, headers={"Accept": "application/json"})
+        resp = urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log.debug(f"Runbook feedback fetch failed (non-fatal): {e}")
+        return []
+
+
 def fetch_ai_instructions():
     """Fetch active global AI instructions from the runbook API."""
     url = f"{RUNBOOK_API_URL}/api/runbook/ai-instructions"
@@ -349,15 +365,17 @@ def keep_request(path, method="GET", data=None):
 def ollama_generate(prompt, timeout=45):
     body = json.dumps({
         "model": OLLAMA_MODEL,
-        "prompt": prompt,
+        "messages": [
+            {"role": "user", "content": prompt},
+        ],
         "stream": False,
+        "think": False,
         "options": {
-            "temperature": 0.3,
-            "num_predict": 768,
+            "num_predict": 1024,
         },
     }).encode()
     req = Request(
-        f"{OLLAMA_URL}/api/generate",
+        f"{OLLAMA_URL}/api/chat",
         data=body,
         headers={"Content-Type": "application/json"},
     )
@@ -365,7 +383,8 @@ def ollama_generate(prompt, timeout=45):
         try:
             resp = urlopen(req, timeout=timeout)
             data = json.loads(resp.read())
-            return data.get("response", "").strip()
+            msg = data.get("message", {})
+            return msg.get("content", "").strip()
         except Exception as e:
             if attempt == 0:
                 log.warning(f"Ollama timeout/error (attempt 1), retrying: {e}")
@@ -499,21 +518,50 @@ def build_enrichment_prompt(alert, similar_alerts):
             direct_fb_context += f'  SRE comment: "{direct_feedback["comment"][:200]}"\n'
         direct_fb_context += "  IMPORTANT: Respect the SRE's corrections in your assessment.\n"
 
-    # Runbook entries context
+    # Runbook entries context (with SRE feedback integration)
     runbook_entries = fetch_runbook_entries(name, host, service)
+
+    # Fetch SRE feedback on runbook entries
+    entry_ids = [e.get("id") for e in runbook_entries if e.get("id")]
+    feedback_rows = fetch_runbook_feedback(entry_ids)
+
+    # Aggregate votes per entry_id: net score (up=+1, down=-1)
+    vote_scores = {}
+    for fb in feedback_rows:
+        eid = fb.get("runbook_entry_id")
+        v = 1 if fb.get("vote") == "up" else -1
+        vote_scores[eid] = vote_scores.get(eid, 0) + v
+
     runbook_context = ""
     if runbook_entries:
-        lines = ["\nRUNBOOK ENTRIES (real SRE remediation experience for similar alerts — use as authoritative reference):"]
+        good_lines = ["\nRUNBOOK ENTRIES (real SRE remediation experience for similar alerts — use as authoritative reference):"]
+        bad_lines = ["\nDOWNVOTED REMEDIATION (marked irrelevant by SREs — do NOT recommend these):"]
+        has_good = False
+        has_bad = False
         for entry in runbook_entries[:5]:
             date = (entry.get("created_at") or "unknown")[:10]
             user = entry.get("sre_user") or "unknown"
             e_name = (entry.get("alert_name") or "")[:60]
             e_host = entry.get("hostname") or "N/A"
             rem = (entry.get("remediation") or "")[:300]
-            lines.append(f'  - [{date}, {user}] Alert: "{e_name}" | Host: {e_host}')
-            lines.append(f'    Remediation: "{rem}"')
-        lines.append("  Apply these SRE-validated remediation steps to your REMEDIATION field when relevant.\n")
-        runbook_context = "\n".join(lines)
+            eid = entry.get("id")
+            score = vote_scores.get(eid, 0)
+            line1 = f'  - [{date}, {user}] Alert: "{e_name}" | Host: {e_host}'
+            line2 = f'    Remediation: "{rem}"'
+            if score < 0:
+                bad_lines.append(line1)
+                bad_lines.append(line2)
+                has_bad = True
+            else:
+                good_lines.append(line1)
+                good_lines.append(line2)
+                has_good = True
+        if has_good:
+            good_lines.append("  Apply these SRE-validated remediation steps to your REMEDIATION field when relevant.\n")
+            runbook_context += "\n".join(good_lines)
+        if has_bad:
+            bad_lines.append("  These have been flagged as unhelpful. Do not use them.\n")
+            runbook_context += "\n".join(bad_lines)
 
     # Global AI instructions from SRE team
     ai_instructions = fetch_ai_instructions()
@@ -570,32 +618,20 @@ def build_enrichment_prompt(alert, similar_alerts):
         f"{direct_fb_context}"
         f"{runbook_context}"
         f"{instructions_context}\n"
-        "Respond in this EXACT format. Keep each field concise (1-3 sentences max):\n\n"
-        "ASSESSED_SEVERITY: [critical/high/warning/low/info — base this on USER IMPACT "
-        "and SLO risk, not just the raw metric. critical=active user-facing outage or "
-        "imminent SLO breach; high=degraded service or high risk of escalation; "
-        "warning=early saturation signal, no current user impact; low=informational, "
-        "redundancy covers it; info=no action needed]\n"
-        "LIKELY_CAUSE: [root cause hypothesis. Apply 'what changed?' thinking. "
-        "Distinguish symptom from cause. Prefer simple explanations (Occam's Razor).]\n"
-        "REMEDIATION: [concrete steps for on-call. TRIAGE FIRST: list immediate "
-        "mitigation (failover, restart, shed load) before investigation steps. "
-        "Include rollback if a recent change is suspected.]\n"
-        "IMPACT_SCOPE: [affected services and users. Be specific: which SLIs are at "
-        "risk? Is this a single redundant node or a single point of failure? "
-        "Include upstream/downstream blast radius.]\n"
-        "DEDUP_ASSESSMENT: [DUPLICATE if repeat of a similar alert above, "
-        "CORRELATED if likely shares a root cause with related alerts, "
-        "UNIQUE if standalone]\n"
-        "DEDUP_REASON: [brief explanation. If CORRELATED, state the hypothesized "
-        "shared root cause.]\n"
-        "NOISE_SCORE: [1-10. 1=definitely actionable (user impact, requires human "
-        "intelligence). 10=noise (auto-resolves, flapping, no user impact, or would "
-        "be better as a ticket than a page). Consider: does this require urgent human "
-        "action right now?]\n"
-        "NOISE_REASON: [why this score, referencing actionability and user impact]\n"
-        "SUMMARY: [one-line plain English for on-call. Lead with the user impact, "
-        "then the technical detail.]\n"
+        "Respond with a JSON object containing exactly these fields (keep values concise, 1-3 sentences):\n"
+        '{"assessed_severity": "critical|high|warning|low|info",\n'
+        '"likely_cause": "root cause hypothesis",\n'
+        '"remediation": "concrete triage-first steps for on-call",\n'
+        '"impact_scope": "affected services/users, SLIs at risk, blast radius",\n'
+        '"dedup_assessment": "DUPLICATE|CORRELATED|UNIQUE",\n'
+        '"dedup_reason": "brief explanation",\n'
+        '"noise_score": 1,\n'
+        '"noise_reason": "why this score",\n'
+        '"summary": "one-line for on-call, lead with user impact"}\n\n'
+        "Rules: assessed_severity must be one of critical/high/warning/low/info. "
+        "noise_score must be integer 1-10 (1=actionable, 10=noise). "
+        "dedup_assessment must be DUPLICATE, CORRELATED, or UNIQUE. "
+        "Output ONLY valid JSON, no commentary.\n"
     )
 
 
@@ -612,40 +648,73 @@ def parse_enrichment(response):
         "summary": "",
     }
 
-    field_map = {
-        "ASSESSED_SEVERITY": "assessed_severity",
-        "LIKELY_CAUSE": "likely_cause",
-        "REMEDIATION": "remediation",
-        "IMPACT_SCOPE": "impact_scope",
-        "DEDUP_ASSESSMENT": "dedup_assessment",
-        "DEDUP_REASON": "dedup_reason",
-        "NOISE_SCORE": "noise_score",
-        "NOISE_REASON": "noise_reason",
-        "SUMMARY": "summary",
-    }
+    # Try JSON parsing first (preferred — matches Modelfile output format)
+    try:
+        # Strip markdown code fences if present
+        text = response.strip()
+        if text.startswith("```"):
+            text = "\n".join(text.split("\n")[1:])
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+        data = json.loads(text)
+        if isinstance(data, dict):
+            for key in enrichment:
+                if key in data:
+                    val = data[key]
+                    if key == "assessed_severity":
+                        val = str(val).lower().strip()
+                        if val in ("critical", "high", "warning", "low", "info"):
+                            enrichment[key] = val
+                    elif key == "noise_score":
+                        try:
+                            enrichment[key] = max(1, min(10, int(val)))
+                        except (ValueError, TypeError):
+                            pass
+                    elif key == "dedup_assessment":
+                        val_upper = str(val).upper().strip()
+                        if val_upper in ("DUPLICATE", "CORRELATED", "UNIQUE"):
+                            enrichment[key] = val_upper
+                    else:
+                        enrichment[key] = str(val).strip()
+            log.debug("Parsed enrichment as JSON")
+    except (json.JSONDecodeError, ValueError):
+        # Fall back to text-based parsing (ASSESSED_SEVERITY: ... format)
+        field_map = {
+            "ASSESSED_SEVERITY": "assessed_severity",
+            "LIKELY_CAUSE": "likely_cause",
+            "REMEDIATION": "remediation",
+            "IMPACT_SCOPE": "impact_scope",
+            "DEDUP_ASSESSMENT": "dedup_assessment",
+            "DEDUP_REASON": "dedup_reason",
+            "NOISE_SCORE": "noise_score",
+            "NOISE_REASON": "noise_reason",
+            "SUMMARY": "summary",
+        }
 
-    for line in response.split("\n"):
-        line = line.strip()
-        for prefix, key in field_map.items():
-            if line.upper().startswith(prefix + ":"):
-                val = line.split(":", 1)[1].strip()
-                if key == "assessed_severity":
-                    val = val.lower().strip("[]")
-                    if val in ("critical", "high", "warning", "low", "info"):
+        for line in response.split("\n"):
+            line = line.strip()
+            for prefix, key in field_map.items():
+                if line.upper().startswith(prefix + ":"):
+                    val = line.split(":", 1)[1].strip()
+                    if key == "assessed_severity":
+                        val = val.lower().strip("[]")
+                        if val in ("critical", "high", "warning", "low", "info"):
+                            enrichment[key] = val
+                    elif key == "noise_score":
+                        try:
+                            score = int(val.strip("[]").split("/")[0].split(" ")[0])
+                            enrichment[key] = max(1, min(10, score))
+                        except (ValueError, IndexError):
+                            pass
+                    elif key == "dedup_assessment":
+                        val_upper = val.upper().strip("[]")
+                        if val_upper in ("DUPLICATE", "CORRELATED", "UNIQUE"):
+                            enrichment[key] = val_upper
+                    else:
                         enrichment[key] = val
-                elif key == "noise_score":
-                    try:
-                        score = int(val.strip("[]").split("/")[0].split(" ")[0])
-                        enrichment[key] = max(1, min(10, score))
-                    except (ValueError, IndexError):
-                        pass
-                elif key == "dedup_assessment":
-                    val_upper = val.upper().strip("[]")
-                    if val_upper in ("DUPLICATE", "CORRELATED", "UNIQUE"):
-                        enrichment[key] = val_upper
-                else:
-                    enrichment[key] = val
-                break
+                    break
+        log.debug("Parsed enrichment as text")
 
     # Fill empty critical fields with fallback values
     if not enrichment["remediation"]:
