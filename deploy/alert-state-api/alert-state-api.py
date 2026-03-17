@@ -33,7 +33,7 @@ _SSE_MAX_CLIENTS = 50
 
 def _sse_broadcast(event_type, payload):
     """Broadcast an SSE event to all connected clients."""
-    global _sse_event_counter
+    global _sse_event_counter, _sse_clients
     with _sse_lock:
         _sse_event_counter += 1
         event_id = _sse_event_counter
