@@ -30,6 +30,10 @@ enriched_cache = set()
 # In-memory tracking for noise suppression
 recent_enrichments = {}  # fingerprint -> {alert_name, host, enrichment_text, noise_score, enriched_at, resolve_count, last_resolved_at}
 
+_last_summary_hash = ""
+_last_summary_time = 0
+_SUMMARY_COOLDOWN = 300
+
 # === Service Dependency Map ===
 SERVICE_DEPS = {
     "dns": {
@@ -931,6 +935,138 @@ def cluster_alerts(active_alerts):
     return clusters
 
 
+def generate_situation_summary(clusters, active_alerts, resolved_count):
+    """Generate an AI situation summary from clustered alerts."""
+    global _last_summary_hash, _last_summary_time
+
+    fps = sorted(a.get("fingerprint", "") for a in active_alerts)
+    alert_hash = hashlib.sha256(",".join(fps).encode()).hexdigest()[:16]
+
+    now = time.time()
+    if alert_hash == _last_summary_hash and (now - _last_summary_time) < _SUMMARY_COOLDOWN:
+        return None
+
+    noise_count = 0
+    cluster_info = []
+    for c in clusters:
+        if c["count"] == 1:
+            continue
+        cluster_info.append(
+            f"- Cluster '{c['label']}': {c['count']} alerts, "
+            f"top severity={c['top_severity']}, "
+            f"alerts: {', '.join(c['alert_names'][:5])}"
+        )
+
+    for a in active_alerts:
+        note = a.get("note", "") or ""
+        for line in note.split("\n"):
+            if line.startswith("NOISE_SCORE:"):
+                try:
+                    score = int(line.split(":")[1].strip())
+                    if score >= 8:
+                        noise_count += 1
+                except (ValueError, IndexError):
+                    pass
+                break
+
+    singleton_count = sum(1 for c in clusters if c["count"] == 1)
+
+    prompt = f"""You are an SRE situation analyst. Analyze the current alert state and produce a JSON situation summary.
+
+CURRENT STATE:
+- Active alerts: {len(active_alerts)}
+- Resolved alerts (recent): {resolved_count}
+- Noise alerts (score >= 8): {noise_count}
+- Alert clusters: {len([c for c in clusters if c['count'] > 1])}
+- Unclustered alerts: {singleton_count}
+
+CLUSTERS:
+{chr(10).join(cluster_info) if cluster_info else "No multi-alert clusters detected."}
+
+INDIVIDUAL ACTIVE ALERTS:
+"""
+    for a in active_alerts[:30]:
+        note = a.get("note", "") or ""
+        summary_line = ""
+        sev_line = ""
+        for line in note.split("\n"):
+            if line.startswith("SUMMARY:"):
+                summary_line = line.split(":", 1)[1].strip()[:100]
+            elif line.startswith("ASSESSED_SEVERITY:"):
+                sev_line = line.split(":", 1)[1].strip()
+        name = a.get("name", "")[:50]
+        host = get_host(a)
+        prompt += f"- [{sev_line}] {name} on {host}: {summary_line}\n"
+
+    prompt += """
+Respond with JSON only:
+{
+  "one_liner": "Brief 1-sentence situation overview with alert counts and top priority",
+  "clusters": [
+    {"cluster_id": "<id from input>", "assessment": "1-sentence assessment", "priority": 1}
+  ],
+  "shift_context": {
+    "new_since_last": 0,
+    "resolved_since_last": 0,
+    "trend": "improving|stable|worsening",
+    "recurring": ["patterns that keep firing"]
+  },
+  "recommended_actions": [
+    "Numbered action items, most urgent first"
+  ]
+}
+
+Rules:
+- one_liner: concise, lead with most critical issue
+- clusters: ordered by priority (1 = most urgent), only clusters with count > 1
+- recommended_actions: specific and actionable
+- trend: "improving" if more resolving, "worsening" if more firing, "stable" otherwise
+"""
+
+    response = ollama_generate(prompt, timeout=15)
+    if not response:
+        log.warning("Situation summary LLM call failed")
+        return None
+
+    try:
+        text = response.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+        summary = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as e:
+        log.warning(f"Situation summary JSON parse failed: {e}")
+        return None
+
+    payload = {
+        "one_liner": summary.get("one_liner", ""),
+        "clusters": summary.get("clusters", []),
+        "shift_context": summary.get("shift_context", {}),
+        "recommended_actions": summary.get("recommended_actions", []),
+        "alert_hash": alert_hash,
+    }
+
+    try:
+        body = json.dumps(payload).encode()
+        req = Request(
+            f"{ALERT_STATE_API_URL}/api/alert-states/situation-summary",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        urlopen(req, timeout=5)
+        _last_summary_hash = alert_hash
+        _last_summary_time = now
+        log.info(f"Situation summary updated: {summary.get('one_liner', '')[:80]}")
+    except Exception as e:
+        log.warning(f"Failed to store situation summary: {e}")
+
+    return summary
+
+
 def poll_and_enrich():
     alerts_data = keep_request("/alerts?limit=250")
     if not alerts_data:
@@ -1058,6 +1194,14 @@ def poll_and_enrich():
 
     if suppressed_count:
         log.info(f"Suppressed {suppressed_count} alerts (noise/flapping/dedup)")
+
+    # ── Clustering & Situation Summary ──
+    if active_alerts:
+        clusters = cluster_alerts(active_alerts)
+        multi_clusters = [c for c in clusters if c["count"] > 1]
+        if multi_clusters:
+            log.info(f"Clustered {sum(c['count'] for c in multi_clusters)} alerts into {len(multi_clusters)} groups")
+        generate_situation_summary(clusters, active_alerts, len(items) - len(active_alerts))
 
     return enriched_count
 
