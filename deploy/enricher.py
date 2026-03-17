@@ -8,6 +8,7 @@ import json
 import time
 import os
 import logging
+import hashlib
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -855,6 +856,79 @@ def clear_force_enrich(fingerprint):
         urlopen(req, timeout=5)
     except Exception:
         pass
+
+
+# ── Alert Clustering ──────────────────────────────────────
+def cluster_alerts(active_alerts):
+    """Group related active alerts using deterministic rules."""
+    by_host = {}
+    by_prefix = {}
+    for a in active_alerts:
+        host = get_host(a)
+        if host and host != "unknown":
+            by_host.setdefault(host, []).append(a)
+        name = a.get("name", "")
+        if ":" in name:
+            prefix = name.split(":")[0].strip()
+            if len(prefix) > 2:
+                by_prefix.setdefault(prefix, []).append(a)
+
+    assigned = set()
+    clusters = []
+    sev_order = {"critical": 0, "high": 1, "warning": 2, "low": 3, "info": 4}
+
+    def get_top_severity(alerts_list):
+        severities = []
+        for a in alerts_list:
+            note = a.get("note", "") or ""
+            for line in note.split("\n"):
+                if line.startswith("ASSESSED_SEVERITY:"):
+                    severities.append(line.split(":", 1)[1].strip())
+                    break
+        return min(severities, key=lambda s: sev_order.get(s, 5)) if severities else "unknown"
+
+    # Rule 1: Same host
+    for host, alerts in sorted(by_host.items(), key=lambda x: -len(x[1])):
+        fps = [a.get("fingerprint", "") for a in alerts if a.get("fingerprint", "") not in assigned]
+        if len(fps) >= 2:
+            cluster_list = [a for a in alerts if a.get("fingerprint", "") in set(fps)]
+            names = [a.get("name", "")[:60] for a in cluster_list]
+            top_sev = get_top_severity(cluster_list)
+            cid = "c_" + hashlib.sha256(",".join(sorted(fps)).encode()).hexdigest()[:12]
+            clusters.append({
+                "cluster_id": cid, "label": host, "fingerprints": fps,
+                "alert_names": names, "top_severity": top_sev,
+                "count": len(fps), "hosts": [host],
+            })
+            assigned.update(fps)
+
+    # Rule 2: Same service prefix (across hosts)
+    for prefix, alerts in sorted(by_prefix.items(), key=lambda x: -len(x[1])):
+        fps = [a.get("fingerprint", "") for a in alerts if a.get("fingerprint", "") not in assigned]
+        if len(fps) >= 2:
+            cluster_list = [a for a in alerts if a.get("fingerprint", "") in set(fps)]
+            names = [a.get("name", "")[:60] for a in cluster_list]
+            hosts = sorted(set(get_host(a) for a in cluster_list))
+            top_sev = get_top_severity(cluster_list)
+            cid = "c_" + hashlib.sha256(",".join(sorted(fps)).encode()).hexdigest()[:12]
+            clusters.append({
+                "cluster_id": cid, "label": f"{prefix} (multi-host)", "fingerprints": fps,
+                "alert_names": names, "top_severity": top_sev,
+                "count": len(fps), "hosts": hosts,
+            })
+            assigned.update(fps)
+
+    # Remaining: single-alert clusters
+    for a in active_alerts:
+        fp = a.get("fingerprint", "")
+        if fp and fp not in assigned:
+            clusters.append({
+                "cluster_id": "c_" + fp[:12], "label": get_host(a) or a.get("name", "unknown")[:30],
+                "fingerprints": [fp], "alert_names": [a.get("name", "")[:60]],
+                "top_severity": "unknown", "count": 1, "hosts": [get_host(a)],
+            })
+
+    return clusters
 
 
 def poll_and_enrich():
