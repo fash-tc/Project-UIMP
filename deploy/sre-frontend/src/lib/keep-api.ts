@@ -1,4 +1,4 @@
-import { Alert, AIEnrichment, AlertStats, SREFeedback, RunbookEntry, AIInstruction, AIFeedbackSummary, AlertState } from './types';
+import { Alert, AIEnrichment, AlertStats, SREFeedback, RunbookEntry, AIInstruction, AIFeedbackSummary, AlertState, RunbookFeedback } from './types';
 
 const API_BASE = '/api/keep';
 
@@ -669,4 +669,54 @@ export async function forceEnrich(fingerprint: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export async function storeIncidentState(
+  fingerprint: string,
+  jiraKey: string,
+  jiraUrl: string,
+): Promise<void> {
+  await fetch('/api/alert-states/incident', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ fingerprint, jira_key: jiraKey, jira_url: jiraUrl }),
+  });
+}
+
+export async function storeEscalationState(
+  fingerprint: string,
+  escalatedTo: string,
+): Promise<void> {
+  await fetch('/api/alert-states/escalation', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ fingerprint, escalated_to: escalatedTo }),
+  });
+}
+
+export async function submitRunbookFeedback(
+  fingerprint: string,
+  alertName: string,
+  entryId: number,
+  vote: 'up' | 'down' | 'none',
+): Promise<void> {
+  await fetch('/api/alert-states/runbook-feedback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ fingerprint, alert_name: alertName, entry_id: entryId, vote }),
+  });
+}
+
+export async function fetchRunbookFeedback(
+  entryIds: number[],
+): Promise<RunbookFeedback[]> {
+  if (entryIds.length === 0) return [];
+  const res = await fetch(`/api/alert-states/runbook-feedback?entry_ids=${entryIds.join(',')}`, {
+    credentials: 'include',
+  });
+  if (!res.ok) return [];
+  return res.json();
 }
