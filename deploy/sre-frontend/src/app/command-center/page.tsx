@@ -1230,6 +1230,13 @@ function IncidentForm({ alert, enrichment, onCreated, onCancel }: {
       } catch {
         // Best-effort — incident was already created in Jira
       }
+      try {
+        await fetch('/api/alert-states/investigate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fingerprint: alert.fingerprint }),
+        });
+      } catch {}
       onCreated(result.issueKey, result.issueUrl || '');
     } else {
       setError(result.error || 'Failed to create incident');

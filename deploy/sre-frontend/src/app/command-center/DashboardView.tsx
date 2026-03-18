@@ -10,8 +10,17 @@ import {
   timeAgo,
   alertStartTime,
   getSourceLabel,
+  overrideSeverity,
+  forceEnrich,
 } from '@/lib/keep-api';
 import SituationCard from './SituationCard';
+
+const ZABBIX_URLS: Record<string, string> = {
+  'domains-shared': 'https://zabbix.bra2.tucows.cloud',
+  'ascio': 'https://zabbix.ascio.net',
+  'hostedemail': 'https://zabbix.hostedemail.com',
+  'enom': 'https://zabbix.enom.net',
+};
 
 /* ── Alert Grouping (duplicated from page-level helpers) ── */
 
@@ -165,8 +174,10 @@ function AlertRow({ alert, expanded, onToggleExpand, onOpenDetail, indented, ale
   onUnacknowledge?: () => void;
   showAckInfo?: boolean;
 }) {
+  const [severityDropdown, setSeverityDropdown] = useState<boolean>(false);
   const enrichment = parseAIEnrichment(alert.note);
-  const sev = enrichment?.assessed_severity ?? 'unknown';
+  const displaySeverity = alertState?.severity_override || enrichment?.assessed_severity || alert.severity || 'unknown';
+  const sev = displaySeverity;
   const host = alert.hostName || alert.hostname || '';
   const source = getSourceLabel(alert);
   const summary = enrichment?.summary || '';
@@ -179,9 +190,48 @@ function AlertRow({ alert, expanded, onToggleExpand, onOpenDetail, indented, ale
   return (
     <tr className={`border-b border-border/50 hover:bg-surface-hover transition-colors ${indented ? 'bg-bg/20' : ''}`}>
       <td className={`table-cell ${indented ? 'pl-10' : ''}`}>
-        <span className={`badge ${severityBg(sev)}`}>
-          {sev}
-        </span>
+        <div className="relative">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setSeverityDropdown(v => !v);
+            }}
+            className={`text-xs px-1.5 py-0.5 rounded border ${severityBg(sev)} ${severityColor(sev)} cursor-pointer hover:ring-1 hover:ring-accent/50 transition-all`}
+            title={alertState?.severity_override ? `Overridden severity` : 'Click to override severity'}
+          >
+            {sev}
+            {alertState?.severity_override && <span className="ml-0.5 opacity-60">•</span>}
+          </button>
+          {severityDropdown && (
+            <div className="absolute z-50 top-full mt-1 left-0 bg-surface border border-border rounded-md shadow-lg py-1 min-w-[100px]">
+              {['critical', 'high', 'warning', 'info'].map(s => (
+                <button
+                  key={s}
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    await overrideSeverity(alert.fingerprint, s);
+                    setSeverityDropdown(false);
+                  }}
+                  className={`block w-full text-left text-xs px-3 py-1.5 hover:bg-surface-hover transition-colors ${severityColor(s)}`}
+                >
+                  {s}
+                </button>
+              ))}
+              {alertState?.severity_override && (
+                <button
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    await overrideSeverity(alert.fingerprint, 'none');
+                    setSeverityDropdown(false);
+                  }}
+                  className="block w-full text-left text-xs px-3 py-1.5 hover:bg-surface-hover transition-colors text-muted border-t border-border"
+                >
+                  Reset to AI
+                </button>
+              )}
+            </div>
+          )}
+        </div>
       </td>
       <td className="table-cell">
         <div className="flex items-center gap-1.5 flex-wrap">
@@ -237,6 +287,20 @@ function AlertRow({ alert, expanded, onToggleExpand, onOpenDetail, indented, ale
               {alertState.escalated_to}
             </span>
           )}
+          {alert.triggerId && alert.zabbixInstance && ZABBIX_URLS[alert.zabbixInstance] && (
+            <a
+              href={`${ZABBIX_URLS[alert.zabbixInstance]}/zabbix.php?action=problem.view&filter_triggerids[]=${alert.triggerId}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center text-muted/50 hover:text-blue-400 transition-colors ml-1"
+              title="View in Zabbix"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+              </svg>
+            </a>
+          )}
         </div>
         {description && (
           <div className="text-xs text-muted mt-0.5 font-mono">
@@ -258,7 +322,19 @@ function AlertRow({ alert, expanded, onToggleExpand, onOpenDetail, indented, ale
             {expanded ? 'Show less' : 'Show more'}
           </button>
         )}
-        {!summary && <span>--</span>}
+        {!alert.note && (
+          <button
+            onClick={async (e) => {
+              e.stopPropagation();
+              await forceEnrich(alert.fingerprint);
+            }}
+            className="text-xs text-muted animate-pulse hover:text-accent transition-colors cursor-pointer"
+            title="Click to force enrichment"
+          >
+            Enriching...
+          </button>
+        )}
+        {alert.note && !summary && <span>--</span>}
       </td>
       <td className="table-cell text-xs text-muted whitespace-nowrap">
         <div className="flex items-center gap-2">

@@ -101,6 +101,9 @@ export interface AlertState {
   escalated_to?: string | null;
   escalated_by?: string | null;
   escalated_at?: string | null;
+  // Severity override
+  severity_override?: string | null;
+  severity_override_by?: string | null;
 }
 
 export interface SSEEvent {
