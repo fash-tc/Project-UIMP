@@ -17,6 +17,7 @@ export default function SituationCard({ onClusterClick, sseUpdateTrigger }: Situ
     }
     return false;
   });
+  const [expandedCluster, setExpandedCluster] = useState<string | null>(null);
 
   const loadSummary = useCallback(async () => {
     const data = await fetchSituationSummary();
@@ -63,6 +64,7 @@ export default function SituationCard({ onClusterClick, sseUpdateTrigger }: Situ
         className="w-full flex items-center gap-2 px-4 py-2 bg-surface border border-border rounded-lg hover:bg-surface-hover transition-colors text-left"
       >
         <span className={`w-2.5 h-2.5 rounded-full ${severityDotColor(worstSeverity)} shrink-0`} />
+        <span className="text-xs font-medium text-accent shrink-0">✦ AI Summary</span>
         <span className="text-sm text-text-bright flex-1 truncate">
           {summary.one_liner || 'Generating situation summary...'}
         </span>
@@ -88,18 +90,56 @@ export default function SituationCard({ onClusterClick, sseUpdateTrigger }: Situ
                   .map((cluster) => (
                   <button
                     key={cluster.cluster_id}
-                    onClick={() => onClusterClick?.(cluster.fingerprints || [])}
-                    className="flex-shrink-0 p-2 bg-background border border-border rounded-md hover:border-accent transition-colors text-left max-w-[280px]"
+                    onClick={() => {
+                      if (expandedCluster === cluster.cluster_id) {
+                        setExpandedCluster(null);
+                      } else {
+                        setExpandedCluster(cluster.cluster_id);
+                      }
+                    }}
+                    className="flex-shrink-0 p-2.5 bg-background border border-border rounded-md hover:border-accent transition-colors text-left min-w-[200px] max-w-[300px]"
                   >
                     <div className="flex items-center gap-1.5 mb-1">
-                      <span className={`w-2 h-2 rounded-full ${severityDotColor(cluster.top_severity || 'info')}`} />
-                      <span className="text-xs font-medium text-text-bright truncate">{cluster.label}</span>
-                      <span className="text-xs text-muted ml-auto">{cluster.count}</span>
+                      <span className={`w-2 h-2 rounded-full ${severityDotColor(cluster.top_severity || 'info')} shrink-0`} />
+                      <span className="text-xs font-medium text-text-bright truncate flex-1">{cluster.label}</span>
+                      <span className="text-xs text-muted bg-surface px-1.5 py-0.5 rounded-full">{cluster.count}</span>
                     </div>
-                    <p className="text-xs text-muted line-clamp-2">{cluster.assessment || ''}</p>
+                    <p className="text-xs text-muted line-clamp-2">{cluster.assessment || 'Analyzing...'}</p>
                   </button>
                 ))}
               </div>
+
+              {expandedCluster && (() => {
+                const cluster = summary.clusters.find(c => c.cluster_id === expandedCluster);
+                if (!cluster) return null;
+                return (
+                  <div className="mt-2 p-3 bg-background border border-border rounded-md">
+                    <div className="flex items-center justify-between mb-2">
+                      <h5 className="text-xs font-medium text-text-bright">{cluster.label} — {cluster.count} alerts</h5>
+                      <button
+                        onClick={() => {
+                          onClusterClick?.(cluster.fingerprints || []);
+                          setExpandedCluster(null);
+                        }}
+                        className="text-xs px-2 py-0.5 bg-accent/20 text-accent rounded hover:bg-accent/30 transition-colors"
+                      >
+                        Filter alerts
+                      </button>
+                    </div>
+                    {cluster.assessment && (
+                      <p className="text-xs text-muted mb-2">{cluster.assessment}</p>
+                    )}
+                    {cluster.hosts && cluster.hosts.length > 0 && (
+                      <p className="text-xs text-muted mb-2">Hosts: {cluster.hosts.join(', ')}</p>
+                    )}
+                    <ul className="space-y-0.5">
+                      {cluster.alert_names?.map((name, i) => (
+                        <li key={i} className="text-xs text-text pl-2 border-l border-border">{name}</li>
+                      ))}
+                    </ul>
+                  </div>
+                );
+              })()}
             </div>
           )}
 
@@ -127,6 +167,14 @@ export default function SituationCard({ onClusterClick, sseUpdateTrigger }: Situ
                   </li>
                 ))}
               </ol>
+            </div>
+          )}
+
+          {summary.suggested_merges && summary.suggested_merges.length > 0 && (
+            <div className="pt-2 border-t border-border">
+              <p className="text-xs text-muted italic">
+                AI suggests these clusters may be related: {summary.suggested_merges.map(m => m.reason).join('; ')}
+              </p>
             </div>
           )}
         </div>
