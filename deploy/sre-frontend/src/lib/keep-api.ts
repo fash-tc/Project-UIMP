@@ -1,4 +1,4 @@
-import { Alert, AIEnrichment, AlertStats, SREFeedback, RunbookEntry, AIInstruction, AIFeedbackSummary, AlertState, RunbookFeedback, SituationSummary } from './types';
+import { Alert, AIEnrichment, AlertStats, SREFeedback, RunbookEntry, AIInstruction, AIFeedbackSummary, AlertState, RunbookFeedback, SituationSummary, SuggestedMerge } from './types';
 
 const API_BASE = '/api/keep';
 
@@ -732,3 +732,25 @@ export async function fetchSituationSummary(): Promise<SituationSummary | null> 
     return null;
   }
 }
+
+export async function overrideSeverity(fingerprint: string, severity: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/severity-override`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fingerprint, severity }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function invalidateSummary(): Promise<void> {
+  try {
+    await fetch(`${ALERT_STATE_BASE}/invalidate-summary`, { method: 'POST' });
+  } catch {}
+}
+
+// Re-export SuggestedMerge so consumers can import from keep-api if needed
+export type { SuggestedMerge };

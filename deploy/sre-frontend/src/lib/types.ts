@@ -146,6 +146,11 @@ export interface ShiftContext {
   recurring: string[];
 }
 
+export interface SuggestedMerge {
+  clusters: string[];
+  reason: string;
+}
+
 export interface SituationSummary {
   one_liner: string | null;
   clusters: ClusterInfo[];
@@ -153,4 +158,5 @@ export interface SituationSummary {
   recommended_actions: string[];
   generated_at: string;
   alert_hash: string;
+  suggested_merges?: SuggestedMerge[];
 }
