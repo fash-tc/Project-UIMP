@@ -96,6 +96,7 @@ def _init_db():
             clusters_json TEXT,
             shift_context_json TEXT,
             actions_json TEXT,
+            suggested_merges_json TEXT,
             generated_at TEXT,
             alert_hash TEXT
         )
@@ -118,10 +119,19 @@ def _init_db():
         ("escalated_to", "NULL"),
         ("escalated_by", "NULL"),
         ("escalated_at", "NULL"),
+        ("severity_override", "NULL"),
+        ("severity_override_by", "NULL"),
+        ("severity_override_at", "NULL"),
     ]:
         if col not in existing:
             db.execute(f"ALTER TABLE alert_states ADD COLUMN {col} TEXT DEFAULT {default}")
             log.info(f"Migrated: added '{col}' column to alert_states")
+    db.commit()
+    # Migrate situation_summary table
+    existing_ss = {row[1] for row in db.execute("PRAGMA table_info(situation_summary)").fetchall()}
+    if "suggested_merges_json" not in existing_ss:
+        db.execute("ALTER TABLE situation_summary ADD COLUMN suggested_merges_json TEXT DEFAULT NULL")
+        log.info("Migrated: added 'suggested_merges_json' to situation_summary")
     db.commit()
     log.info(f"Database initialized at {DB_PATH}")
     return db
@@ -299,6 +309,7 @@ class AlertStateHandler(BaseHTTPRequestHandler):
                     "clusters": json.loads(row["clusters_json"] or "[]"),
                     "shift_context": json.loads(row["shift_context_json"] or "{}"),
                     "recommended_actions": json.loads(row["actions_json"] or "[]"),
+                    "suggested_merges": json.loads(row["suggested_merges_json"] or "[]"),
                     "generated_at": row["generated_at"],
                     "alert_hash": row["alert_hash"],
                 })
@@ -592,6 +603,55 @@ class AlertStateHandler(BaseHTTPRequestHandler):
             })
             self._send_json(200, {"status": "stored", "vote": vote})
 
+        elif path == "/api/alert-states/severity-override":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            fingerprint = (data.get("fingerprint") or "").strip()
+            severity = (data.get("severity") or "").strip()
+            if not fingerprint or severity not in ("critical", "high", "warning", "info", "none"):
+                self._send_json(400, {"error": "fingerprint and severity (critical/high/warning/info/none) required"})
+                return
+            now = datetime.now(timezone.utc).isoformat()
+            with _db_lock:
+                if severity == "none":
+                    db.execute("""
+                        UPDATE alert_states SET severity_override = NULL,
+                            severity_override_by = NULL, severity_override_at = NULL,
+                            updated_at = datetime('now')
+                        WHERE alert_fingerprint = ?
+                    """, (fingerprint,))
+                else:
+                    db.execute("""
+                        INSERT INTO alert_states (alert_fingerprint, severity_override, severity_override_by,
+                            severity_override_at, updated_at)
+                        VALUES (?, ?, ?, ?, datetime('now'))
+                        ON CONFLICT(alert_fingerprint) DO UPDATE SET
+                            severity_override = excluded.severity_override,
+                            severity_override_by = excluded.severity_override_by,
+                            severity_override_at = excluded.severity_override_at,
+                            updated_at = datetime('now')
+                    """, (fingerprint, severity, username, now))
+                db.commit()
+            _sse_broadcast("severity_override", {
+                "fingerprint": fingerprint, "severity": severity,
+                "user": username,
+            })
+            log.info(f"{username} overrode severity to {severity} for {fingerprint[:16]}")
+            self._send_json(200, {"status": "stored", "severity": severity})
+
+        elif path == "/api/alert-states/invalidate-summary":
+            with _db_lock:
+                db.execute("UPDATE situation_summary SET alert_hash = '' WHERE id = 1")
+                db.commit()
+            self._send_json(200, {"status": "invalidated"})
+
         elif path == "/api/alert-states/situation-summary":
             try:
                 data = self._read_body()
@@ -602,22 +662,24 @@ class AlertStateHandler(BaseHTTPRequestHandler):
             clusters = data.get("clusters", [])
             shift_context = data.get("shift_context", {})
             actions = data.get("recommended_actions", [])
+            suggested_merges = data.get("suggested_merges", [])
             alert_hash = (data.get("alert_hash") or "").strip()
             now = datetime.now(timezone.utc).isoformat()
             with _db_lock:
                 db.execute("""
                     INSERT INTO situation_summary (id, one_liner, clusters_json, shift_context_json,
-                        actions_json, generated_at, alert_hash)
-                    VALUES (1, ?, ?, ?, ?, ?, ?)
+                        actions_json, suggested_merges_json, generated_at, alert_hash)
+                    VALUES (1, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         one_liner = excluded.one_liner,
                         clusters_json = excluded.clusters_json,
                         shift_context_json = excluded.shift_context_json,
                         actions_json = excluded.actions_json,
+                        suggested_merges_json = excluded.suggested_merges_json,
                         generated_at = excluded.generated_at,
                         alert_hash = excluded.alert_hash
                 """, (one_liner, json.dumps(clusters), json.dumps(shift_context),
-                      json.dumps(actions), now, alert_hash))
+                      json.dumps(actions), json.dumps(suggested_merges), now, alert_hash))
                 db.commit()
             _sse_broadcast("situation_update", {"generated_at": now})
             self._send_json(200, {"status": "stored"})
