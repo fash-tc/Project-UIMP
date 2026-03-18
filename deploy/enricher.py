@@ -1077,6 +1077,9 @@ Respond with JSON only:
   },
   "recommended_actions": [
     "Numbered action items, most urgent first"
+  ],
+  "suggested_merges": [
+    {"clusters": ["c_id1", "c_id2"], "reason": "Why these should be merged"}
   ]
 }
 
@@ -1085,6 +1088,7 @@ Rules:
 - clusters: ordered by priority (1 = most urgent), only clusters with count > 1
 - recommended_actions: specific and actionable
 - trend: "improving" if more resolving, "worsening" if more firing, "stable" otherwise
+- suggested_merges: suggest if any remaining clusters appear related but weren't grouped
 """
 
     response = ollama_generate(prompt, timeout=15)
@@ -1111,6 +1115,7 @@ Rules:
         "clusters": summary.get("clusters", []),
         "shift_context": summary.get("shift_context", {}),
         "recommended_actions": summary.get("recommended_actions", []),
+        "suggested_merges": summary.get("suggested_merges", []),
         "alert_hash": alert_hash,
     }
 
