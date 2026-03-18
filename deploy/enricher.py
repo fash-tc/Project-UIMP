@@ -25,7 +25,7 @@ DEDUP_WINDOW = int(os.environ.get("DEDUP_WINDOW_SECONDS", "1800"))
 NOISE_THRESHOLD = int(os.environ.get("NOISE_THRESHOLD", "8"))
 ALERT_STATE_API_URL = os.environ.get("ALERT_STATE_API_URL", "http://alert-state-api:8092")
 
-enriched_cache = set()
+enriched_cache = {}  # {fingerprint: timestamp} — entries expire after 600s
 
 # In-memory tracking for noise suppression
 recent_enrichments = {}  # fingerprint -> {alert_name, host, enrichment_text, noise_score, enriched_at, resolve_count, last_resolved_at}
@@ -1068,6 +1068,14 @@ Rules:
 
 
 def poll_and_enrich():
+    # Prune expired cache entries (older than 10 minutes)
+    now = time.time()
+    expired = [fp for fp, ts in enriched_cache.items() if now - ts > 600]
+    for fp in expired:
+        del enriched_cache[fp]
+    if expired:
+        log.info(f"Pruned {len(expired)} expired entries from enrichment cache")
+
     alerts_data = keep_request("/alerts?limit=250")
     if not alerts_data:
         return 0
@@ -1100,7 +1108,7 @@ def poll_and_enrich():
             # Cache resolved fingerprints so we never revisit them
             fp = alert.get("fingerprint", "")
             if fp:
-                enriched_cache.add(fp)
+                enriched_cache[fp] = time.time()
                 # Track resolve counts for flapping detection
                 if fp in recent_enrichments:
                     recent_enrichments[fp]["resolve_count"] = recent_enrichments[fp].get("resolve_count", 0) + 1
@@ -1122,7 +1130,7 @@ def poll_and_enrich():
 
         note = alert.get("note", "") or ""
         if "---AI-ENRICHMENT-V2---" in note or note.startswith("AI Summary:"):
-            enriched_cache.add(fingerprint)
+            enriched_cache[fingerprint] = time.time()
             continue
         # Allow retry of pending alerts (don't cache them)
         if note.startswith("ENRICHMENT_PENDING:"):
@@ -1140,13 +1148,16 @@ def poll_and_enrich():
                 note_text = reason
                 if copied:
                     note_text = copied  # Use the copied enrichment
-                keep_request("/alerts/enrich", method="POST", data={
+                result = keep_request("/alerts/enrich", method="POST", data={
                     "fingerprint": fingerprint,
                     "enrichments": {"note": note_text},
                 })
-                enriched_cache.add(fingerprint)
-                suppressed_count += 1
-                log.info(f"  Suppressed: {name[:40]} — {reason[:60]}")
+                if result is not None:
+                    enriched_cache[fingerprint] = time.time()
+                    suppressed_count += 1
+                    log.info(f"  Suppressed: {name[:40]} — {reason[:60]}")
+                else:
+                    log.warning(f"  Suppression write failed for {name[:40]}, will retry")
                 continue
         else:
             log.info(f"  Force-enriching: {name[:40]} (requested by SRE)")
@@ -1159,7 +1170,7 @@ def poll_and_enrich():
         if enrichment:
             success = post_enrichment_to_keep(alert, enrichment)
             if success:
-                enriched_cache.add(fingerprint)
+                enriched_cache[fingerprint] = time.time()
                 pattern_tracker.add(alert)
                 enriched_count += 1
                 # Track for noise suppression
