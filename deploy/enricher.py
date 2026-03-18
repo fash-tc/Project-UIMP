@@ -935,6 +935,70 @@ def cluster_alerts(active_alerts):
     return clusters
 
 
+def merge_related_clusters(clusters):
+    """Merge clusters whose host labels differ only by trailing digits."""
+    import re
+
+    def normalize_label(label):
+        """Strip trailing digits from each hostname segment for pattern matching."""
+        if "(" in label:
+            return label  # Skip service-prefix labels like "MySQL (multi-host)"
+        parts = label.split(".")
+        normalized = []
+        for p in parts:
+            normalized.append(re.sub(r'\d+$', '', p))
+        return ".".join(normalized)
+
+    # Group clusters by normalized label
+    groups = {}
+    for c in clusters:
+        norm = normalize_label(c["label"])
+        groups.setdefault(norm, []).append(c)
+
+    merged = []
+    for norm, group in groups.items():
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+        # Merge all clusters in this group
+        all_fps = []
+        all_names = []
+        all_hosts = []
+        top_sev = "info"
+        sev_order = {"critical": 0, "high": 1, "warning": 2, "low": 3, "info": 4}
+        for c in group:
+            all_fps.extend(c.get("fingerprints", []))
+            all_names.extend(c.get("alert_names", []))
+            all_hosts.extend(c.get("hosts", []))
+            c_sev = c.get("top_severity", "info")
+            if sev_order.get(c_sev, 5) < sev_order.get(top_sev, 5):
+                top_sev = c_sev
+        # Build wildcard label
+        labels = [c["label"] for c in group]
+        parts = labels[0].split(".")
+        wild_parts = []
+        for i, p in enumerate(parts):
+            variants = set(l.split(".")[i] if i < len(l.split(".")) else "" for l in labels)
+            if len(variants) > 1:
+                wild_parts.append(re.sub(r'\d+$', '', p) + "*")
+            else:
+                wild_parts.append(p)
+        wild_label = ".".join(wild_parts)
+
+        cid = "c_" + hashlib.sha256(",".join(sorted(all_fps)).encode()).hexdigest()[:12]
+        merged.append({
+            "cluster_id": cid,
+            "label": wild_label,
+            "fingerprints": all_fps,
+            "alert_names": all_names,
+            "top_severity": top_sev,
+            "count": len(all_fps),
+            "hosts": sorted(set(all_hosts)),
+        })
+
+    return merged
+
+
 def generate_situation_summary(clusters, active_alerts, resolved_count):
     """Generate an AI situation summary from clustered alerts."""
     global _last_summary_hash, _last_summary_time
@@ -1209,6 +1273,7 @@ def poll_and_enrich():
     # ── Clustering & Situation Summary ──
     if active_alerts:
         clusters = cluster_alerts(active_alerts)
+        clusters = merge_related_clusters(clusters)  # Merge clusters whose labels differ only by trailing digits
         multi_clusters = [c for c in clusters if c["count"] > 1]
         if multi_clusters:
             log.info(f"Clustered {sum(c['count'] for c in multi_clusters)} alerts into {len(multi_clusters)} groups")
