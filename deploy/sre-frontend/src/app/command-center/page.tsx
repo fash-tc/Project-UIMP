@@ -1,13 +1,13 @@
 'use client';
 
-import { Fragment, useEffect, useState, useCallback, useMemo } from 'react';
-import { Alert, AlertStats, AIEnrichment, SREFeedback, RunbookEntry, AlertState } from '@/lib/types';
+import { useEffect, useState, useCallback } from 'react';
+import { Alert, AIEnrichment, RunbookEntry, AlertState, SSEEvent, RunbookFeedback } from '@/lib/types';
+import { useSSE } from '@/hooks/useSSE';
 import {
   fetchAlerts,
   parseAIEnrichment,
-  parseSREFeedback,
-  submitFeedback,
-  computeStats,
+  submitSREFeedback,
+  submitStructuredFeedback,
   severityColor,
   severityBg,
   timeAgo,
@@ -15,6 +15,9 @@ import {
   fetchRunbookMatches,
   submitRunbookEntry,
   resolveAlert,
+  resolveAlerts,
+  unresolveAlert,
+  unresolveAlerts,
   silenceAlert,
   createJiraIncident,
   fetchAlertStates,
@@ -23,169 +26,64 @@ import {
   unacknowledgeAlerts,
   markAlertsUpdated,
   getSourceLabel,
+  forceEnrich,
+  fetchEscalationTeams,
+  fetchEscalationUsers,
+  escalateAlert,
+  storeIncidentState,
+  storeEscalationState,
+  submitRunbookFeedback,
+  fetchRunbookFeedback,
+  fetchSilenceRules,
+  createSilenceRule,
+  cancelSilenceRule,
+  SilenceRule,
+  MaintenanceEvent,
+  fetchMaintenanceEvents,
 } from '@/lib/keep-api';
 import { getClientUsername } from '@/lib/auth';
-import { detectRegistryFromAlert, buildRegistryMailto } from '@/lib/registry-contacts';
-
-/* ── Alert Grouping ── */
-
-interface AlertGroup {
-  key: string;
-  label: string;
-  alerts: Alert[];
-  highestSeverity: string;
-}
-
-function extractAlertBase(alertName: string, hostname: string): string {
-  if (!alertName) return 'Unknown';
-  if (hostname) {
-    const lower = alertName.toLowerCase();
-    const hostLower = hostname.toLowerCase();
-    for (const sep of [' on ', ' for ', ' at ', ' - ', ': ']) {
-      const idx = lower.indexOf(sep + hostLower);
-      if (idx !== -1) return alertName.substring(0, idx).trim();
-    }
-    if (lower.endsWith(hostLower)) {
-      return alertName.substring(0, alertName.length - hostname.length).replace(/[\s\-:]+$/, '').trim();
-    }
-  }
-  return alertName;
-}
-
-function getParentDomain(hostname: string): string {
-  if (!hostname) return '';
-  const parts = hostname.split('.');
-  if (parts.length <= 2) return hostname;
-  return parts.slice(1).join('.');
-}
-
-function buildAlertGroups(alerts: Alert[], sortKey: string = 'severity', sortDir: 'asc' | 'desc' = 'desc'): AlertGroup[] {
-  const sevOrder: Record<string, number> = { critical: 0, high: 1, warning: 2, low: 3, info: 4, unknown: 5 };
-  const sevNames = ['critical', 'high', 'warning', 'low', 'info', 'unknown'];
-
-  // Pass 1: group by alertBase + parentDomain
-  const domainMap = new Map<string, AlertGroup>();
-  for (const alert of alerts) {
-    const host = alert.hostName || alert.hostname || '';
-    const base = extractAlertBase(alert.name || '', host);
-    const parent = getParentDomain(host);
-    const key = `${base}::${parent}`;
-
-    if (!domainMap.has(key)) {
-      const label = parent ? `${base} — ${parent}` : base;
-      domainMap.set(key, { key, label, alerts: [], highestSeverity: 'unknown' });
-    }
-    domainMap.get(key)!.alerts.push(alert);
-  }
-
-  // Pass 2: singles from pass 1 that share alertBase get merged into name-only groups
-  const multiGroups: AlertGroup[] = [];
-  const singles: { base: string; alert: Alert }[] = [];
-
-  Array.from(domainMap.values()).forEach(g => {
-    if (g.alerts.length >= 2) {
-      multiGroups.push(g);
-    } else {
-      const host = g.alerts[0].hostName || g.alerts[0].hostname || '';
-      singles.push({ base: extractAlertBase(g.alerts[0].name || '', host), alert: g.alerts[0] });
-    }
-  });
-
-  const nameMap = new Map<string, AlertGroup>();
-  for (const { base, alert } of singles) {
-    if (!nameMap.has(base)) {
-      nameMap.set(base, { key: `name::${base}`, label: base, alerts: [], highestSeverity: 'unknown' });
-    }
-    nameMap.get(base)!.alerts.push(alert);
-  }
-
-  // Name-only groups with 2+ alerts become real groups; true singles stay as-is
-  Array.from(nameMap.values()).forEach(g => multiGroups.push(g));
-
-  // Compute highest severity per group and best time
-  const result = multiGroups.map(g => {
-    let best = 5;
-    for (const a of g.alerts) {
-      const sev = parseAIEnrichment(a.note)?.assessed_severity ?? 'unknown';
-      best = Math.min(best, sevOrder[sev] ?? 5);
-    }
-    g.highestSeverity = sevNames[best];
-    return g;
-  });
-
-  // Sort groups respecting the user's chosen sort key and direction
-  const dir = sortDir === 'asc' ? 1 : -1;
-  result.sort((a, b) => {
-    switch (sortKey) {
-      case 'time': {
-        const ta = Math.max(...a.alerts.map(al => new Date(alertStartTime(al)).getTime() || 0));
-        const tb = Math.max(...b.alerts.map(al => new Date(alertStartTime(al)).getTime() || 0));
-        return (ta - tb) * dir;
-      }
-      case 'severity': {
-        const sa = sevOrder[a.highestSeverity] ?? 5;
-        const sb = sevOrder[b.highestSeverity] ?? 5;
-        if (sa !== sb) return (sa - sb) * dir;
-        return b.alerts.length - a.alerts.length;
-      }
-      case 'alert':
-        return a.label.localeCompare(b.label) * dir;
-      case 'host': {
-        const ha = a.alerts[0]?.hostName || a.alerts[0]?.hostname || '';
-        const hb = b.alerts[0]?.hostName || b.alerts[0]?.hostname || '';
-        return ha.localeCompare(hb) * dir;
-      }
-      default: {
-        // Default: multi-alert groups first, then severity
-        const aMulti = a.alerts.length >= 2 ? 0 : 1;
-        const bMulti = b.alerts.length >= 2 ? 0 : 1;
-        if (aMulti !== bMulti) return aMulti - bMulti;
-        const sa = sevOrder[a.highestSeverity] ?? 5;
-        const sb = sevOrder[b.highestSeverity] ?? 5;
-        if (sa !== sb) return sa - sb;
-        return b.alerts.length - a.alerts.length;
-      }
-    }
-  });
-
-  return result;
-}
+import { detectRegistryFromAlert, buildRegistryMailto, matchMaintenanceToOperators } from '@/lib/registry';
+import DashboardView from './DashboardView';
+import AlertsTableView from './AlertsTableView';
+import KnowledgeBasePage from './KnowledgeBasePage';
+import IncidentWizard from './IncidentWizard';
 
 export default function CommandCenter() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
-  // stats derived via useMemo below
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [sevFilter, setSevFilter] = useState<string | null>(null);
-  const [refreshInterval, setRefreshInterval] = useState(30);
+  const [refreshInterval, setRefreshInterval] = useState(60);
   const [refreshing, setRefreshing] = useState(false);
   const [selectedAlert, setSelectedAlert] = useState<Alert | null>(null);
-  const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
-  const [sortKey, setSortKey] = useState<'severity' | 'alert' | 'host' | 'source' | 'summary' | 'time'>('time');
-  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
-  const [pageSize, setPageSize] = useState(10);
-  const [currentPage, setCurrentPage] = useState(0);
-  const [groupView, setGroupView] = useState(true);
-  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [alertStates, setAlertStates] = useState<Map<string, AlertState>>(new Map());
-  const [dashboardTab, setDashboardTab] = useState<'firing' | 'acknowledged'>('firing');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'alerts' | 'knowledge-base'>('dashboard');
+  const [situationTrigger, setSituationTrigger] = useState(0);
+  const [silenceRules, setSilenceRules] = useState<SilenceRule[]>([]);
+  const [maintenanceEvents, setMaintenanceEvents] = useState<MaintenanceEvent[]>([]);
 
   const load = useCallback(async () => {
     try {
-      const [data, states] = await Promise.all([fetchAlerts(100), fetchAlertStates()]);
+      const [data, states, rules, maint] = await Promise.all([fetchAlerts(250), fetchAlertStates(), fetchSilenceRules(), fetchMaintenanceEvents()]);
 
       // Build states map
       let stateMap = new Map<string, AlertState>();
       for (const s of states) stateMap.set(s.alert_fingerprint, s);
 
-      // Re-fire detection: check acked alerts for new firingStartTime
+      // Re-fire detection: check alerts with any persisted state for new firingStartTime
+      // This catches acked alerts, investigated alerts, and alerts with stale Jira tickets
       const refired: string[] = [];
       for (const alert of data) {
         const st = stateMap.get(alert.fingerprint);
-        if (st?.acknowledged_by && st.ack_firing_start) {
-          const cur = alert.firingStartTime || alert.startedAt || '';
-          if (cur && cur !== st.ack_firing_start) refired.push(alert.fingerprint);
+        if (!st) continue;
+        const hasState = st.acknowledged_by || st.investigating_user || st.incident_jira_key;
+        if (!hasState) continue;
+        const cur = alert.firingStartTime || alert.startedAt || '';
+        if (!cur) continue;
+        // Compare against ack_firing_start if acked, or against the state timestamp
+        const stateTime = st.ack_firing_start || st.investigating_since || st.incident_created_at || st.acknowledged_at || '';
+        if (stateTime && new Date(cur).getTime() > new Date(stateTime).getTime()) {
+          refired.push(alert.fingerprint);
         }
       }
       if (refired.length > 0) {
@@ -197,6 +95,8 @@ export default function CommandCenter() {
 
       setAlerts(data);
       setAlertStates(stateMap);
+      setSilenceRules(rules);
+      setMaintenanceEvents(maint);
       setLastUpdated(new Date());
       setError(null);
     } catch (e: unknown) {
@@ -206,102 +106,90 @@ export default function CommandCenter() {
     }
   }, []);
 
+  const handleSSEEvent = useCallback((event: SSEEvent) => {
+    if (event.type === '_reset') {
+      load();
+      return;
+    }
+
+    if (event.type === 'situation_update') {
+      setSituationTrigger(prev => prev + 1);
+      return;
+    }
+
+    if (event.type === 'silence_created' || event.type === 'silence_cancelled') {
+      // Refresh silence rules on any change
+      fetchSilenceRules().then(rules => setSilenceRules(rules));
+      return;
+    }
+
+    setAlertStates(prev => {
+      const next = new Map(prev);
+      const defaultState = (fp: string): AlertState => ({
+        alert_fingerprint: fp, alert_name: '', investigating_user: null,
+        investigating_since: null, acknowledged_by: null, acknowledged_at: null,
+        ack_firing_start: null, is_updated: 0,
+      });
+
+      if (event.fingerprint) {
+        const fp = event.fingerprint;
+        const existing = next.get(fp) || defaultState(fp);
+        switch (event.type) {
+          case 'investigate':
+            next.set(fp, { ...existing, investigating_user: event.active ? (event.user || null) : null, investigating_since: event.active ? event.timestamp : null });
+            break;
+          case 'incident_created':
+            next.set(fp, { ...existing, incident_jira_key: event.jira_key || null, incident_jira_url: event.jira_url || null, incident_created_by: event.user || null, incident_created_at: event.timestamp || null });
+            break;
+          case 'escalated':
+            next.set(fp, { ...existing, escalated_to: event.escalated_to || null, escalated_by: event.user || null, escalated_at: event.timestamp || null });
+            break;
+          case 'force_enrich':
+            break;
+          case 'severity_override':
+            next.set(fp, { ...existing, severity_override: event.severity === 'none' ? null : (event.severity || null), severity_override_by: event.user || null });
+            break;
+          case 'runbook_feedback':
+            break;
+        }
+      }
+
+      if (event.fingerprints) {
+        for (const fp of event.fingerprints) {
+          const existing = next.get(fp) || defaultState(fp);
+          switch (event.type) {
+            case 'acknowledge':
+              next.set(fp, { ...existing, acknowledged_by: event.user || null, acknowledged_at: event.timestamp || null, is_updated: 0 });
+              break;
+            case 'unacknowledge':
+              next.set(fp, { ...existing, acknowledged_by: null, acknowledged_at: null, ack_firing_start: null, is_updated: 0 });
+              break;
+            case 'mark_updated':
+              next.set(fp, { ...existing,
+                acknowledged_by: null, acknowledged_at: null, ack_firing_start: null,
+                investigating_user: null, investigating_since: null,
+                incident_jira_key: null, incident_jira_url: null,
+                incident_created_by: null, incident_created_at: null,
+                escalated_to: null, escalated_by: null, escalated_at: null,
+                severity_override: null, severity_override_by: null,
+                is_updated: 1,
+              });
+              break;
+          }
+        }
+      }
+
+      return next;
+    });
+  }, [load]);
+
+  const { connected } = useSSE('/api/alert-states/events', handleSSEEvent);
+
   useEffect(() => {
     load();
     const interval = setInterval(load, refreshInterval * 1000);
     return () => clearInterval(interval);
   }, [load, refreshInterval]);
-
-  const activeAlerts = alerts.filter(a => a.status !== 'resolved' && a.status !== 'ok');
-
-  // Split into firing vs acknowledged
-  const firingAlerts = activeAlerts.filter(a => !alertStates.get(a.fingerprint)?.acknowledged_by);
-  const ackedAlerts = activeAlerts.filter(a => !!alertStates.get(a.fingerprint)?.acknowledged_by);
-  const tabAlerts = dashboardTab === 'firing' ? firingAlerts : ackedAlerts;
-
-  // Stats from firing alerts only
-  const stats = useMemo(() => computeStats(firingAlerts), [firingAlerts]);
-
-  const filteredAlerts = useMemo(() => {
-    return tabAlerts.filter(a => {
-      if (sevFilter) {
-        const enrichment = parseAIEnrichment(a.note);
-        const sev = enrichment?.assessed_severity ?? 'unknown';
-        if (sevFilter === 'low') {
-          if (sev !== 'low' && sev !== 'info') return false;
-        } else {
-          if (sev !== sevFilter) return false;
-        }
-      }
-      return true;
-    });
-  }, [tabAlerts, sevFilter]);
-
-  const sevOrder: Record<string, number> = { critical: 0, high: 1, warning: 2, low: 3, info: 4, unknown: 5 };
-
-  const sortedAlerts = useMemo(() => {
-    const arr = [...filteredAlerts];
-    const dir = sortDir === 'asc' ? 1 : -1;
-    arr.sort((a, b) => {
-      switch (sortKey) {
-        case 'severity': {
-          const sa = sevOrder[parseAIEnrichment(a.note)?.assessed_severity ?? 'unknown'] ?? 5;
-          const sb = sevOrder[parseAIEnrichment(b.note)?.assessed_severity ?? 'unknown'] ?? 5;
-          return (sa - sb) * dir;
-        }
-        case 'alert':
-          return (a.name || '').localeCompare(b.name || '') * dir;
-        case 'host': {
-          const ha = a.hostName || a.hostname || '';
-          const hb = b.hostName || b.hostname || '';
-          return ha.localeCompare(hb) * dir;
-        }
-        case 'source':
-          return getSourceLabel(a).localeCompare(getSourceLabel(b)) * dir;
-        case 'summary': {
-          const sumA = parseAIEnrichment(a.note)?.summary || '';
-          const sumB = parseAIEnrichment(b.note)?.summary || '';
-          return sumA.localeCompare(sumB) * dir;
-        }
-        case 'time': {
-          const ta = new Date(alertStartTime(a)).getTime() || 0;
-          const tb = new Date(alertStartTime(b)).getTime() || 0;
-          return (ta - tb) * dir;
-        }
-        default:
-          return 0;
-      }
-    });
-    return arr;
-  }, [filteredAlerts, sortKey, sortDir]);
-
-  const alertGroups = useMemo(() => groupView ? buildAlertGroups(sortedAlerts, sortKey, sortDir) : [], [sortedAlerts, groupView, sortKey, sortDir]);
-
-  const totalPages = Math.max(1, Math.ceil(sortedAlerts.length / pageSize));
-  const safePage = Math.min(currentPage, totalPages - 1);
-  const displayAlerts = sortedAlerts.slice(safePage * pageSize, (safePage + 1) * pageSize);
-  const hasFilter = sevFilter !== null;
-
-  // Reset to page 0 when filters or page size change
-  useEffect(() => { setCurrentPage(0); }, [sevFilter, pageSize]);
-
-  function handleSort(key: typeof sortKey) {
-    if (sortKey === key) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
-    } else {
-      setSortKey(key);
-      setSortDir(key === 'time' ? 'desc' : 'asc');
-    }
-  }
-
-  function toggleRow(id: string) {
-    setExpandedRows(prev => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
 
   async function handleInvestigate(alert: Alert) {
     await toggleInvestigating(alert.fingerprint, alert.name || '');
@@ -320,30 +208,23 @@ export default function CommandCenter() {
     load();
   }
 
-  async function handleGroupAcknowledge(group: AlertGroup) {
-    const fps = group.alerts.map(a => a.fingerprint);
-    const names: Record<string, string> = {};
-    const starts: Record<string, string> = {};
-    for (const a of group.alerts) {
-      names[a.fingerprint] = a.name || '';
-      starts[a.fingerprint] = alertStartTime(a);
-    }
-    await acknowledgeAlerts(fps, names, starts);
+  async function handleGroupAcknowledge(fingerprints: string[], names: Record<string, string>, starts: Record<string, string>) {
+    await acknowledgeAlerts(fingerprints, names, starts);
     load();
   }
 
-  function toggleGroup(key: string) {
-    setExpandedGroups(prev => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
+  async function handleGroupResolve(fingerprints: string[]) {
+    await resolveAlerts(fingerprints);
+    load();
+  }
+
+  async function handleGroupUnresolve(fingerprints: string[]) {
+    await unresolveAlerts(fingerprints);
+    load();
   }
 
   function handleAlertRefresh() {
     load();
-    // Update the selectedAlert if it's still open
     if (selectedAlert) {
       const fresh = alerts.find(a => a.fingerprint === selectedAlert.fingerprint);
       if (fresh) setSelectedAlert(fresh);
@@ -363,6 +244,7 @@ export default function CommandCenter() {
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-text-bright">Command Center</h1>
         <div className="flex items-center gap-3">
+          <span className={`inline-block w-2 h-2 rounded-full ${connected ? 'bg-green' : 'bg-red/50'}`} title={connected ? 'Live updates connected' : 'Live updates disconnected'} />
           <RefreshControl
             refreshInterval={refreshInterval}
             onRefreshIntervalChange={setRefreshInterval}
@@ -381,296 +263,70 @@ export default function CommandCenter() {
         </div>
       )}
 
-      {/* Stat Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <StatCard label="Active Alerts" value={stats.total} color="text-text-bright" />
-        <StatCard label="Critical" value={stats.critical} color="text-red"
-          filterKey="critical" activeFilter={sevFilter} onFilter={setSevFilter} />
-        <StatCard label="High" value={stats.high} color="text-orange"
-          filterKey="high" activeFilter={sevFilter} onFilter={setSevFilter} />
-        <StatCard label="Warning" value={stats.warning} color="text-yellow"
-          filterKey="warning" activeFilter={sevFilter} onFilter={setSevFilter} />
-      </div>
-
-      {/* Firing / Acknowledged Tab Bar */}
-      <div className="flex items-center gap-1 bg-surface border border-border rounded-lg p-1">
+      {/* Tab Bar */}
+      <div className="flex gap-1 mb-6 bg-zinc-800/50 p-1 rounded-lg w-fit">
         <button
-          onClick={() => setDashboardTab('firing')}
-          className={`px-4 py-1.5 rounded-md text-xs font-medium transition-colors ${
-            dashboardTab === 'firing'
-              ? 'bg-accent text-white'
-              : 'text-muted hover:text-text-bright'
+          onClick={() => setActiveTab('dashboard')}
+          className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+            activeTab === 'dashboard' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-white'
           }`}
         >
-          Firing ({firingAlerts.length})
+          Dashboard
         </button>
         <button
-          onClick={() => setDashboardTab('acknowledged')}
-          className={`px-4 py-1.5 rounded-md text-xs font-medium transition-colors ${
-            dashboardTab === 'acknowledged'
-              ? 'bg-accent text-white'
-              : 'text-muted hover:text-text-bright'
+          onClick={() => setActiveTab('alerts')}
+          className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+            activeTab === 'alerts' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-white'
           }`}
         >
-          Acknowledged ({ackedAlerts.length})
+          All Alerts
+        </button>
+        <button
+          onClick={() => setActiveTab('knowledge-base')}
+          className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+            activeTab === 'knowledge-base' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-white'
+          }`}
+        >
+          Knowledge Base
         </button>
       </div>
 
-      {/* Active filter indicator */}
-      {hasFilter && (
-        <div className="flex items-center gap-2 text-sm">
-          <span className="text-muted">Filtering by:</span>
-          {sevFilter && (
-            <button
-              onClick={() => setSevFilter(null)}
-              className={`badge ${severityBg(sevFilter)} cursor-pointer`}
-            >
-              {sevFilter} &times;
-            </button>
-          )}
-          <button
-            onClick={() => setSevFilter(null)}
-            className="text-xs text-muted hover:text-text transition-colors ml-2"
-          >
-            Clear
-          </button>
-        </div>
+      {/* Tab Content */}
+      {activeTab === 'dashboard' && (
+        <DashboardView
+          alerts={alerts}
+          alertStates={alertStates}
+          loading={false}
+          onAlertClick={setSelectedAlert}
+          onInvestigate={handleInvestigate}
+          onAcknowledge={handleAcknowledge}
+          onUnacknowledge={handleUnacknowledge}
+          onGroupAcknowledge={handleGroupAcknowledge}
+          onGroupResolve={handleGroupResolve}
+          onGroupUnresolve={handleGroupUnresolve}
+          onForceEnrich={async (fp: string) => { await forceEnrich(fp); load(); }}
+          onRefresh={load}
+          sseUpdateTrigger={situationTrigger}
+          silenceRules={silenceRules}
+          onSilenceGroup={async (alertNamePattern, durationSeconds, hostnamePattern) => {
+            await createSilenceRule(alertNamePattern, durationSeconds, hostnamePattern);
+            load();
+          }}
+          onCancelSilence={async (ruleId) => {
+            await cancelSilenceRule(ruleId);
+            load();
+          }}
+        />
       )}
-
-      {/* Recent Alerts Table */}
-      <div className="stat-card overflow-hidden">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-sm font-medium text-muted">
-            {hasFilter ? `Filtered Alerts (${filteredAlerts.length})` : 'Recent Active Alerts'}
-          </h3>
-          <div className="flex items-center gap-3">
-            <button
-              onClick={() => { setGroupView(v => !v); setExpandedGroups(new Set()); }}
-              className={`text-xs px-2.5 py-1 rounded border transition-colors inline-flex items-center gap-1.5 ${
-                groupView
-                  ? 'border-accent/40 bg-accent/10 text-accent'
-                  : 'border-border text-muted hover:text-text hover:bg-surface-hover'
-              }`}
-              title="Group similar alerts by name and host pattern"
-            >
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-              </svg>
-              Group similar
-            </button>
-            <a href="/portal/alerts" className="text-xs text-accent hover:text-accent-hover transition-colors">
-              View all &rarr;
-            </a>
-          </div>
-        </div>
-        <div className="overflow-x-auto -mx-5">
-          <table className="w-full">
-            <thead>
-              <tr className="border-b border-border">
-                {([
-                  ['severity', 'Severity'],
-                  ['alert', 'Alert'],
-                  ['host', 'Host'],
-                  ['source', 'Source'],
-                  ['summary', 'AI Summary'],
-                  ['time', 'Time'],
-                ] as const).map(([key, label]) => (
-                  <th
-                    key={key}
-                    className="table-header cursor-pointer select-none hover:text-text-bright transition-colors"
-                    onClick={() => handleSort(key)}
-                  >
-                    <span className="inline-flex items-center gap-1">
-                      {label}
-                      {sortKey === key ? (
-                        <span className="text-accent">{sortDir === 'asc' ? '\u25B2' : '\u25BC'}</span>
-                      ) : (
-                        <span className="text-muted/40">{'\u25BC'}</span>
-                      )}
-                    </span>
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {groupView ? (
-                alertGroups.length === 0 ? (
-                  <tr>
-                    <td colSpan={6} className="table-cell text-center text-muted py-8">
-                      {hasFilter ? 'No alerts match the selected filters' : 'No active alerts'}
-                    </td>
-                  </tr>
-                ) : (
-                  alertGroups.map(group => group.alerts.length >= 2 ? (
-                    <Fragment key={group.key}>
-                      <tr
-                        className="border-b border-border/50 hover:bg-surface-hover cursor-pointer transition-colors bg-bg/30"
-                        onClick={() => toggleGroup(group.key)}
-                      >
-                        <td colSpan={6} className="px-5 py-2.5">
-                          <div className="flex items-center gap-3">
-                            <span className="text-muted text-xs w-4 text-center">{expandedGroups.has(group.key) ? '\u25BE' : '\u25B8'}</span>
-                            <span className={`badge ${severityBg(group.highestSeverity)}`}>
-                              {group.highestSeverity}
-                            </span>
-                            <span className="text-text-bright font-medium text-sm">{group.label}</span>
-                            <span className="bg-accent/10 text-accent text-[10px] px-2 py-0.5 rounded-full font-medium">
-                              {group.alerts.length} alerts
-                            </span>
-                            <span className="text-muted text-xs ml-auto flex items-center gap-2">
-                              {timeAgo(alertStartTime(group.alerts.reduce((latest, a) => {
-                                const t = new Date(alertStartTime(a)).getTime() || 0;
-                                const l = new Date(alertStartTime(latest)).getTime() || 0;
-                                return t > l ? a : latest;
-                              })))}
-                              {dashboardTab === 'firing' && (
-                                <button
-                                  onClick={(e) => { e.stopPropagation(); handleGroupAcknowledge(group); }}
-                                  className="text-[10px] px-2 py-0.5 rounded border border-border text-muted hover:text-green hover:border-green/50 transition-colors"
-                                >
-                                  Ack Group
-                                </button>
-                              )}
-                            </span>
-                          </div>
-                        </td>
-                      </tr>
-                      {expandedGroups.has(group.key) && group.alerts.map(alert => {
-                        const rowId = alert.fingerprint || alert.id;
-                        return (
-                          <AlertRow
-                            key={rowId}
-                            alert={alert}
-                            expanded={expandedRows.has(rowId)}
-                            onToggleExpand={() => toggleRow(rowId)}
-                            onOpenDetail={() => setSelectedAlert(alert)}
-                            indented
-                            alertState={alertStates.get(alert.fingerprint)}
-                            onInvestigate={() => handleInvestigate(alert)}
-                            onAcknowledge={dashboardTab === 'firing' ? () => handleAcknowledge(alert) : undefined}
-                            onUnacknowledge={dashboardTab === 'acknowledged' ? () => handleUnacknowledge(alert) : undefined}
-                            showAckInfo={dashboardTab === 'acknowledged'}
-                          />
-                        );
-                      })}
-                    </Fragment>
-                  ) : (
-                    <AlertRow
-                      key={group.alerts[0].fingerprint || group.alerts[0].id}
-                      alert={group.alerts[0]}
-                      expanded={expandedRows.has(group.alerts[0].fingerprint || group.alerts[0].id)}
-                      onToggleExpand={() => toggleRow(group.alerts[0].fingerprint || group.alerts[0].id)}
-                      onOpenDetail={() => setSelectedAlert(group.alerts[0])}
-                      alertState={alertStates.get(group.alerts[0].fingerprint)}
-                      onInvestigate={() => handleInvestigate(group.alerts[0])}
-                      onAcknowledge={dashboardTab === 'firing' ? () => handleAcknowledge(group.alerts[0]) : undefined}
-                      onUnacknowledge={dashboardTab === 'acknowledged' ? () => handleUnacknowledge(group.alerts[0]) : undefined}
-                      showAckInfo={dashboardTab === 'acknowledged'}
-                    />
-                  ))
-                )
-              ) : (
-                displayAlerts.length === 0 ? (
-                  <tr>
-                    <td colSpan={6} className="table-cell text-center text-muted py-8">
-                      {hasFilter ? 'No alerts match the selected filters' : 'No active alerts'}
-                    </td>
-                  </tr>
-                ) : (
-                  displayAlerts.map((alert) => {
-                    const rowId = alert.fingerprint || alert.id;
-                    return (
-                      <AlertRow
-                        key={rowId}
-                        alert={alert}
-                        expanded={expandedRows.has(rowId)}
-                        onToggleExpand={() => toggleRow(rowId)}
-                        onOpenDetail={() => setSelectedAlert(alert)}
-                        alertState={alertStates.get(alert.fingerprint)}
-                        onInvestigate={() => handleInvestigate(alert)}
-                        onAcknowledge={dashboardTab === 'firing' ? () => handleAcknowledge(alert) : undefined}
-                        onUnacknowledge={dashboardTab === 'acknowledged' ? () => handleUnacknowledge(alert) : undefined}
-                        showAckInfo={dashboardTab === 'acknowledged'}
-                      />
-                    );
-                  })
-                )
-              )}
-            </tbody>
-          </table>
-        </div>
-
-        {/* Pagination / Group summary */}
-        <div className="flex items-center justify-between px-4 py-3 border-t border-border">
-          {groupView ? (
-            <span className="text-xs text-muted">
-              {(() => {
-                const multi = alertGroups.filter(g => g.alerts.length >= 2);
-                const singles = alertGroups.filter(g => g.alerts.length === 1);
-                const parts: string[] = [];
-                if (multi.length > 0) parts.push(`${multi.length} group${multi.length > 1 ? 's' : ''} (${multi.reduce((s, g) => s + g.alerts.length, 0)} alerts)`);
-                if (singles.length > 0) parts.push(`${singles.length} ungrouped`);
-                return parts.join(', ') || 'No alerts';
-              })()}
-            </span>
-          ) : (
-            <>
-              <div className="flex items-center gap-3">
-                <span className="text-xs text-muted">
-                  {sortedAlerts.length > 0
-                    ? `Showing ${safePage * pageSize + 1}\u2013${Math.min((safePage + 1) * pageSize, sortedAlerts.length)} of ${sortedAlerts.length}`
-                    : 'No alerts'}
-                </span>
-                <select
-                  value={pageSize}
-                  onChange={e => setPageSize(Number(e.target.value))}
-                  className="bg-surface border border-border rounded px-2 py-1 text-xs text-muted focus:outline-none focus:ring-1 focus:ring-accent"
-                >
-                  <option value={10}>10 per page</option>
-                  <option value={25}>25 per page</option>
-                  <option value={50}>50 per page</option>
-                  <option value={100}>100 per page</option>
-                </select>
-              </div>
-              {totalPages > 1 && (
-                <div className="flex items-center gap-1">
-                  <button
-                    onClick={() => setCurrentPage(p => Math.max(0, p - 1))}
-                    disabled={safePage === 0}
-                    className="px-2 py-1 text-xs text-muted hover:text-text hover:bg-surface-hover rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-                  >
-                    &lsaquo; Prev
-                  </button>
-                  {paginationRange(safePage, totalPages).map((p, i) =>
-                    p === -1 ? (
-                      <span key={`ellipsis-${i}`} className="px-1 text-xs text-muted">&hellip;</span>
-                    ) : (
-                      <button
-                        key={p}
-                        onClick={() => setCurrentPage(p)}
-                        className={`w-7 h-7 rounded text-xs font-medium transition-colors ${
-                          p === safePage
-                            ? 'bg-accent text-bg'
-                            : 'text-muted hover:text-text hover:bg-surface-hover'
-                        }`}
-                      >
-                        {p + 1}
-                      </button>
-                    )
-                  )}
-                  <button
-                    onClick={() => setCurrentPage(p => Math.min(totalPages - 1, p + 1))}
-                    disabled={safePage >= totalPages - 1}
-                    className="px-2 py-1 text-xs text-muted hover:text-text hover:bg-surface-hover rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-                  >
-                    Next &rsaquo;
-                  </button>
-                </div>
-              )}
-            </>
-          )}
-        </div>
-      </div>
+      {activeTab === 'alerts' && (
+        <AlertsTableView
+          alerts={alerts}
+          alertStates={alertStates}
+          loading={false}
+          onAlertClick={setSelectedAlert}
+        />
+      )}
+      {activeTab === 'knowledge-base' && <KnowledgeBasePage />}
 
       {/* Alert Detail Modal */}
       {selectedAlert && (
@@ -681,42 +337,9 @@ export default function CommandCenter() {
           alertState={alertStates.get(selectedAlert.fingerprint)}
           onInvestigate={() => handleInvestigate(selectedAlert)}
           onAcknowledge={() => handleAcknowledge(selectedAlert)}
+          maintenanceEvents={maintenanceEvents}
         />
       )}
-    </div>
-  );
-}
-
-/** Generate page number buttons: [0, 1, -1, 4, 5] where -1 = ellipsis */
-function paginationRange(current: number, total: number): number[] {
-  if (total <= 7) return Array.from({ length: total }, (_, i) => i);
-  const pages: number[] = [];
-  pages.push(0);
-  if (current > 2) pages.push(-1);
-  for (let i = Math.max(1, current - 1); i <= Math.min(total - 2, current + 1); i++) {
-    pages.push(i);
-  }
-  if (current < total - 3) pages.push(-1);
-  pages.push(total - 1);
-  return pages;
-}
-
-function StatCard({ label, value, color, subtext, filterKey, activeFilter, onFilter }: {
-  label: string; value: number; color: string; subtext?: string;
-  filterKey?: string; activeFilter?: string | null; onFilter?: (f: string | null) => void;
-}) {
-  const isActive = filterKey && activeFilter === filterKey;
-  const clickable = filterKey && onFilter;
-  return (
-    <div
-      className={`stat-card transition-all ${clickable ? 'cursor-pointer hover:ring-1 hover:ring-accent/30' : ''} ${
-        isActive ? 'ring-2 ring-accent' : ''
-      }`}
-      onClick={() => clickable && onFilter(isActive ? null : filterKey)}
-    >
-      <div className="text-xs text-muted uppercase tracking-wider mb-1">{label}</div>
-      <div className={`text-3xl font-bold ${color}`}>{value}</div>
-      {subtext && <div className="text-xs text-muted font-normal mt-1">{subtext}</div>}
     </div>
   );
 }
@@ -758,143 +381,16 @@ function RefreshControl({ refreshInterval, onRefreshIntervalChange, onRefresh, r
   );
 }
 
-function AlertRow({ alert, expanded, onToggleExpand, onOpenDetail, indented, alertState, onInvestigate, onAcknowledge, onUnacknowledge, showAckInfo }: {
-  alert: Alert;
-  expanded: boolean;
-  onToggleExpand: () => void;
-  onOpenDetail: () => void;
-  indented?: boolean;
-  alertState?: AlertState;
-  onInvestigate?: () => void;
-  onAcknowledge?: () => void;
-  onUnacknowledge?: () => void;
-  showAckInfo?: boolean;
-}) {
-  const enrichment = parseAIEnrichment(alert.note);
-  const sev = enrichment?.assessed_severity ?? 'unknown';
-  const host = alert.hostName || alert.hostname || '';
-  const source = getSourceLabel(alert);
-  const summary = enrichment?.summary || '';
-  const description = alert.description && alert.description !== alert.name ? alert.description : '';
-
-  const truncatedSummary = summary.length > 80 ? summary.substring(0, 80) + '...' : summary;
-  const truncatedDesc = description.length > 80 ? description.substring(0, 80) + '...' : description;
-  const hasExpandableContent = summary.length > 80 || description.length > 80;
-
-  return (
-    <tr className={`border-b border-border/50 hover:bg-surface-hover transition-colors ${indented ? 'bg-bg/20' : ''}`}>
-      <td className={`table-cell ${indented ? 'pl-10' : ''}`}>
-        <span className={`badge ${severityBg(sev)}`}>
-          {sev}
-        </span>
-      </td>
-      <td className="table-cell">
-        <div className="flex items-center gap-1.5 flex-wrap">
-          <button
-            onClick={onOpenDetail}
-            className="text-left text-text-bright hover:text-accent transition-colors"
-          >
-            {alert.name?.substring(0, 60) || 'Unknown'}
-            {(alert.name?.length ?? 0) > 60 ? '...' : ''}
-          </button>
-          {alertState?.investigating_user && (
-            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-blue/10 border border-blue/30 text-blue whitespace-nowrap">
-              <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-              </svg>
-              {alertState.investigating_user}
-            </span>
-          )}
-          {alertState?.is_updated === 1 && (
-            <span className="px-1.5 py-0.5 rounded text-[10px] bg-orange/10 border border-orange/30 text-orange font-medium whitespace-nowrap">
-              Updated
-            </span>
-          )}
-          {showAckInfo && alertState?.acknowledged_by && (
-            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-green/10 border border-green/30 text-green whitespace-nowrap">
-              Acked by {alertState.acknowledged_by} {alertState.acknowledged_at ? timeAgo(alertState.acknowledged_at) : ''}
-            </span>
-          )}
-        </div>
-        {description && (
-          <div className="text-xs text-muted mt-0.5 font-mono">
-            {expanded ? description : truncatedDesc}
-          </div>
-        )}
-      </td>
-      <td className="table-cell text-muted text-xs font-mono">{host}</td>
-      <td className="table-cell text-xs text-muted">{source}</td>
-      <td className="table-cell text-xs text-muted max-w-xs">
-        <div className={expanded ? '' : 'truncate'}>
-          {expanded ? summary : truncatedSummary}
-        </div>
-        {hasExpandableContent && (
-          <button
-            onClick={(e) => { e.stopPropagation(); onToggleExpand(); }}
-            className="text-accent hover:text-accent-hover text-[10px] mt-0.5 transition-colors"
-          >
-            {expanded ? 'Show less' : 'Show more'}
-          </button>
-        )}
-        {!summary && <span>--</span>}
-      </td>
-      <td className="table-cell text-xs text-muted whitespace-nowrap">
-        <div className="flex items-center gap-2">
-          <span>{timeAgo(alertStartTime(alert))}</span>
-          <div className="flex items-center gap-1 ml-auto">
-            {onInvestigate && (
-              <button
-                onClick={(e) => { e.stopPropagation(); onInvestigate(); }}
-                title={alertState?.investigating_user ? `Investigating by ${alertState.investigating_user}` : 'Mark as investigating'}
-                className={`p-1 rounded transition-colors ${
-                  alertState?.investigating_user
-                    ? 'text-blue hover:text-blue/70'
-                    : 'text-muted/40 hover:text-blue'
-                }`}
-              >
-                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-                </svg>
-              </button>
-            )}
-            {onAcknowledge && (
-              <button
-                onClick={(e) => { e.stopPropagation(); onAcknowledge(); }}
-                title="Acknowledge"
-                className="p-1 rounded text-muted/40 hover:text-green transition-colors"
-              >
-                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                </svg>
-              </button>
-            )}
-            {onUnacknowledge && (
-              <button
-                onClick={(e) => { e.stopPropagation(); onUnacknowledge(); }}
-                title="Unacknowledge"
-                className="p-1 rounded text-muted/40 hover:text-orange transition-colors"
-              >
-                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            )}
-          </div>
-        </div>
-      </td>
-    </tr>
-  );
-}
-
 /* ── Alert Detail Modal ── */
 
-function AlertDetailModal({ alert, onClose, onRefresh, alertState, onInvestigate, onAcknowledge }: {
+function AlertDetailModal({ alert, onClose, onRefresh, alertState, onInvestigate, onAcknowledge, maintenanceEvents = [] }: {
   alert: Alert;
   onClose: () => void;
   onRefresh: () => void;
   alertState?: AlertState;
   onInvestigate?: () => void;
   onAcknowledge?: () => void;
+  maintenanceEvents?: MaintenanceEvent[];
 }) {
   const enrichment = parseAIEnrichment(alert.note);
   const host = alert.hostName || alert.hostname || 'Unknown';
@@ -949,7 +445,7 @@ function AlertDetailModal({ alert, onClose, onRefresh, alertState, onInvestigate
           </div>
 
           {/* Actions */}
-          <AlertActions alert={alert} enrichment={enrichment} onAlertChanged={onRefresh} alertState={alertState} onInvestigate={onInvestigate} onAcknowledge={onAcknowledge} />
+          <AlertActions alert={alert} enrichment={enrichment} onAlertChanged={onRefresh} alertState={alertState} onInvestigate={onInvestigate} onAcknowledge={onAcknowledge} maintenanceEvents={maintenanceEvents} />
 
           {/* Description / Metric Values */}
           {alert.description && alert.description !== alert.name && (
@@ -1049,15 +545,13 @@ function AlertDetailModal({ alert, onClose, onRefresh, alertState, onInvestigate
           )}
 
           {/* SRE Feedback */}
-          {enrichment && (
-            <ModalFeedbackPanel
-              fingerprint={alert.fingerprint}
-              currentNote={alert.note}
-              existingFeedback={parseSREFeedback(alert.note)}
-              enrichment={enrichment}
-              onFeedbackSubmitted={onRefresh}
-            />
-          )}
+          <ModalFeedbackPanel
+            fingerprint={alert.fingerprint}
+            enrichment={enrichment}
+            onFeedbackSubmitted={onRefresh}
+            alertName={alert.name || ''}
+            hostname={alert.hostName || alert.hostname || ''}
+          />
 
           {/* Runbook & Remediation */}
           <RunbookPanel alert={alert} />
@@ -1125,28 +619,26 @@ function ModalDetailCard({ title, content, icon }: { title: string; content: str
 
 function ModalFeedbackPanel({
   fingerprint,
-  currentNote,
-  existingFeedback,
   enrichment,
   onFeedbackSubmitted,
+  alertName,
+  hostname,
 }: {
   fingerprint: string;
-  currentNote: string | undefined | null;
-  existingFeedback: SREFeedback | null;
-  enrichment: { assessed_severity: string; noise_score: number };
+  enrichment: { assessed_severity: string; noise_score: number } | null;
   onFeedbackSubmitted?: () => void;
+  alertName: string;
+  hostname: string;
 }) {
-  const [rating, setRating] = useState<'positive' | 'negative' | null>(
-    existingFeedback?.rating === 'positive' ? 'positive' :
-    existingFeedback?.rating ? 'negative' : null
-  );
-  const [correctedSeverity, setCorrectedSeverity] = useState(existingFeedback?.corrected_severity ?? '');
-  const [correctedNoise, setCorrectedNoise] = useState(existingFeedback?.corrected_noise?.toString() ?? '');
-  const [comment, setComment] = useState(existingFeedback?.comment ?? '');
-  const [sreUser] = useState(() => existingFeedback?.sre_user || getClientUsername() || '');
+  const [rating, setRating] = useState<'positive' | 'negative' | null>(null);
+  const [correctedSeverity, setCorrectedSeverity] = useState('');
+  const [correctedNoise, setCorrectedNoise] = useState('');
+  const [causeCorrection, setCauseCorrection] = useState('');
+  const [remediationCorrection, setRemediationCorrection] = useState('');
+  const [comment, setComment] = useState('');
+  const [sreUser] = useState(() => getClientUsername() || '');
   const [submitting, setSubmitting] = useState(false);
-  const [submitted, setSubmitted] = useState(!!existingFeedback);
-  const [editing, setEditing] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
   const [justSubmitted, setJustSubmitted] = useState(false);
   const [submitError, setSubmitError] = useState(false);
 
@@ -1155,21 +647,43 @@ function ModalFeedbackPanel({
     setSubmitting(true);
     setSubmitError(false);
 
-    const feedback: SREFeedback = {
-      rating: rating === 'negative' && !correctedSeverity && !correctedNoise ? 'negative' :
-              rating === 'negative' ? 'correction' : 'positive',
-      corrected_severity: correctedSeverity || undefined,
-      corrected_noise: correctedNoise ? parseInt(correctedNoise, 10) : undefined,
-      comment: comment.slice(0, 500) || undefined,
-      sre_user: sreUser || undefined,
-    };
+    const computedRating = rating === 'negative' && (correctedSeverity || correctedNoise) ? 'correction' : rating;
+    const combinedComment = [
+      comment,
+      causeCorrection ? `Cause correction: ${causeCorrection}` : '',
+      remediationCorrection ? `Remediation correction: ${remediationCorrection}` : '',
+    ].filter(Boolean).join('\n').slice(0, 2000) || undefined;
 
-    const ok = await submitFeedback(fingerprint, currentNote, feedback);
+    // Submit to new API and structured feedback in parallel
+    const [result] = await Promise.all([
+      submitSREFeedback({
+        fingerprint,
+        alert_name: alertName,
+        rating: computedRating,
+        corrected_severity: correctedSeverity || undefined,
+        corrected_noise: correctedNoise ? parseInt(correctedNoise, 10) : undefined,
+        comment: combinedComment,
+      }),
+      submitStructuredFeedback({
+        alert_name: alertName,
+        hostname: hostname,
+        service: '',
+        severity_correction: correctedSeverity || '',
+        cause_correction: causeCorrection || '',
+        remediation_correction: remediationCorrection || '',
+        full_text: comment || '',
+      }),
+    ]);
     setSubmitting(false);
-    if (ok) {
+    if (result) {
       setSubmitted(true);
-      setEditing(false);
       setJustSubmitted(true);
+      setRating(null);
+      setCorrectedSeverity('');
+      setCorrectedNoise('');
+      setCauseCorrection('');
+      setRemediationCorrection('');
+      setComment('');
       if (onFeedbackSubmitted) {
         setTimeout(onFeedbackSubmitted, 500);
       }
@@ -1205,39 +719,7 @@ function ModalFeedbackPanel({
         </div>
       )}
 
-      {submitted && !editing ? (
-        <div className="space-y-2">
-          <div className="flex items-center gap-2 text-sm">
-            <span className={`text-base ${rating === 'positive' ? 'text-green' : 'text-red'}`}>
-              {rating === 'positive' ? '\u2713' : '\u2717'}
-            </span>
-            <span className="text-text text-xs">
-              {rating === 'positive' ? 'Confirmed accurate' : 'Needs correction'}
-            </span>
-            {sreUser && <span className="text-muted text-[10px]">by {sreUser}</span>}
-          </div>
-          {(correctedSeverity || correctedNoise) && (
-            <div className="flex gap-3 text-[10px] text-muted">
-              {correctedSeverity && (
-                <span>Severity: <span className={`font-medium ${severityColor(correctedSeverity)}`}>{correctedSeverity}</span></span>
-              )}
-              {correctedNoise && (
-                <span>Noise: <span className="font-medium text-text">{correctedNoise}/10</span></span>
-              )}
-            </div>
-          )}
-          {comment && (
-            <div className="text-xs text-text bg-bg rounded-md p-2 border border-border">{comment}</div>
-          )}
-          <button
-            onClick={() => { setEditing(true); setJustSubmitted(false); }}
-            className="text-[10px] text-accent hover:text-accent-hover transition-colors"
-          >
-            Update feedback
-          </button>
-        </div>
-      ) : (
-        <div className="space-y-3">
+      <div className="space-y-3">
           <div>
             <div className="text-[10px] text-muted mb-1.5">Is this analysis accurate?</div>
             <div className="flex gap-2">
@@ -1273,7 +755,7 @@ function ModalFeedbackPanel({
                   onChange={(e) => setCorrectedSeverity(e.target.value)}
                   className="w-full bg-bg border border-border rounded-md px-2 py-1.5 text-xs text-text focus:border-accent focus:outline-none"
                 >
-                  <option value="">No change ({enrichment.assessed_severity})</option>
+                  <option value="">No change ({enrichment?.assessed_severity || 'unknown'})</option>
                   <option value="critical">Critical</option>
                   <option value="high">High</option>
                   <option value="warning">Warning</option>
@@ -1288,7 +770,7 @@ function ModalFeedbackPanel({
                   onChange={(e) => setCorrectedNoise(e.target.value)}
                   className="w-full bg-bg border border-border rounded-md px-2 py-1.5 text-xs text-text focus:border-accent focus:outline-none"
                 >
-                  <option value="">No change ({enrichment.noise_score}/10)</option>
+                  <option value="">No change ({enrichment?.noise_score ?? '?'}/10)</option>
                   {[1,2,3,4,5,6,7,8,9,10].map(n => (
                     <option key={n} value={n}>{n}/10 {n <= 3 ? '(actionable)' : n >= 7 ? '(noise)' : ''}</option>
                   ))}
@@ -1297,10 +779,37 @@ function ModalFeedbackPanel({
             </div>
           )}
 
+          {rating === 'negative' && (
+            <div className="space-y-2">
+              <div>
+                <label className="text-[10px] text-muted block mb-1">Correct cause (what&apos;s actually wrong?)</label>
+                <textarea
+                  value={causeCorrection}
+                  onChange={(e) => setCauseCorrection(e.target.value)}
+                  maxLength={300}
+                  rows={2}
+                  placeholder='e.g. "This is expected during monthly batch processing"'
+                  className="w-full bg-bg border border-border rounded-md px-2 py-1.5 text-xs text-text placeholder-muted/50 focus:border-accent focus:outline-none resize-y"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] text-muted block mb-1">Correct remediation (what should be done?)</label>
+                <textarea
+                  value={remediationCorrection}
+                  onChange={(e) => setRemediationCorrection(e.target.value)}
+                  maxLength={300}
+                  rows={2}
+                  placeholder='e.g. "No action needed, auto-resolves after batch completes"'
+                  className="w-full bg-bg border border-border rounded-md px-2 py-1.5 text-xs text-text placeholder-muted/50 focus:border-accent focus:outline-none resize-y"
+                />
+              </div>
+            </div>
+          )}
+
           {rating && (
             <div>
               <label className="text-[10px] text-muted block mb-1">
-                {rating === 'positive' ? 'Notes (optional)' : 'What should the AI learn?'}
+                {rating === 'positive' ? 'Notes (optional)' : 'Additional notes'}
               </label>
               <textarea
                 value={comment}
@@ -1309,7 +818,7 @@ function ModalFeedbackPanel({
                 rows={2}
                 placeholder={rating === 'positive'
                   ? 'Additional context...'
-                  : 'e.g. "Known maintenance window, noise should be higher"'
+                  : 'Any other context for future enrichments'
                 }
                 className="w-full bg-bg border border-border rounded-md px-2 py-1.5 text-xs text-text placeholder-muted/50 focus:border-accent focus:outline-none resize-y"
               />
@@ -1326,38 +835,41 @@ function ModalFeedbackPanel({
               >
                 {submitting ? 'Submitting...' : 'Submit'}
               </button>
-              {editing && (
-                <button
-                  onClick={() => setEditing(false)}
-                  className="px-3 py-1.5 rounded-md border border-border text-muted text-xs hover:text-text transition-colors"
-                >
-                  Cancel
-                </button>
-              )}
             </div>
           )}
         </div>
-      )}
     </div>
   );
 }
 
-function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvestigate, onAcknowledge }: {
+function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvestigate, onAcknowledge, maintenanceEvents = [] }: {
   alert: Alert;
   enrichment: AIEnrichment | null;
   onAlertChanged: () => void;
   alertState?: AlertState;
   onInvestigate?: () => void;
   onAcknowledge?: () => void;
+  maintenanceEvents?: MaintenanceEvent[];
 }) {
   const [resolving, setResolving] = useState(false);
-  const [resolved, setResolved] = useState(false);
+  const [resolved, setResolved] = useState(alert.status === 'resolved' || alert.status === 'ok');
+  const [unresolving, setUnresolving] = useState(false);
   const [showSilenceMenu, setShowSilenceMenu] = useState(false);
   const [silencing, setSilencing] = useState(false);
   const [silenced, setSilenced] = useState<string | null>(null);
   const [silenceError, setSilenceError] = useState(false);
   const [showIncidentForm, setShowIncidentForm] = useState(false);
   const [incidentResult, setIncidentResult] = useState<{ key: string; url: string } | null>(null);
+  const [showIncidentWizard, setShowIncidentWizard] = useState(false);
+  const [showEscalation, setShowEscalation] = useState(false);
+  const [escalationType, setEscalationType] = useState<'team' | 'user'>('team');
+  const [escalationTarget, setEscalationTarget] = useState('');
+  const [escalationMessage, setEscalationMessage] = useState('');
+  const [escalating, setEscalating] = useState(false);
+  const [escalated, setEscalated] = useState(false);
+  const [escalationError, setEscalationError] = useState('');
+  const [teams, setTeams] = useState<{id: string; name: string}[]>([]);
+  const [users, setUsers] = useState<{id: string; name: string; email: string}[]>([]);
 
   const host = alert.hostName || alert.hostname || '';
   const registryMatch = detectRegistryFromAlert(alert.name, host, alert.description);
@@ -1369,6 +881,14 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
       })
     : null;
 
+  // Find maintenance events matching this alert's registry operator
+  const matchedMaintenance = registryMatch
+    ? maintenanceEvents.filter(m => {
+        const ops = matchMaintenanceToOperators(m.vendor, m.title);
+        return ops.includes(registryMatch.operator.id);
+      })
+    : [];
+
   async function handleResolve() {
     if (!confirm('Resolve this alert? It will be marked as resolved in Keep.')) return;
     setResolving(true);
@@ -1376,6 +896,17 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
     setResolving(false);
     if (ok) {
       setResolved(true);
+      onAlertChanged();
+    }
+  }
+
+  async function handleUnresolve() {
+    if (!confirm('Unresolve this alert? It will be marked as firing again.')) return;
+    setUnresolving(true);
+    const ok = await unresolveAlert(alert.fingerprint);
+    setUnresolving(false);
+    if (ok) {
+      setResolved(false);
       onAlertChanged();
     }
   }
@@ -1397,57 +928,116 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap gap-2">
-        {/* Resolve */}
-        <button
-          onClick={handleResolve}
-          disabled={resolving || resolved}
-          className={`px-3 py-1.5 rounded-md border text-xs font-medium transition-all ${
-            resolved
-              ? 'border-green/40 bg-green/10 text-green cursor-default'
-              : 'border-border text-muted hover:border-green/50 hover:text-green hover:bg-green/5'
-          } disabled:opacity-60`}
-        >
-          {resolved ? '\u2713 Resolved' : resolving ? 'Resolving...' : 'Resolve'}
-        </button>
-
-        {/* Silence */}
+        {/* Status Dropdown (Acknowledge, Resolve, Silence, Investigate) */}
         <div className="relative">
           <button
             onClick={() => setShowSilenceMenu(!showSilenceMenu)}
-            disabled={silencing || !!silenced}
-            className={`px-3 py-1.5 rounded-md border text-xs font-medium transition-all ${
-              silenced
-                ? 'border-yellow/40 bg-yellow/10 text-yellow cursor-default'
-                : 'border-border text-muted hover:border-yellow/50 hover:text-yellow hover:bg-yellow/5'
-            } disabled:opacity-60`}
+            className={`px-3 py-1.5 rounded-md border text-xs font-medium transition-all inline-flex items-center gap-1 ${
+              showSilenceMenu
+                ? 'border-accent/40 bg-accent/10 text-accent'
+                : 'border-border text-muted hover:border-accent/50 hover:text-accent hover:bg-accent/5'
+            }`}
           >
-            {silenced ? `Silenced (${silenced})` : silencing ? 'Silencing...' : 'Silence'}
+            Status
+            <svg className="w-3 h-3 opacity-60" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
           </button>
           {showSilenceMenu && (
             <>
               <div className="fixed inset-0 z-10" onClick={() => setShowSilenceMenu(false)} />
-              <div className="absolute top-full left-0 mt-1 bg-surface border border-border rounded-lg shadow-xl z-20 py-1 min-w-[140px]">
-                {[
-                  { label: '30 minutes', seconds: 1800 },
-                  { label: '1 hour', seconds: 3600 },
-                  { label: '4 hours', seconds: 14400 },
-                  { label: '8 hours', seconds: 28800 },
-                  { label: '24 hours', seconds: 86400 },
-                ].map(opt => (
+              <div className="absolute top-full left-0 mt-1 bg-surface border border-border rounded-lg shadow-xl z-20 py-1 min-w-[200px]">
+                {/* Acknowledge */}
+                {onAcknowledge && !alertState?.acknowledged_by && (
                   <button
-                    key={opt.seconds}
-                    onClick={() => handleSilence(opt.seconds)}
-                    className="w-full text-left px-3 py-1.5 text-xs text-text hover:bg-surface-hover transition-colors"
+                    onClick={() => { onAcknowledge(); setShowSilenceMenu(false); }}
+                    className="w-full text-left px-3 py-2 text-xs text-text hover:bg-surface-hover transition-colors flex items-center gap-2"
                   >
-                    {opt.label}
+                    <svg className="w-3 h-3 text-green" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                    </svg>
+                    Acknowledge
                   </button>
-                ))}
+                )}
+                {alertState?.acknowledged_by && (
+                  <div className="px-3 py-2 text-xs text-green flex items-center gap-2">
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                    </svg>
+                    Acked by {alertState.acknowledged_by}
+                  </div>
+                )}
+
+                {/* Resolve / Unresolve */}
+                {resolved ? (
+                  <button
+                    onClick={() => { handleUnresolve(); setShowSilenceMenu(false); }}
+                    disabled={unresolving}
+                    className="w-full text-left px-3 py-2 text-xs text-yellow hover:bg-surface-hover transition-colors flex items-center gap-2 disabled:opacity-60"
+                  >
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                    {unresolving ? 'Unresolving...' : 'Unresolve'}
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => { handleResolve(); setShowSilenceMenu(false); }}
+                    disabled={resolving}
+                    className="w-full text-left px-3 py-2 text-xs text-text hover:bg-surface-hover transition-colors flex items-center gap-2 disabled:opacity-60"
+                  >
+                    <svg className="w-3 h-3 text-green" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    {resolving ? 'Resolving...' : 'Resolve'}
+                  </button>
+                )}
+
+                {/* Investigate */}
+                {onInvestigate && (
+                  <button
+                    onClick={() => { onInvestigate(); setShowSilenceMenu(false); }}
+                    className={`w-full text-left px-3 py-2 text-xs hover:bg-surface-hover transition-colors flex items-center gap-2 ${
+                      alertState?.investigating_user ? 'text-blue' : 'text-text'
+                    }`}
+                  >
+                    <svg className="w-3 h-3 text-blue" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                    </svg>
+                    {alertState?.investigating_user ? `Investigating (${alertState.investigating_user})` : 'Investigate'}
+                  </button>
+                )}
+
+                {/* Silence durations */}
+                <div className="border-t border-border mt-1 pt-1">
+                  <div className="px-3 py-1 text-[10px] text-muted uppercase tracking-wider">Silence</div>
+                  {silenced ? (
+                    <div className="px-3 py-2 text-xs text-yellow flex items-center gap-2">
+                      Silenced ({silenced})
+                    </div>
+                  ) : (
+                    [
+                      { label: '30 minutes', seconds: 1800 },
+                      { label: '1 hour', seconds: 3600 },
+                      { label: '4 hours', seconds: 14400 },
+                      { label: '8 hours', seconds: 28800 },
+                      { label: '24 hours', seconds: 86400 },
+                    ].map(opt => (
+                      <button
+                        key={opt.seconds}
+                        onClick={() => { handleSilence(opt.seconds); setShowSilenceMenu(false); }}
+                        disabled={silencing}
+                        className="w-full text-left px-3 py-1.5 text-xs text-text hover:bg-surface-hover transition-colors pl-6"
+                      >
+                        {opt.label}
+                      </button>
+                    ))
+                  )}
+                </div>
               </div>
             </>
           )}
         </div>
 
-        {/* Create Incident */}
+        {/* Create Ticket (Jira) */}
         {incidentResult ? (
           <a
             href={incidentResult.url}
@@ -1466,9 +1056,45 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
                 : 'border-border text-muted hover:border-accent/50 hover:text-accent hover:bg-accent/5'
             }`}
           >
-            Create Incident
+            Create Ticket
           </button>
         )}
+
+        {/* Create Incident (webhook + statuspage) */}
+        <button
+          onClick={() => setShowIncidentWizard(!showIncidentWizard)}
+          className={`px-3 py-1.5 rounded-md border text-xs font-medium transition-all ${
+            showIncidentWizard
+              ? 'border-orange/40 bg-orange/10 text-orange'
+              : 'border-border text-muted hover:border-orange/50 hover:text-orange hover:bg-orange/5'
+          }`}
+        >
+          Create Incident
+        </button>
+
+        {/* Escalate (Grafana IRM) */}
+        <button
+          onClick={() => {
+            setShowEscalation(!showEscalation);
+            if (!showEscalation && teams.length === 0) {
+              fetchEscalationTeams().then(setTeams);
+              fetchEscalationUsers().then(setUsers);
+            }
+          }}
+          disabled={escalated}
+          className={`px-3 py-1.5 rounded-md border text-xs font-medium transition-all inline-flex items-center gap-1 ${
+            escalated
+              ? 'border-green/40 bg-green/10 text-green cursor-default'
+              : showEscalation
+                ? 'border-red/40 bg-red/10 text-red'
+                : 'border-border text-muted hover:border-red/50 hover:text-red hover:bg-red/5'
+          }`}
+        >
+          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+          </svg>
+          {escalated ? '✓ Escalated' : 'Escalate'}
+        </button>
 
         {/* Contact Registry */}
         {registryMailto && (
@@ -1486,43 +1112,24 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
           </a>
         )}
 
-        {/* Investigate Toggle */}
-        {onInvestigate && (
-          <button
-            onClick={onInvestigate}
-            className={`px-3 py-1.5 rounded-md border text-xs font-medium transition-all inline-flex items-center gap-1 ${
-              alertState?.investigating_user
-                ? 'border-blue/40 bg-blue/10 text-blue'
-                : 'border-border text-muted hover:border-blue/50 hover:text-blue hover:bg-blue/5'
-            }`}
+        {/* Maintenance Active */}
+        {matchedMaintenance.length > 0 && matchedMaintenance.slice(0, 2).map(m => (
+          <a
+            key={m.id}
+            href={m.permalink}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="px-3 py-1.5 rounded-md border border-yellow/30 bg-yellow/10 text-yellow text-xs font-medium hover:bg-yellow/20 transition-all inline-flex items-center gap-1"
+            title={m.title}
           >
             <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
             </svg>
-            {alertState?.investigating_user ? `Investigating (${alertState.investigating_user})` : 'Investigate'}
-          </button>
-        )}
+            Maint: {m.title.length > 30 ? m.title.substring(0, 30) + '...' : m.title}
+            {m.end_time && ` until ${new Date(m.end_time).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}`}
+          </a>
+        ))}
 
-        {/* Acknowledge */}
-        {onAcknowledge && !alertState?.acknowledged_by && (
-          <button
-            onClick={onAcknowledge}
-            className="px-3 py-1.5 rounded-md border border-border text-muted text-xs font-medium hover:border-green/50 hover:text-green hover:bg-green/5 transition-all inline-flex items-center gap-1"
-          >
-            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-            </svg>
-            Acknowledge
-          </button>
-        )}
-        {alertState?.acknowledged_by && (
-          <span className="px-3 py-1.5 rounded-md border border-green/40 bg-green/10 text-green text-xs font-medium inline-flex items-center gap-1">
-            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-            </svg>
-            Acked by {alertState.acknowledged_by}
-          </span>
-        )}
       </div>
 
       {silenceError && (
@@ -1542,6 +1149,94 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
           }}
           onCancel={() => setShowIncidentForm(false)}
         />
+      )}
+
+      {/* Incident Wizard (webhook + statuspage) */}
+      {showIncidentWizard && (
+        <IncidentWizard
+          alert={alert}
+          onClose={() => setShowIncidentWizard(false)}
+        />
+      )}
+
+      {/* Escalation Form */}
+      {showEscalation && !escalated && (
+        <div className="bg-surface border border-red/20 rounded-lg p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <h4 className="text-sm font-medium text-red">Escalate via Grafana IRM</h4>
+            <button onClick={() => setShowEscalation(false)} className="text-muted hover:text-text text-xs">✕</button>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => { setEscalationType('team'); setEscalationTarget(''); }}
+              className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                escalationType === 'team' ? 'bg-red/10 text-red border border-red/30' : 'text-muted border border-border hover:text-text'
+              }`}
+            >Team</button>
+            <button
+              onClick={() => { setEscalationType('user'); setEscalationTarget(''); }}
+              className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                escalationType === 'user' ? 'bg-red/10 text-red border border-red/30' : 'text-muted border border-border hover:text-text'
+              }`}
+            >User</button>
+          </div>
+          <select
+            value={escalationTarget}
+            onChange={e => setEscalationTarget(e.target.value)}
+            className="w-full bg-bg border border-border rounded px-3 py-2 text-sm text-text focus:outline-none focus:ring-1 focus:ring-red/50"
+          >
+            <option value="">Select {escalationType}...</option>
+            {escalationType === 'team'
+              ? teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)
+              : users.map(u => <option key={u.id} value={u.id}>{u.name} ({u.email})</option>)
+            }
+          </select>
+          <textarea
+            value={escalationMessage}
+            onChange={e => setEscalationMessage(e.target.value)}
+            placeholder="Additional context (optional)"
+            rows={2}
+            className="w-full bg-bg border border-border rounded px-3 py-2 text-sm text-text placeholder:text-muted focus:outline-none focus:ring-1 focus:ring-red/50 resize-none"
+          />
+          {escalationError && (
+            <div className="text-xs text-red bg-red/10 border border-red/20 rounded px-2 py-1">{escalationError}</div>
+          )}
+          <button
+            onClick={async () => {
+              if (!escalationTarget) return;
+              setEscalating(true);
+              setEscalationError('');
+              const host = alert.hostName || alert.hostname || '';
+              const result = await escalateAlert({
+                team_id: escalationType === 'team' ? escalationTarget : undefined,
+                user_ids: escalationType === 'user' ? [escalationTarget] : undefined,
+                alert_name: alert.name || 'Unknown',
+                severity: alert.severity || 'unknown',
+                hostname: host,
+                message: escalationMessage,
+              });
+              setEscalating(false);
+              if (result.success) {
+                const escalatedToName = escalationType === 'team'
+                  ? (teams.find(t => t.id === escalationTarget)?.name || escalationTarget)
+                  : (users.find(u => u.id === escalationTarget)?.name || escalationTarget);
+                try {
+                  await storeEscalationState(alert.fingerprint, escalatedToName);
+                } catch {
+                  // Best-effort — escalation was already sent
+                }
+                setEscalated(true);
+                setShowEscalation(false);
+              } else {
+                setEscalationError(result.error || 'Escalation failed');
+              }
+            }}
+            disabled={!escalationTarget || escalating}
+            className="w-full px-3 py-2 rounded-md bg-red/80 hover:bg-red text-white text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {escalating ? 'Sending...' : 'Send Escalation'}
+          </button>
+        </div>
       )}
     </div>
   );
@@ -1635,6 +1330,18 @@ function IncidentForm({ alert, enrichment, onCreated, onCancel }: {
 
     setSubmitting(false);
     if (result.ok && result.issueKey) {
+      try {
+        await storeIncidentState(alert.fingerprint, result.issueKey, result.issueUrl || '');
+      } catch {
+        // Best-effort — incident was already created in Jira
+      }
+      try {
+        await fetch('/api/alert-states/investigate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fingerprint: alert.fingerprint }),
+        });
+      } catch {}
       onCreated(result.issueKey, result.issueUrl || '');
     } else {
       setError(result.error || 'Failed to create incident');
@@ -1644,7 +1351,7 @@ function IncidentForm({ alert, enrichment, onCreated, onCancel }: {
   return (
     <div className="bg-bg/60 border border-accent/20 rounded-lg p-4 space-y-3">
       <div className="flex items-center justify-between">
-        <h4 className="text-sm font-semibold text-accent">Create Jira Incident (OCCIR)</h4>
+        <h4 className="text-sm font-semibold text-accent">Create Ticket (OCCIR)</h4>
         <button onClick={onCancel} className="text-muted hover:text-text text-xs transition-colors">Cancel</button>
       </div>
 
@@ -1737,7 +1444,7 @@ function IncidentForm({ alert, enrichment, onCreated, onCancel }: {
           disabled={submitting || !summary.trim()}
           className="px-4 py-1.5 rounded-md bg-accent text-bg font-medium text-xs hover:bg-accent-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          {submitting ? (pastedImages.length > 0 ? 'Creating & uploading...' : 'Creating...') : 'Create Incident'}
+          {submitting ? (pastedImages.length > 0 ? 'Creating & uploading...' : 'Creating...') : 'Create Ticket'}
         </button>
       </div>
     </div>
@@ -1752,15 +1459,52 @@ function RunbookPanel({ alert }: { alert: Alert }) {
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [submitError, setSubmitError] = useState(false);
+  const [votes, setVotes] = useState<Map<string, 'up' | 'down'>>(new Map());
 
   const host = alert.hostName || alert.hostname || '';
 
   useEffect(() => {
     setLoadingMatches(true);
     fetchRunbookMatches(alert.name, host || undefined)
-      .then(setMatches)
+      .then((entries) => {
+        setMatches(entries);
+        const entryIds = entries.map((e: RunbookEntry) => e.id).filter(Boolean) as number[];
+        if (entryIds.length > 0) {
+          fetchRunbookFeedback(entryIds, alert.fingerprint).then((feedback: RunbookFeedback[]) => {
+            const voteMap = new Map<string, 'up' | 'down'>();
+            for (const fb of feedback) {
+              voteMap.set(`${fb.runbook_entry_id}`, fb.vote);
+            }
+            setVotes(voteMap);
+          });
+        }
+      })
       .finally(() => setLoadingMatches(false));
   }, [alert.name, host]);
+
+  const handleVote = async (entryId: number, vote: 'up' | 'down') => {
+    const key = `${entryId}`;
+    const currentVote = votes.get(key);
+    const newVote = currentVote === vote ? 'none' : vote;
+
+    setVotes(prev => {
+      const next = new Map(prev);
+      if (newVote === 'none') next.delete(key);
+      else next.set(key, newVote as 'up' | 'down');
+      return next;
+    });
+
+    try {
+      await submitRunbookFeedback(alert.fingerprint, alert.name, entryId, newVote as 'up' | 'down' | 'none');
+    } catch {
+      setVotes(prev => {
+        const next = new Map(prev);
+        if (currentVote) next.set(key, currentVote);
+        else next.delete(key);
+        return next;
+      });
+    }
+  };
 
   async function handleSubmit() {
     if (!remediation.trim()) return;
@@ -1781,7 +1525,19 @@ function RunbookPanel({ alert }: { alert: Alert }) {
     if (ok) {
       setSubmitted(true);
       setRemediation('');
-      fetchRunbookMatches(alert.name, host || undefined).then(setMatches);
+      fetchRunbookMatches(alert.name, host || undefined).then((entries) => {
+        setMatches(entries);
+        const entryIds = entries.map((e: RunbookEntry) => e.id).filter(Boolean) as number[];
+        if (entryIds.length > 0) {
+          fetchRunbookFeedback(entryIds, alert.fingerprint).then((feedback: RunbookFeedback[]) => {
+            const voteMap = new Map<string, 'up' | 'down'>();
+            for (const fb of feedback) {
+              voteMap.set(`${fb.runbook_entry_id}`, fb.vote);
+            }
+            setVotes(voteMap);
+          });
+        }
+      });
     } else {
       setSubmitError(true);
     }
@@ -1802,17 +1558,49 @@ function RunbookPanel({ alert }: { alert: Alert }) {
             Past remediations for similar alerts ({matches.length})
           </div>
           {matches.map((entry) => (
-            <div key={entry.id} className="bg-bg rounded-md p-2.5 border border-border">
-              <div className="flex items-center gap-2 text-[10px] text-muted mb-1">
-                <span>{entry.created_at?.substring(0, 10)}</span>
-                {entry.sre_user && <span>by {entry.sre_user}</span>}
-                {entry.hostname && <span className="font-mono">{entry.hostname}</span>}
-                {entry.score != null && <span className="text-accent">relevance: {entry.score}</span>}
+            <div key={entry.id} className={`${votes.get(`${entry.id}`) === 'down' ? 'opacity-50' : ''} transition-opacity`}>
+              <div className="bg-bg rounded-md p-2.5 border border-border">
+                <div className="flex items-center gap-2 text-[10px] text-muted mb-1">
+                  <span>{entry.created_at?.substring(0, 10)}</span>
+                  {entry.sre_user && <span>by {entry.sre_user}</span>}
+                  {entry.hostname && <span className="font-mono">{entry.hostname}</span>}
+                  {entry.score != null && <span className="text-accent">relevance: {entry.score}</span>}
+                  {entry.id != null && (
+                    <div className="inline-flex items-center gap-1 ml-2">
+                      <button
+                        onClick={() => handleVote(entry.id!, 'up')}
+                        className={`p-0.5 rounded transition-colors ${
+                          votes.get(`${entry.id}`) === 'up'
+                            ? 'text-green'
+                            : 'text-muted/30 hover:text-green/70'
+                        }`}
+                        title="Useful remediation"
+                      >
+                        <svg className="w-3.5 h-3.5" fill={votes.get(`${entry.id}`) === 'up' ? 'currentColor' : 'none'} viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M14 9V5a3 3 0 00-3-3l-4 9v11h11.28a2 2 0 002-1.7l1.38-9a2 2 0 00-2-2.3H14z" />
+                        </svg>
+                      </button>
+                      <button
+                        onClick={() => handleVote(entry.id!, 'down')}
+                        className={`p-0.5 rounded transition-colors ${
+                          votes.get(`${entry.id}`) === 'down'
+                            ? 'text-red'
+                            : 'text-muted/30 hover:text-red/70'
+                        }`}
+                        title="Irrelevant remediation"
+                      >
+                        <svg className="w-3.5 h-3.5" fill={votes.get(`${entry.id}`) === 'down' ? 'currentColor' : 'none'} viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M10 15v4a3 3 0 003 3l4-9V2H5.72a2 2 0 00-2 1.7l-1.38 9a2 2 0 002 2.3H10z" />
+                        </svg>
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <div className="text-[10px] text-muted mb-0.5 truncate">
+                  Alert: {entry.alert_name?.substring(0, 80)}
+                </div>
+                <div className="text-xs text-text whitespace-pre-wrap">{entry.remediation}</div>
               </div>
-              <div className="text-[10px] text-muted mb-0.5 truncate">
-                Alert: {entry.alert_name?.substring(0, 80)}
-              </div>
-              <div className="text-xs text-text whitespace-pre-wrap">{entry.remediation}</div>
             </div>
           ))}
         </div>

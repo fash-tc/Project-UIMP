@@ -22,11 +22,14 @@ DOCKER_CONTAINERS = {
     "keep-ui":         {"display": "Keep Frontend",     "role": "Admin UI"},
     "ollama":          {"display": "Ollama LLM",        "role": "AI Inference"},
     "alert-enricher":  {"display": "Alert Enricher",    "role": "AI Analysis"},
-    "zabbix-poller":   {"display": "Zabbix Poller",     "role": "Alert Collection"},
+    "auth-api":        {"display": "Auth API",          "role": "Authentication"},
+    "alert-state-api": {"display": "Alert State API",   "role": "Alert Tracking"},
+    "loki-gateway":    {"display": "Loki Gateway",      "role": "Log Queries"},
     "sre-frontend":    {"display": "SRE Frontend",      "role": "SRE Portal"},
     "n8n":             {"display": "n8n Workflows",     "role": "Automation"},
     "nginx":           {"display": "Nginx Proxy",       "role": "Reverse Proxy"},
     "runbook-api":     {"display": "Runbook API",       "role": "Knowledge Base"},
+    "escalation-api":  {"display": "Escalation API",   "role": "IRM Escalation"},
 }
 
 # HTTP health checks (from within Docker network)
@@ -36,6 +39,10 @@ HTTP_CHECKS = {
     "n8n":          "http://n8n:5678/n8n/healthz",
     "ollama":       "http://ollama:11434/api/tags",
     "runbook-api":  "http://runbook-api:8090/api/runbook/entries?limit=1",
+    "auth-api":        "http://auth-api:8093/api/auth/login",
+    "alert-state-api": "http://alert-state-api:8092/api/alert-states",
+    "loki-gateway":    "http://loki-gateway:8091/api/loki/registry-health",
+    "escalation-api":  "http://escalation-api:8094/api/escalation/health",
 }
 
 KEEP_URL = os.environ.get("KEEP_URL", "http://keep-api:8080")

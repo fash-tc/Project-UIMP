@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useMemo, useCallback } from 'react';
 import { Alert } from '@/lib/types';
-import { fetchAlerts, parseAIEnrichment, timeAgo, alertStartTime, fetchRegistryHealth, RegistryHealthData, RegistryHealthOperator } from '@/lib/keep-api';
+import { fetchAlerts, parseAIEnrichment, timeAgo, alertStartTime, fetchRegistryHealth, RegistryHealthData, RegistryHealthOperator, fetchRegistryTrends, MaintenanceEvent, fetchMaintenanceEvents } from '@/lib/keep-api';
 import {
   REGISTRY_OPERATORS,
   TLD_OPERATOR_MAP,
@@ -11,7 +11,8 @@ import {
   buildRegistryMailto,
   detectRegistryFromAlert,
   RegistryMatch,
-} from '@/lib/registry-contacts';
+  matchMaintenanceToOperators,
+} from '@/lib/registry';
 
 interface RegistryAlert {
   alert: Alert;
@@ -25,6 +26,7 @@ export default function RegistryContactsPage() {
   const [loadingAlerts, setLoadingAlerts] = useState(true);
   const [tldFilter, setTldFilter] = useState('');
   const [healthData, setHealthData] = useState<RegistryHealthData | null>(null);
+  const [maintenanceEvents, setMaintenanceEvents] = useState<MaintenanceEvent[]>([]);
 
   useEffect(() => {
     fetchAlerts(250).then(a => {
@@ -34,10 +36,19 @@ export default function RegistryContactsPage() {
   }, []);
 
   useEffect(() => {
-    const load = () => { fetchRegistryHealth().then(setHealthData); };
-    load();
-    const interval = setInterval(load, 300_000);
+    fetchMaintenanceEvents().then(setMaintenanceEvents);
+    const interval = setInterval(() => fetchMaintenanceEvents().then(setMaintenanceEvents), 60000);
     return () => clearInterval(interval);
+  }, []);
+
+  const [loadingHealth, setLoadingHealth] = useState(false);
+
+  const loadHealthData = useCallback(() => {
+    setLoadingHealth(true);
+    fetchRegistryHealth().then(data => {
+      setHealthData(data);
+      setLoadingHealth(false);
+    }).catch(() => setLoadingHealth(false));
   }, []);
 
   // Match alerts to registries
@@ -94,23 +105,42 @@ export default function RegistryContactsPage() {
     return map;
   }, [registryAlerts]);
 
+  const maintenanceByOperator = useMemo(() => {
+    const map: Record<string, MaintenanceEvent[]> = {};
+    for (const m of maintenanceEvents) {
+      const ops = matchMaintenanceToOperators(m.vendor, m.title);
+      for (const opId of ops) {
+        if (!map[opId]) map[opId] = [];
+        map[opId].push(m);
+      }
+    }
+    return map;
+  }, [maintenanceEvents]);
+
   return (
     <div className="space-y-6">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-text-bright">Registry Contacts</h1>
+          <h1 className="text-2xl font-bold text-text-bright">Registry</h1>
           <p className="text-sm text-muted mt-1">
             Quick contact for registry operators — click email to launch your mail client
           </p>
         </div>
-        <div className="flex items-center gap-2 text-xs text-muted">
+        <div className="flex items-center gap-3 text-xs text-muted">
           <span>{REGISTRY_OPERATORS.length} registries</span>
           {registryAlerts.length > 0 && (
             <span className="badge bg-orange/10 border-orange/30 text-orange">
               {registryAlerts.length} registry-related alert{registryAlerts.length !== 1 ? 's' : ''}
             </span>
           )}
+          <button
+            onClick={loadHealthData}
+            disabled={loadingHealth}
+            className="px-3 py-1.5 text-xs font-medium rounded-md border border-border text-muted hover:text-text-bright hover:bg-surface-hover disabled:opacity-40 transition-colors"
+          >
+            {loadingHealth ? 'Loading...' : 'Load Health Data'}
+          </button>
         </div>
       </div>
 
@@ -139,8 +169,12 @@ export default function RegistryContactsPage() {
       )}
 
       {/* Registry Health Banner */}
-      {healthData && healthData.last_updated && (
+      {healthData && healthData.last_updated ? (
         <RegistryHealthBanner healthData={healthData} />
+      ) : !healthData && (
+        <div className="bg-surface border border-border rounded-lg px-5 py-3 text-xs text-muted">
+          Click &ldquo;Load Health Data&rdquo; to load registry health metrics
+        </div>
       )}
 
       {/* Search & Filter */}
@@ -175,6 +209,7 @@ export default function RegistryContactsPage() {
             alertCount={alertsByOperator[op.id]?.length || 0}
             alerts={alertsByOperator[op.id] || []}
             health={healthData?.operators[op.id] || null}
+            maintenance={maintenanceByOperator[op.id] || []}
             isSelected={selectedOperator?.id === op.id}
             onSelect={() => setSelectedOperator(selectedOperator?.id === op.id ? null : op)}
           />
@@ -193,6 +228,7 @@ export default function RegistryContactsPage() {
           operator={selectedOperator}
           alerts={alertsByOperator[selectedOperator.id] || []}
           health={healthData?.operators[selectedOperator.id] || null}
+          maintenance={maintenanceByOperator[selectedOperator.id] || []}
           onClose={() => setSelectedOperator(null)}
         />
       )}
@@ -202,11 +238,12 @@ export default function RegistryContactsPage() {
 
 /* ── Operator Card ── */
 
-function OperatorCard({ operator, alertCount, alerts, health, isSelected, onSelect }: {
+function OperatorCard({ operator, alertCount, alerts, health, maintenance, isSelected, onSelect }: {
   operator: RegistryOperator;
   alertCount: number;
   alerts: RegistryAlert[];
   health: RegistryHealthOperator | null;
+  maintenance: MaintenanceEvent[];
   isSelected: boolean;
   onSelect: () => void;
 }) {
@@ -217,6 +254,7 @@ function OperatorCard({ operator, alertCount, alerts, health, isSelected, onSele
     <div
       className={`stat-card cursor-pointer ${
         alertCount > 0 ? 'border-orange/40 bg-orange/5' :
+        maintenance.length > 0 ? 'border-yellow/40 bg-yellow/5' :
         health?.status === 'down' ? 'border-red/40 bg-red/5' :
         health?.status === 'degraded' ? 'border-orange/40 bg-orange/5' : ''
       } ${isSelected ? 'ring-2 ring-accent' : ''}`}
@@ -229,6 +267,11 @@ function OperatorCard({ operator, alertCount, alerts, health, isSelected, onSele
             {alertCount > 0 && (
               <span className="badge bg-orange/10 border-orange/30 text-orange text-[10px] flex-shrink-0">
                 {alertCount} alert{alertCount !== 1 ? 's' : ''}
+              </span>
+            )}
+            {maintenance.length > 0 && (
+              <span className="badge bg-yellow/10 border-yellow/30 text-yellow text-[10px] flex-shrink-0">
+                Maint Active
               </span>
             )}
           </div>
@@ -477,10 +520,11 @@ const RESP_CODE_DESC: Record<string, string> = {
 
 /* ── Operator Detail Modal ── */
 
-function OperatorDetailModal({ operator, alerts, health, onClose }: {
+function OperatorDetailModal({ operator, alerts, health, maintenance, onClose }: {
   operator: RegistryOperator;
   alerts: RegistryAlert[];
   health: RegistryHealthOperator | null;
+  maintenance: MaintenanceEvent[];
   onClose: () => void;
 }) {
   useEffect(() => {
@@ -495,6 +539,26 @@ function OperatorDetailModal({ operator, alerts, health, onClose }: {
     document.body.style.overflow = 'hidden';
     return () => { document.body.style.overflow = ''; };
   }, []);
+
+  const [trendsData, setTrendsData] = useState<any>(null);
+  const [trendsLoading, setTrendsLoading] = useState(false);
+  const [trendsError, setTrendsError] = useState<string | null>(null);
+  const [trendsRange, setTrendsRange] = useState(86400);
+
+  const loadTrends = async (seconds: number) => {
+    setTrendsLoading(true);
+    setTrendsError(null);
+    setTrendsRange(seconds);
+    try {
+      const data = await fetchRegistryTrends(operator.id, seconds);
+      setTrendsData(data);
+    } catch (err: any) {
+      setTrendsError(err.message || 'Failed to load trends');
+      setTrendsData(null);
+    } finally {
+      setTrendsLoading(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-[100] flex items-start justify-center">
@@ -561,6 +625,34 @@ function OperatorDetailModal({ operator, alerts, health, onClose }: {
                   </div>
                 );
               })}
+            </div>
+          )}
+
+          {/* Active Maintenance Windows */}
+          {maintenance.length > 0 && (
+            <div className="bg-yellow/5 border border-yellow/30 rounded-lg px-4 py-3 space-y-2">
+              <h3 className="text-xs font-medium text-yellow">
+                {maintenance.length} Active Maintenance Window{maintenance.length !== 1 ? 's' : ''}
+              </h3>
+              {maintenance.map(m => (
+                <div key={m.id} className="flex items-center gap-2 text-xs">
+                  <div className="w-2 h-2 rounded-full bg-yellow flex-shrink-0 animate-pulse" />
+                  <a
+                    href={m.permalink}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-text-bright hover:text-accent truncate flex-1"
+                  >
+                    {m.title}
+                  </a>
+                  <span className="text-muted">{m.vendor}</span>
+                  {m.end_time && (
+                    <span className="text-muted">
+                      until {new Date(m.end_time).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })}
+                    </span>
+                  )}
+                </div>
+              ))}
             </div>
           )}
 
@@ -649,6 +741,42 @@ function OperatorDetailModal({ operator, alerts, health, onClose }: {
               )}
             </div>
           )}
+
+          {/* Performance Trends */}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-medium text-text-bright">Performance Trends</h3>
+              <div className="flex gap-1">
+                {[{ label: '5m', secs: 300 }, { label: '15m', secs: 900 }, { label: '30m', secs: 1800 }, { label: '1h', secs: 3600 }, { label: '6h', secs: 21600 }, { label: '24h', secs: 86400 }, { label: '7d', secs: 604800 }].map(opt => (
+                  <button
+                    key={opt.secs}
+                    onClick={() => loadTrends(opt.secs)}
+                    className={`px-2.5 py-1 rounded-md text-[10px] font-medium transition-colors ${
+                      trendsRange === opt.secs && trendsData
+                        ? 'bg-accent text-bg'
+                        : 'border border-border text-muted hover:text-text hover:bg-surface-hover'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {trendsLoading && (
+              <div className="text-xs text-muted text-center py-6">Loading trends...</div>
+            )}
+            {trendsError && (
+              <div className="text-xs text-red text-center py-4">{trendsError}</div>
+            )}
+            {trendsData && trendsData.buckets && !trendsLoading && (
+              <TrendsTable buckets={trendsData.buckets} />
+            )}
+            {!trendsData && !trendsLoading && !trendsError && (
+              <div className="text-xs text-muted text-center py-6 bg-bg/40 border border-border rounded-lg">
+                Click a time range above to load performance trends.
+              </div>
+            )}
+          </div>
 
           {/* All Contacts */}
           <div className="space-y-3">
@@ -744,6 +872,91 @@ function ContactRow({ operator, contact }: { operator: RegistryOperator; contact
             Email
           </a>
         )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Trends Chart ── */
+
+function TrendsTable({ buckets }: { buckets: Array<{ timestamp: string; avg_response_ms: number; error_rate: number; request_count: number }> }) {
+  if (!buckets.length) return <div className="text-xs text-muted text-center py-4">No data for this time range.</div>;
+
+  // Summary stats across all buckets
+  const totalRequests = buckets.reduce((s, b) => s + b.request_count, 0);
+  const weightedMs = buckets.reduce((s, b) => s + b.avg_response_ms * b.request_count, 0);
+  const avgMs = totalRequests > 0 ? weightedMs / totalRequests : 0;
+  const maxMs = Math.max(...buckets.map(b => b.avg_response_ms));
+  const totalErrors = buckets.reduce((s, b) => s + Math.round(b.error_rate * b.request_count), 0);
+  const overallErrorRate = totalRequests > 0 ? totalErrors / totalRequests : 0;
+
+  const formatTime = (ts: string) => {
+    try {
+      const d = new Date(ts);
+      return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+    } catch { return ts; }
+  };
+
+  return (
+    <div className="space-y-3">
+      {/* Summary Cards */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div className="bg-bg/40 border border-border rounded-lg px-3 py-2 text-center">
+          <div className="text-[10px] text-muted uppercase">Avg Response</div>
+          <div className="text-sm font-bold text-text-bright">{avgMs.toFixed(0)}ms</div>
+          <div className="text-[10px] text-muted">peak: {maxMs.toFixed(0)}ms</div>
+        </div>
+        <div className="bg-bg/40 border border-border rounded-lg px-3 py-2 text-center">
+          <div className="text-[10px] text-muted uppercase">Requests</div>
+          <div className="text-sm font-bold text-text-bright">{totalRequests.toLocaleString()}</div>
+          <div className="text-[10px] text-muted">{buckets.length} buckets</div>
+        </div>
+        <div className="bg-bg/40 border border-border rounded-lg px-3 py-2 text-center">
+          <div className="text-[10px] text-muted uppercase">Error Rate</div>
+          <div className={`text-sm font-bold ${overallErrorRate > 0.1 ? 'text-red' : overallErrorRate > 0.01 ? 'text-orange' : 'text-green'}`}>
+            {(overallErrorRate * 100).toFixed(1)}%
+          </div>
+          <div className="text-[10px] text-muted">{totalErrors} errors</div>
+        </div>
+        <div className="bg-bg/40 border border-border rounded-lg px-3 py-2 text-center">
+          <div className="text-[10px] text-muted uppercase">Status</div>
+          <div className={`text-sm font-bold ${overallErrorRate > 0.1 ? 'text-red' : overallErrorRate > 0.01 ? 'text-orange' : 'text-green'}`}>
+            {overallErrorRate > 0.1 ? 'DEGRADED' : overallErrorRate > 0.01 ? 'WARNING' : 'HEALTHY'}
+          </div>
+        </div>
+      </div>
+
+      {/* Bucket Table */}
+      <div className="bg-bg/40 border border-border rounded-lg overflow-hidden">
+        <div className="max-h-[200px] overflow-y-auto">
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 bg-surface">
+              <tr className="border-b border-border">
+                <th className="text-left px-3 py-1.5 text-muted font-medium">Time</th>
+                <th className="text-right px-3 py-1.5 text-muted font-medium">Avg (ms)</th>
+                <th className="text-right px-3 py-1.5 text-muted font-medium">Requests</th>
+                <th className="text-right px-3 py-1.5 text-muted font-medium">Errors</th>
+              </tr>
+            </thead>
+            <tbody>
+              {buckets.map((b, i) => {
+                const errPct = (b.error_rate * 100);
+                return (
+                  <tr key={i} className="border-b border-border/30 hover:bg-surface-hover/50">
+                    <td className="px-3 py-1 text-muted font-mono">{formatTime(b.timestamp)}</td>
+                    <td className={`px-3 py-1 text-right font-mono ${b.avg_response_ms > avgMs * 2 ? 'text-orange' : 'text-text-bright'}`}>
+                      {b.avg_response_ms.toFixed(0)}
+                    </td>
+                    <td className="px-3 py-1 text-right font-mono text-text-bright">{b.request_count}</td>
+                    <td className={`px-3 py-1 text-right font-mono ${errPct > 10 ? 'text-red' : errPct > 1 ? 'text-orange' : 'text-green'}`}>
+                      {errPct.toFixed(1)}%
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );

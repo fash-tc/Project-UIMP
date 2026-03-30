@@ -7,6 +7,8 @@ interface UserProfile {
   display_name: string;
   jira_email: string;
   has_jira_token: boolean;
+  jira_connected: boolean;
+  jira_oauth_email: string;
   created_at: string;
 }
 
@@ -21,19 +23,36 @@ export default function SettingsPage() {
   const [pwMsg, setPwMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [pwLoading, setPwLoading] = useState(false);
 
-  // Jira config
-  const [jiraEmail, setJiraEmail] = useState('');
-  const [jiraToken, setJiraToken] = useState('');
+  // Jira
   const [jiraMsg, setJiraMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
-  const [jiraLoading, setJiraLoading] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
 
   useEffect(() => {
-    fetch('/api/runbook/auth/me')
+    // Check for OAuth callback params from URL
+    const params = new URLSearchParams(window.location.search);
+    const connected = params.get('jira_connected');
+    const jiraError = params.get('jira_error');
+    if (connected === 'true') {
+      setJiraMsg({ type: 'ok', text: 'Jira account connected successfully!' });
+      // Clean URL
+      window.history.replaceState({}, '', window.location.pathname);
+    } else if (jiraError) {
+      const errorMessages: Record<string, string> = {
+        'access_denied': 'You denied the Jira authorization request',
+        'token_exchange_failed': 'Failed to exchange authorization code — please try again',
+        'invalid_state': 'Authorization session expired — please try again',
+        'missing_params': 'Missing authorization parameters — please try again',
+        'auth_required': 'Please log in first, then connect your Jira account',
+      };
+      setJiraMsg({ type: 'err', text: errorMessages[jiraError] || `Authorization error: ${jiraError}` });
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+
+    fetch('/api/auth/me')
       .then((r) => r.json())
       .then((data) => {
         if (data.username) {
           setProfile(data);
-          setJiraEmail(data.jira_email || '');
         }
       })
       .catch(() => {})
@@ -53,7 +72,7 @@ export default function SettingsPage() {
     }
     setPwLoading(true);
     try {
-      const res = await fetch('/api/runbook/auth/change-password', {
+      const res = await fetch('/api/auth/change-password', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ current_password: currentPw, new_password: newPw }),
@@ -74,30 +93,29 @@ export default function SettingsPage() {
     }
   }
 
-  async function handleJiraConfig(e: React.FormEvent) {
-    e.preventDefault();
+  function handleJiraConnect() {
+    // Navigate to the OAuth start endpoint — auth-api will redirect to Atlassian
+    window.location.href = '/api/auth/jira/connect';
+  }
+
+  async function handleJiraDisconnect() {
+    setDisconnecting(true);
     setJiraMsg(null);
-    setJiraLoading(true);
     try {
-      const res = await fetch('/api/runbook/auth/jira-config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jira_email: jiraEmail, jira_api_token: jiraToken }),
-      });
+      const res = await fetch('/api/auth/jira/disconnect', { method: 'POST' });
       const data = await res.json();
       if (res.ok && data.ok) {
-        setJiraMsg({ type: 'ok', text: 'Jira configuration saved' });
-        setJiraToken('');
+        setJiraMsg({ type: 'ok', text: 'Jira account disconnected' });
         setProfile((prev) =>
-          prev ? { ...prev, jira_email: jiraEmail, has_jira_token: data.has_jira_token } : prev,
+          prev ? { ...prev, jira_connected: false, jira_oauth_email: '', has_jira_token: false } : prev,
         );
       } else {
-        setJiraMsg({ type: 'err', text: data.error || 'Failed' });
+        setJiraMsg({ type: 'err', text: data.error || 'Failed to disconnect' });
       }
     } catch {
       setJiraMsg({ type: 'err', text: 'Network error' });
     } finally {
-      setJiraLoading(false);
+      setDisconnecting(false);
     }
   }
 
@@ -206,27 +224,19 @@ export default function SettingsPage() {
       <div className="bg-surface border border-border rounded-lg p-5">
         <div className="flex items-center justify-between mb-1">
           <h2 className="text-sm font-semibold text-text-bright">Jira Integration</h2>
-          {profile.has_jira_token ? (
+          {profile.jira_connected ? (
             <span className="text-[10px] px-2 py-0.5 rounded-full bg-green/15 border border-green/30 text-green">
-              Configured
+              Connected
             </span>
           ) : (
             <span className="text-[10px] px-2 py-0.5 rounded-full bg-orange/15 border border-orange/30 text-orange">
-              Not configured
+              Not connected
             </span>
           )}
         </div>
         <p className="text-[11px] text-muted mb-3">
-          Connect your Jira account so incidents you create are attributed to you.
-          Generate an API token at{' '}
-          <a
-            href="https://id.atlassian.com/manage-profile/security/api-tokens"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-accent hover:underline"
-          >
-            id.atlassian.com
-          </a>
+          Connect your Atlassian account so incidents you create are attributed to you.
+          No API tokens needed — just click the button and authorize.
         </p>
         {jiraMsg && (
           <div
@@ -239,39 +249,54 @@ export default function SettingsPage() {
             {jiraMsg.text}
           </div>
         )}
-        <form onSubmit={handleJiraConfig} className="space-y-3">
-          <div>
-            <label className="text-[10px] text-muted block mb-1">Jira Email</label>
-            <input
-              type="email"
-              value={jiraEmail}
-              onChange={(e) => setJiraEmail(e.target.value)}
-              placeholder="you@tucows.com"
-              className="w-full bg-bg border border-border rounded-md px-3 py-2 text-sm text-text-bright font-mono placeholder:text-muted/50 focus:outline-none focus:border-accent/50"
-            />
+
+        {profile.jira_connected ? (
+          <div className="space-y-3">
+            <div className="flex items-center gap-3 p-3 bg-bg rounded-md border border-border">
+              <div className="w-8 h-8 rounded-full bg-blue-500/20 border border-blue-500/40 flex items-center justify-center">
+                <svg className="w-4 h-4 text-blue-400" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M11.571 11.513H0a5.218 5.218 0 0 0 5.232 5.215h2.13v2.057A5.215 5.215 0 0 0 12.575 24V12.518a1.005 1.005 0 0 0-1.005-1.005zm5.723-5.756H5.736a5.215 5.215 0 0 0 5.215 5.214h2.129v2.058a5.218 5.218 0 0 0 5.215 5.214V6.758a1.001 1.001 0 0 0-1.001-1.001zM23.013 0H11.455a5.215 5.215 0 0 0 5.215 5.215h2.129v2.057A5.215 5.215 0 0 0 24.013 12.487V1.005A1.005 1.005 0 0 0 23.013 0z"/>
+                </svg>
+              </div>
+              <div className="flex-1">
+                <div className="text-sm text-text-bright font-medium">
+                  {profile.jira_oauth_email || 'Atlassian Account'}
+                </div>
+                <div className="text-[10px] text-muted">Jira account linked — tickets will be created under your identity</div>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={handleJiraConnect}
+                className="px-3 py-1.5 text-xs font-medium rounded-md bg-surface border border-border text-muted hover:text-text-bright hover:border-accent/50 transition-colors"
+              >
+                Reconnect
+              </button>
+              <button
+                onClick={handleJiraDisconnect}
+                disabled={disconnecting}
+                className="px-3 py-1.5 text-xs font-medium rounded-md bg-red/10 border border-red/30 text-red hover:bg-red/20 disabled:opacity-40 transition-colors"
+              >
+                {disconnecting ? 'Disconnecting...' : 'Disconnect'}
+              </button>
+            </div>
           </div>
-          <div>
-            <label className="text-[10px] text-muted block mb-1">
-              API Token {profile.has_jira_token && <span className="text-muted/50">(leave blank to keep existing)</span>}
-            </label>
-            <input
-              type="password"
-              value={jiraToken}
-              onChange={(e) => setJiraToken(e.target.value)}
-              placeholder={profile.has_jira_token ? '••••••••••••' : 'Paste your Jira API token'}
-              className="w-full bg-bg border border-border rounded-md px-3 py-2 text-sm text-text-bright font-mono placeholder:text-muted/50 focus:outline-none focus:border-accent/50"
-            />
-          </div>
-          <div className="flex justify-end">
+        ) : (
+          <div className="space-y-3">
             <button
-              type="submit"
-              disabled={jiraLoading || !jiraEmail}
-              className="px-4 py-1.5 text-xs font-medium rounded-md bg-accent text-white hover:bg-accent-hover disabled:opacity-40 transition-colors"
+              onClick={handleJiraConnect}
+              className="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium rounded-md bg-[#0052CC] text-white hover:bg-[#0065FF] transition-colors"
             >
-              {jiraLoading ? 'Saving...' : 'Save Jira Config'}
+              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M11.571 11.513H0a5.218 5.218 0 0 0 5.232 5.215h2.13v2.057A5.215 5.215 0 0 0 12.575 24V12.518a1.005 1.005 0 0 0-1.005-1.005zm5.723-5.756H5.736a5.215 5.215 0 0 0 5.215 5.214h2.129v2.058a5.218 5.218 0 0 0 5.215 5.214V6.758a1.001 1.001 0 0 0-1.001-1.001zM23.013 0H11.455a5.215 5.215 0 0 0 5.215 5.215h2.129v2.057A5.215 5.215 0 0 0 24.013 12.487V1.005A1.005 1.005 0 0 0 23.013 0z"/>
+              </svg>
+              Connect Jira Account
             </button>
+            <p className="text-[10px] text-muted text-center">
+              You&apos;ll be redirected to Atlassian to authorize access. UIP will only be able to create and read Jira issues.
+            </p>
           </div>
-        </form>
+        )}
       </div>
     </div>
   );

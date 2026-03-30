@@ -1,24 +1,8 @@
 'use client';
 
 import { useEffect, useState, useCallback, useMemo } from 'react';
-import { fetchRegistryHealth, RegistryHealthData, RegistryHealthOperator } from '@/lib/keep-api';
-import { REGISTRY_OPERATORS } from '@/lib/registry-contacts';
-
-interface MaintenanceEvent {
-  id: number;
-  source_type: string;
-  title: string;
-  summary: string | null;
-  vendor: string;
-  severity: string | null;
-  start_time: string;
-  end_time: string | null;
-  impact: string | null;
-  status: string | null;
-  permalink: string;
-  ingested_at: string;
-  event_type: string;
-}
+import { fetchRegistryHealth, RegistryHealthData, RegistryHealthOperator, MaintenanceEvent, fetchMaintenanceEvents } from '@/lib/keep-api';
+import { REGISTRY_OPERATORS } from '@/lib/registry';
 
 interface ApiResponse {
   count: number;
@@ -163,10 +147,8 @@ export default function MaintenancePage() {
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch('/api/maintenance/active-now');
-      if (!res.ok) throw new Error(`API returned ${res.status}`);
-      const data: ApiResponse = await res.json();
-      setEvents(data.results || []);
+      const results = await fetchMaintenanceEvents();
+      setEvents(results);
       setLastUpdated(new Date());
       setError(null);
     } catch (e: unknown) {

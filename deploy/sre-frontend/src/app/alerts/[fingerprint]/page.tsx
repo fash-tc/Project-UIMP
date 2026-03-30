@@ -2,12 +2,10 @@
 
 import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
-import { Alert, AIEnrichment, SREFeedback, RunbookEntry, AlertState } from '@/lib/types';
+import { Alert, AIEnrichment, RunbookEntry, AlertState, SREFeedbackEntry, RunbookExclusion } from '@/lib/types';
 import {
   fetchAlertByFingerprint,
   parseAIEnrichment,
-  parseSREFeedback,
-  submitFeedback,
   severityColor,
   severityBg,
   timeAgo,
@@ -22,7 +20,23 @@ import {
   acknowledgeAlerts,
   unacknowledgeAlerts,
   getSourceLabel,
+  storeIncidentState,
+  submitRunbookFeedback,
+  fetchRunbookFeedback,
+  fetchSREFeedback,
+  submitSREFeedback,
+  updateSREFeedback,
+  deleteSREFeedback,
+  voteSREFeedback,
+  fetchRunbookExclusions,
+  createRunbookExclusion,
+  deleteRunbookExclusion,
+  deleteRunbookEntry,
+  MaintenanceEvent,
+  fetchMaintenanceEvents,
 } from '@/lib/keep-api';
+import { detectRegistryFromAlert, matchMaintenanceToOperators } from '@/lib/registry';
+import { RunbookFeedback } from '@/lib/types';
 import { getClientUsername } from '@/lib/auth';
 
 export default function AlertDetail() {
@@ -31,6 +45,7 @@ export default function AlertDetail() {
   const [alert, setAlert] = useState<Alert | null>(null);
   const [alertState, setAlertState] = useState<AlertState | undefined>(undefined);
   const [loading, setLoading] = useState(true);
+  const [maintenanceEvents, setMaintenanceEvents] = useState<MaintenanceEvent[]>([]);
 
   const loadAlert = () => {
     if (!fingerprint) return;
@@ -74,6 +89,10 @@ export default function AlertDetail() {
     loadAlert();
   }, [fingerprint]);
 
+  useEffect(() => {
+    fetchMaintenanceEvents().then(setMaintenanceEvents);
+  }, []);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -95,6 +114,13 @@ export default function AlertDetail() {
 
   const enrichment = parseAIEnrichment(alert.note);
   const host = alert.hostName || alert.hostname || 'Unknown';
+  const registryMatch = detectRegistryFromAlert(alert.name, host, alert.description);
+  const matchedMaintenance = registryMatch
+    ? maintenanceEvents.filter(m => {
+        const ops = matchMaintenanceToOperators(m.vendor, m.title);
+        return ops.includes(registryMatch.operator.id);
+      })
+    : [];
   const source = getSourceLabel(alert);
 
   return (
@@ -142,6 +168,45 @@ export default function AlertDetail() {
         <div className="stat-card border-accent/20">
           <h3 className="text-sm font-medium text-muted mb-2">Alert Details</h3>
           <p className="text-sm text-text-bright font-mono">{alert.description}</p>
+        </div>
+      )}
+
+      {/* Active Maintenance Window */}
+      {matchedMaintenance.length > 0 && (
+        <div className="bg-yellow/5 border border-yellow/30 rounded-lg px-5 py-4 space-y-2">
+          <div className="flex items-center gap-2">
+            <svg className="w-4 h-4 text-yellow" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+            </svg>
+            <h3 className="text-sm font-medium text-yellow">Active Maintenance Window</h3>
+            <span className="text-xs text-muted">This alert may be related to scheduled maintenance</span>
+          </div>
+          {matchedMaintenance.map(m => (
+            <div key={m.id} className="flex items-center gap-3 bg-bg/40 rounded-md px-3 py-2">
+              <div className="flex-1 min-w-0">
+                <a
+                  href={m.permalink}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-sm text-text-bright hover:text-accent transition-colors"
+                >
+                  {m.title}
+                </a>
+                <div className="text-xs text-muted mt-0.5">
+                  {m.vendor}
+                  {m.end_time && ` — ends ${new Date(m.end_time).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })}`}
+                </div>
+              </div>
+              <a
+                href={m.permalink}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="px-2.5 py-1 rounded-md border border-yellow/30 text-yellow text-[10px] font-medium hover:bg-yellow/10 transition-colors flex-shrink-0"
+              >
+                View
+              </a>
+            </div>
+          ))}
         </div>
       )}
 
@@ -235,15 +300,12 @@ export default function AlertDetail() {
       )}
 
       {/* SRE Feedback Panel */}
-      {enrichment && (
-        <FeedbackPanel
-          fingerprint={fingerprint}
-          currentNote={alert.note}
-          existingFeedback={parseSREFeedback(alert.note)}
-          enrichment={enrichment}
-          onFeedbackSubmitted={loadAlert}
-        />
-      )}
+      <FeedbackPanel
+        fingerprint={fingerprint}
+        alertName={alert.name || ''}
+        enrichment={enrichment}
+        onFeedbackSubmitted={loadAlert}
+      />
 
       {/* Runbook & Remediation */}
       <RunbookPanel alert={alert} />
@@ -303,63 +365,114 @@ function DetailCard({ title, content, icon }: { title: string; content: string; 
 
 function FeedbackPanel({
   fingerprint,
-  currentNote,
-  existingFeedback,
+  alertName,
   enrichment,
   onFeedbackSubmitted,
 }: {
   fingerprint: string;
-  currentNote: string | undefined | null;
-  existingFeedback: SREFeedback | null;
-  enrichment: { assessed_severity: string; noise_score: number };
+  alertName: string;
+  enrichment: { assessed_severity: string; noise_score: number } | null;
   onFeedbackSubmitted?: () => void;
 }) {
-  const [rating, setRating] = useState<'positive' | 'negative' | null>(
-    existingFeedback?.rating === 'positive' ? 'positive' :
-    existingFeedback?.rating ? 'negative' : null
-  );
-  const [correctedSeverity, setCorrectedSeverity] = useState(
-    existingFeedback?.corrected_severity ?? ''
-  );
-  const [correctedNoise, setCorrectedNoise] = useState(
-    existingFeedback?.corrected_noise?.toString() ?? ''
-  );
-  const [comment, setComment] = useState(existingFeedback?.comment ?? '');
-  const [sreUser] = useState(() => existingFeedback?.sre_user || getClientUsername() || '');
+  const [entries, setEntries] = useState<SREFeedbackEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [rating, setRating] = useState<'positive' | 'negative' | null>(null);
+  const [correctedSeverity, setCorrectedSeverity] = useState('');
+  const [correctedNoise, setCorrectedNoise] = useState('');
+  const [comment, setComment] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const [submitted, setSubmitted] = useState(!!existingFeedback);
-  const [editing, setEditing] = useState(false);
-  const [justSubmitted, setJustSubmitted] = useState(false);
   const [submitError, setSubmitError] = useState(false);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editRating, setEditRating] = useState<string>('');
+  const [editSeverity, setEditSeverity] = useState('');
+  const [editNoise, setEditNoise] = useState('');
+  const [editComment, setEditComment] = useState('');
+  const [currentUser] = useState(() => getClientUsername() || '');
+
+  const loadEntries = () => {
+    fetchSREFeedback(fingerprint).then(data => {
+      setEntries(data);
+      setLoading(false);
+    });
+  };
+
+  useEffect(() => { loadEntries(); }, [fingerprint]);
 
   async function handleSubmit() {
     if (!rating) return;
     setSubmitting(true);
     setSubmitError(false);
-
-    const feedback: SREFeedback = {
-      rating: rating === 'negative' && !correctedSeverity && !correctedNoise ? 'negative' :
-              rating === 'negative' ? 'correction' : 'positive',
+    const result = await submitSREFeedback({
+      fingerprint,
+      alert_name: alertName,
+      rating: rating === 'negative' && (correctedSeverity || correctedNoise) ? 'correction' : rating,
       corrected_severity: correctedSeverity || undefined,
       corrected_noise: correctedNoise ? parseInt(correctedNoise, 10) : undefined,
-      comment: comment.slice(0, 500) || undefined,
-      sre_user: sreUser || undefined,
-    };
-
-    const ok = await submitFeedback(fingerprint, currentNote, feedback);
+      comment: comment.slice(0, 2000) || undefined,
+    });
     setSubmitting(false);
-    if (ok) {
-      setSubmitted(true);
-      setEditing(false);
-      setJustSubmitted(true);
-      // Refresh the alert data to reflect the stored feedback
-      if (onFeedbackSubmitted) {
-        setTimeout(onFeedbackSubmitted, 500);
-      }
+    if (result) {
+      setRating(null);
+      setCorrectedSeverity('');
+      setCorrectedNoise('');
+      setComment('');
+      loadEntries();
+      if (onFeedbackSubmitted) setTimeout(onFeedbackSubmitted, 500);
     } else {
       setSubmitError(true);
     }
   }
+
+  async function handleVote(id: number, vote: 'up' | 'down') {
+    const entry = entries.find(e => e.id === id);
+    if (!entry) return;
+    const newVote = entry.user_vote === vote ? 'none' : vote;
+    // Optimistic update
+    setEntries(prev => prev.map(e => {
+      if (e.id !== id) return e;
+      const scoreDelta = (newVote === 'none' ? 0 : (newVote === 'up' ? 1 : -1))
+        - (e.user_vote === 'up' ? 1 : e.user_vote === 'down' ? -1 : 0);
+      return { ...e, user_vote: newVote === 'none' ? null : newVote as 'up' | 'down', vote_score: e.vote_score + scoreDelta };
+    }));
+    const ok = await voteSREFeedback(id, newVote as 'up' | 'down' | 'none');
+    if (!ok) loadEntries(); // Revert on failure
+  }
+
+  async function handleDelete(id: number, user: string) {
+    if (!confirm(`Delete this feedback from ${user}?`)) return;
+    const ok = await deleteSREFeedback(id);
+    if (ok) {
+      setEntries(prev => prev.filter(e => e.id !== id));
+    }
+  }
+
+  function startEdit(entry: SREFeedbackEntry) {
+    setEditingId(entry.id);
+    setEditRating(entry.rating || '');
+    setEditSeverity(entry.corrected_severity || '');
+    setEditNoise(entry.corrected_noise?.toString() || '');
+    setEditComment(entry.comment || '');
+  }
+
+  async function handleEditSave() {
+    if (!editingId) return;
+    const ok = await updateSREFeedback(editingId, {
+      rating: editRating || undefined,
+      corrected_severity: editSeverity || undefined,
+      corrected_noise: editNoise ? parseInt(editNoise, 10) : undefined,
+      comment: editComment || undefined,
+    });
+    if (ok) {
+      setEditingId(null);
+      loadEntries();
+    }
+  }
+
+  const ratingBadge = (r: string) => {
+    if (r === 'positive') return <span className="px-1.5 py-0.5 rounded text-[10px] bg-green/10 border border-green/30 text-green">Accurate</span>;
+    if (r === 'correction') return <span className="px-1.5 py-0.5 rounded text-[10px] bg-orange/10 border border-orange/30 text-orange">Correction</span>;
+    return <span className="px-1.5 py-0.5 rounded text-[10px] bg-red/10 border border-red/30 text-red">Needs Fix</span>;
+  };
 
   return (
     <div className="stat-card border-accent/20">
@@ -368,171 +481,222 @@ function FeedbackPanel({
         <span className="text-xs text-muted">Help improve AI analysis</span>
       </div>
 
-      {/* Confirmation banner */}
-      {justSubmitted && (
-        <div className="bg-green/10 border border-green/30 rounded-lg px-4 py-3 mb-4">
-          <div className="flex items-start gap-3">
-            <span className="text-green text-lg leading-none">{'\u2713'}</span>
-            <div>
-              <div className="text-sm font-medium text-green">Feedback submitted successfully</div>
-              <div className="text-xs text-muted mt-1">
-                Your feedback has been saved and will be ingested by the AI enricher on the next analysis cycle (~60s).
-                {rating === 'negative' && ' The AI will apply your corrections when analyzing similar alerts in the future.'}
-              </div>
-            </div>
+      {/* Existing feedback entries */}
+      {loading ? (
+        <div className="text-xs text-muted animate-pulse mb-3">Loading feedback...</div>
+      ) : entries.length > 0 ? (
+        <div className="space-y-2 mb-4">
+          <div className="text-[10px] text-muted uppercase tracking-wider">
+            Feedback from SRE team ({entries.length})
           </div>
-        </div>
-      )}
+          {entries.map(entry => (
+            <div key={entry.id} className="bg-bg rounded-md p-2.5 border border-border">
+              {editingId === entry.id ? (
+                /* Inline edit form */
+                <div className="space-y-2">
+                  <div className="grid grid-cols-2 gap-2">
+                    <select value={editRating} onChange={e => setEditRating(e.target.value)}
+                      className="bg-surface border border-border rounded px-2 py-1 text-xs text-text">
+                      <option value="positive">Accurate</option>
+                      <option value="negative">Needs correction</option>
+                      <option value="correction">Correction</option>
+                    </select>
+                    <select value={editSeverity} onChange={e => setEditSeverity(e.target.value)}
+                      className="bg-surface border border-border rounded px-2 py-1 text-xs text-text">
+                      <option value="">No severity correction</option>
+                      <option value="critical">Critical</option>
+                      <option value="high">High</option>
+                      <option value="warning">Warning</option>
+                      <option value="low">Low</option>
+                      <option value="info">Info</option>
+                    </select>
+                  </div>
+                  <textarea value={editComment} onChange={e => setEditComment(e.target.value)}
+                    maxLength={2000} rows={2}
+                    className="w-full bg-surface border border-border rounded px-2 py-1 text-xs text-text resize-none" />
+                  <div className="flex gap-2">
+                    <button onClick={handleEditSave}
+                      className="px-2 py-1 rounded bg-accent text-bg text-[10px] font-medium hover:bg-accent-hover">Save</button>
+                    <button onClick={() => setEditingId(null)}
+                      className="px-2 py-1 rounded border border-border text-muted text-[10px] hover:text-text">Cancel</button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="flex items-center gap-2 text-[10px] text-muted mb-1.5 flex-wrap">
+                    {ratingBadge(entry.rating)}
+                    <span>by {entry.user}</span>
+                    <span>{entry.created_at?.substring(0, 16).replace('T', ' ')}</span>
+                    {entry.corrected_severity && (
+                      <span className="text-orange">sev: {entry.corrected_severity}</span>
+                    )}
+                    {entry.corrected_noise != null && (
+                      <span className="text-orange">noise: {entry.corrected_noise}/10</span>
+                    )}
 
-      {/* Error banner */}
+                    {/* Vote buttons */}
+                    <div className="inline-flex items-center gap-0.5 ml-auto">
+                      <button
+                        onClick={() => handleVote(entry.id, 'up')}
+                        className={`p-0.5 rounded transition-colors ${
+                          entry.user_vote === 'up' ? 'text-green' : 'text-muted/30 hover:text-green/70'
+                        }`}
+                        title="Useful feedback"
+                      >
+                        <svg className="w-3.5 h-3.5" fill={entry.user_vote === 'up' ? 'currentColor' : 'none'} viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M14 9V5a3 3 0 00-3-3l-4 9v11h11.28a2 2 0 002-1.7l1.38-9a2 2 0 00-2-2.3H14z" />
+                        </svg>
+                      </button>
+                      <span className={`text-[10px] min-w-[16px] text-center ${
+                        entry.vote_score > 0 ? 'text-green' : entry.vote_score < 0 ? 'text-red' : 'text-muted/50'
+                      }`}>
+                        {entry.vote_score > 0 ? `+${entry.vote_score}` : entry.vote_score}
+                      </span>
+                      <button
+                        onClick={() => handleVote(entry.id, 'down')}
+                        className={`p-0.5 rounded transition-colors ${
+                          entry.user_vote === 'down' ? 'text-red' : 'text-muted/30 hover:text-red/70'
+                        }`}
+                        title="Not useful"
+                      >
+                        <svg className="w-3.5 h-3.5" fill={entry.user_vote === 'down' ? 'currentColor' : 'none'} viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M10 15v4a3 3 0 003 3l4-9V2H5.72a2 2 0 00-2 1.7l-1.38 9a2 2 0 002 2.3H10z" />
+                        </svg>
+                      </button>
+                    </div>
+
+                    {/* Edit (author only) */}
+                    {entry.user === currentUser && (
+                      <button onClick={() => startEdit(entry)}
+                        className="text-muted/30 hover:text-accent transition-colors" title="Edit">
+                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                        </svg>
+                      </button>
+                    )}
+
+                    {/* Delete (any SRE) */}
+                    <button onClick={() => handleDelete(entry.id, entry.user)}
+                      className="text-muted/30 hover:text-red transition-colors" title="Delete">
+                      <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                      </svg>
+                    </button>
+                  </div>
+                  {entry.comment && (
+                    <div className="text-xs text-text whitespace-pre-wrap">{entry.comment}</div>
+                  )}
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {/* Submit error */}
       {submitError && (
         <div className="bg-red/10 border border-red/30 rounded-lg px-4 py-3 mb-4">
           <div className="text-sm text-red">Failed to submit feedback. Please try again.</div>
         </div>
       )}
 
-      {submitted && !editing ? (
-        <div className="space-y-3">
-          <div className="flex items-center gap-3 text-sm">
-            <span className={`text-lg ${rating === 'positive' ? 'text-green' : 'text-red'}`}>
-              {rating === 'positive' ? '\u2713' : '\u2717'}
-            </span>
-            <span className="text-text">
-              {rating === 'positive' ? 'Analysis confirmed as accurate' : 'Analysis needs correction'}
-            </span>
-            {sreUser && (
-              <span className="text-muted text-xs">by {sreUser}</span>
-            )}
-          </div>
-          {(correctedSeverity || correctedNoise) && (
-            <div className="flex gap-4 text-xs text-muted">
-              {correctedSeverity && (
-                <span>Corrected severity: <span className={`font-medium ${severityColor(correctedSeverity)}`}>{correctedSeverity}</span></span>
-              )}
-              {correctedNoise && (
-                <span>Corrected noise: <span className="font-medium text-text">{correctedNoise}/10</span></span>
-              )}
-            </div>
-          )}
-          {comment && (
-            <div className="text-sm text-text bg-bg rounded-md p-2 border border-border">
-              {comment}
-            </div>
-          )}
+      {/* Add new feedback form */}
+      <div className="space-y-3">
+        <div className="text-[10px] text-muted uppercase tracking-wider">Add your feedback</div>
+
+        {/* Quick rating */}
+        <div className="flex gap-2">
           <button
-            onClick={() => { setEditing(true); setJustSubmitted(false); }}
-            className="text-xs text-accent hover:text-accent-hover transition-colors"
+            onClick={() => setRating(rating === 'positive' ? null : 'positive')}
+            className={`px-4 py-2 rounded-md border text-sm font-medium transition-all ${
+              rating === 'positive'
+                ? 'border-green bg-green/10 text-green'
+                : 'border-border text-muted hover:border-green/50 hover:text-green'
+            }`}
           >
-            Update feedback
+            &#x2713; Accurate
+          </button>
+          <button
+            onClick={() => setRating(rating === 'negative' ? null : 'negative')}
+            className={`px-4 py-2 rounded-md border text-sm font-medium transition-all ${
+              rating === 'negative'
+                ? 'border-red bg-red/10 text-red'
+                : 'border-border text-muted hover:border-red/50 hover:text-red'
+            }`}
+          >
+            &#x2717; Needs correction
           </button>
         </div>
-      ) : (
-        <div className="space-y-4">
-          {/* Quick rating */}
-          <div>
-            <div className="text-xs text-muted mb-2">Is this analysis accurate?</div>
-            <div className="flex gap-2">
-              <button
-                onClick={() => setRating('positive')}
-                className={`px-4 py-2 rounded-md border text-sm font-medium transition-all ${
-                  rating === 'positive'
-                    ? 'border-green bg-green/10 text-green'
-                    : 'border-border text-muted hover:border-green/50 hover:text-green'
-                }`}
+
+        {/* Correction fields */}
+        {rating === 'negative' && enrichment && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-muted block mb-1">Correct severity</label>
+              <select
+                value={correctedSeverity}
+                onChange={(e) => setCorrectedSeverity(e.target.value)}
+                className="w-full bg-bg border border-border rounded-md px-3 py-2 text-sm text-text focus:border-accent focus:outline-none"
               >
-                &#x2713; Accurate
-              </button>
-              <button
-                onClick={() => setRating('negative')}
-                className={`px-4 py-2 rounded-md border text-sm font-medium transition-all ${
-                  rating === 'negative'
-                    ? 'border-red bg-red/10 text-red'
-                    : 'border-border text-muted hover:border-red/50 hover:text-red'
-                }`}
+                <option value="">No change ({enrichment.assessed_severity})</option>
+                <option value="critical">Critical</option>
+                <option value="high">High</option>
+                <option value="warning">Warning</option>
+                <option value="low">Low</option>
+                <option value="info">Info</option>
+              </select>
+            </div>
+            <div>
+              <label className="text-xs text-muted block mb-1">Correct noise score</label>
+              <select
+                value={correctedNoise}
+                onChange={(e) => setCorrectedNoise(e.target.value)}
+                className="w-full bg-bg border border-border rounded-md px-3 py-2 text-sm text-text focus:border-accent focus:outline-none"
               >
-                &#x2717; Needs correction
-              </button>
+                <option value="">No change ({enrichment.noise_score}/10)</option>
+                {[1,2,3,4,5,6,7,8,9,10].map(n => (
+                  <option key={n} value={n}>{n}/10 {n <= 3 ? '(actionable)' : n >= 7 ? '(noise)' : ''}</option>
+                ))}
+              </select>
             </div>
           </div>
+        )}
 
-          {/* Correction fields — shown when negative */}
-          {rating === 'negative' && (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <div>
-                <label className="text-xs text-muted block mb-1">Correct severity</label>
-                <select
-                  value={correctedSeverity}
-                  onChange={(e) => setCorrectedSeverity(e.target.value)}
-                  className="w-full bg-bg border border-border rounded-md px-3 py-2 text-sm text-text focus:border-accent focus:outline-none"
-                >
-                  <option value="">No change ({enrichment.assessed_severity})</option>
-                  <option value="critical">Critical</option>
-                  <option value="high">High</option>
-                  <option value="warning">Warning</option>
-                  <option value="low">Low</option>
-                  <option value="info">Info</option>
-                </select>
-              </div>
-              <div>
-                <label className="text-xs text-muted block mb-1">Correct noise score</label>
-                <select
-                  value={correctedNoise}
-                  onChange={(e) => setCorrectedNoise(e.target.value)}
-                  className="w-full bg-bg border border-border rounded-md px-3 py-2 text-sm text-text focus:border-accent focus:outline-none"
-                >
-                  <option value="">No change ({enrichment.noise_score}/10)</option>
-                  {[1,2,3,4,5,6,7,8,9,10].map(n => (
-                    <option key={n} value={n}>{n}/10 {n <= 3 ? '(actionable)' : n >= 7 ? '(noise)' : ''}</option>
-                  ))}
-                </select>
-              </div>
-            </div>
-          )}
+        {/* Comment */}
+        {rating && (
+          <div>
+            <label className="text-xs text-muted block mb-1">
+              {rating === 'positive' ? 'Additional notes (optional)' : 'What should the AI learn from this?'}
+            </label>
+            <textarea
+              value={comment}
+              onChange={(e) => setComment(e.target.value)}
+              maxLength={2000}
+              rows={2}
+              placeholder={rating === 'positive'
+                ? 'Any additional context...'
+                : 'e.g. "This is a known maintenance window alert, noise score should be higher"'
+              }
+              className="w-full bg-bg border border-border rounded-md px-3 py-2 text-sm text-text placeholder-muted/50 focus:border-accent focus:outline-none resize-none"
+            />
+            <div className="text-xs text-muted text-right mt-1">{comment.length}/2000</div>
+          </div>
+        )}
 
-          {/* Comment */}
-          {rating && (
-            <div>
-              <label className="text-xs text-muted block mb-1">
-                {rating === 'positive' ? 'Additional notes (optional)' : 'What should the AI learn from this?'}
-              </label>
-              <textarea
-                value={comment}
-                onChange={(e) => setComment(e.target.value)}
-                maxLength={500}
-                rows={2}
-                placeholder={rating === 'positive'
-                  ? 'Any additional context...'
-                  : 'e.g. "This is a known maintenance window alert, noise score should be higher"'
-                }
-                className="w-full bg-bg border border-border rounded-md px-3 py-2 text-sm text-text placeholder-muted/50 focus:border-accent focus:outline-none resize-none"
-              />
-              <div className="text-xs text-muted text-right mt-1">{comment.length}/500</div>
-            </div>
-          )}
-
-          {/* Submit */}
-          {rating && (
-            <div className="flex items-end gap-3">
-              {sreUser && <span className="text-xs text-muted py-2">as {sreUser}</span>}
-              <button
-                onClick={handleSubmit}
-                disabled={submitting || !rating}
-                className="px-5 py-2 rounded-md bg-accent text-bg font-medium text-sm hover:bg-accent-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {submitting ? 'Submitting...' : 'Submit Feedback'}
-              </button>
-              {editing && (
-                <button
-                  onClick={() => setEditing(false)}
-                  className="px-3 py-2 rounded-md border border-border text-muted text-sm hover:text-text transition-colors"
-                >
-                  Cancel
-                </button>
-              )}
-            </div>
-          )}
-        </div>
-      )}
+        {/* Submit */}
+        {rating && (
+          <div className="flex items-end gap-3">
+            {currentUser && <span className="text-xs text-muted py-2">as {currentUser}</span>}
+            <button
+              onClick={handleSubmit}
+              disabled={submitting || !rating}
+              className="px-5 py-2 rounded-md bg-accent text-bg font-medium text-sm hover:bg-accent-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {submitting ? 'Submitting...' : 'Submit Feedback'}
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -813,6 +977,11 @@ function IncidentForm({ alert, enrichment, onCreated, onCancel }: {
 
     setSubmitting(false);
     if (result.ok && result.issueKey) {
+      try {
+        await storeIncidentState(alert.fingerprint, result.issueKey, result.issueUrl || '');
+      } catch {
+        // Best-effort — incident was already created in Jira
+      }
       onCreated(result.issueKey, result.issueUrl || '');
     } else {
       setError(result.error || 'Failed to create incident');
@@ -930,15 +1099,55 @@ function RunbookPanel({ alert }: { alert: Alert }) {
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [submitError, setSubmitError] = useState(false);
+  const [votes, setVotes] = useState<Map<string, 'up' | 'down'>>(new Map());
+  const [exclusions, setExclusions] = useState<RunbookExclusion[]>([]);
+  const [showExcluded, setShowExcluded] = useState(false);
 
   const host = alert.hostName || alert.hostname || '';
 
   useEffect(() => {
     setLoadingMatches(true);
     fetchRunbookMatches(alert.name, host || undefined)
-      .then(setMatches)
+      .then((entries) => {
+        setMatches(entries);
+        const entryIds = entries.map((e: RunbookEntry) => e.id).filter(Boolean) as number[];
+        if (entryIds.length > 0) {
+          fetchRunbookFeedback(entryIds, alert.fingerprint).then((feedback: RunbookFeedback[]) => {
+            const voteMap = new Map<string, 'up' | 'down'>();
+            for (const fb of feedback) {
+              voteMap.set(`${fb.runbook_entry_id}`, fb.vote);
+            }
+            setVotes(voteMap);
+          });
+        }
+      })
       .finally(() => setLoadingMatches(false));
+    fetchRunbookExclusions(alert.name).then(setExclusions);
   }, [alert.name, host]);
+
+  const handleVote = async (entryId: number, vote: 'up' | 'down') => {
+    const key = `${entryId}`;
+    const currentVote = votes.get(key);
+    const newVote = currentVote === vote ? 'none' : vote;
+
+    setVotes(prev => {
+      const next = new Map(prev);
+      if (newVote === 'none') next.delete(key);
+      else next.set(key, newVote as 'up' | 'down');
+      return next;
+    });
+
+    try {
+      await submitRunbookFeedback(alert.fingerprint, alert.name, entryId, newVote as 'up' | 'down' | 'none');
+    } catch {
+      setVotes(prev => {
+        const next = new Map(prev);
+        if (currentVote) next.set(key, currentVote);
+        else next.delete(key);
+        return next;
+      });
+    }
+  };
 
   async function handleSubmit() {
     if (!remediation.trim()) return;
@@ -959,11 +1168,27 @@ function RunbookPanel({ alert }: { alert: Alert }) {
     if (ok) {
       setSubmitted(true);
       setRemediation('');
-      fetchRunbookMatches(alert.name, host || undefined).then(setMatches);
+      fetchRunbookMatches(alert.name, host || undefined).then((entries) => {
+        setMatches(entries);
+        const entryIds = entries.map((e: RunbookEntry) => e.id).filter(Boolean) as number[];
+        if (entryIds.length > 0) {
+          fetchRunbookFeedback(entryIds, alert.fingerprint).then((feedback: RunbookFeedback[]) => {
+            const voteMap = new Map<string, 'up' | 'down'>();
+            for (const fb of feedback) {
+              voteMap.set(`${fb.runbook_entry_id}`, fb.vote);
+            }
+            setVotes(voteMap);
+          });
+        }
+      });
     } else {
       setSubmitError(true);
     }
   }
+
+  const excludedEntryIds = new Set(exclusions.map(e => e.runbook_entry_id));
+  const visibleMatches = matches.filter(m => m.id != null && !excludedEntryIds.has(m.id));
+  const excludedMatches = matches.filter(m => m.id != null && excludedEntryIds.has(m.id));
 
   return (
     <div className="stat-card border-accent/20">
@@ -974,29 +1199,130 @@ function RunbookPanel({ alert }: { alert: Alert }) {
 
       {loadingMatches ? (
         <div className="text-xs text-muted animate-pulse mb-3">Loading runbook entries...</div>
-      ) : matches.length > 0 ? (
+      ) : visibleMatches.length > 0 ? (
         <div className="space-y-2 mb-4">
           <div className="text-[10px] text-muted uppercase tracking-wider">
-            Past remediations for similar alerts ({matches.length})
+            Past remediations for similar alerts ({visibleMatches.length})
           </div>
-          {matches.map((entry) => (
-            <div key={entry.id} className="bg-bg rounded-md p-2.5 border border-border">
-              <div className="flex items-center gap-2 text-[10px] text-muted mb-1">
-                <span>{entry.created_at?.substring(0, 10)}</span>
-                {entry.sre_user && <span>by {entry.sre_user}</span>}
-                {entry.hostname && <span className="font-mono">{entry.hostname}</span>}
-                {entry.score != null && <span className="text-accent">relevance: {entry.score}</span>}
+          {visibleMatches.map((entry) => (
+            <div key={entry.id} className={`${votes.get(`${entry.id}`) === 'down' ? 'opacity-50' : ''} transition-opacity`}>
+              <div className="bg-bg rounded-md p-2.5 border border-border">
+                <div className="flex items-center gap-2 text-[10px] text-muted mb-1">
+                  <span>{entry.created_at?.substring(0, 10)}</span>
+                  {entry.sre_user && <span>by {entry.sre_user}</span>}
+                  {entry.hostname && <span className="font-mono">{entry.hostname}</span>}
+                  {entry.score != null && <span className="text-accent">relevance: {entry.score}</span>}
+                  {entry.id != null && (
+                    <div className="inline-flex items-center gap-1 ml-2">
+                      <button
+                        onClick={() => handleVote(entry.id!, 'up')}
+                        className={`p-0.5 rounded transition-colors ${
+                          votes.get(`${entry.id}`) === 'up'
+                            ? 'text-green'
+                            : 'text-muted/30 hover:text-green/70'
+                        }`}
+                        title="Useful remediation"
+                      >
+                        <svg className="w-3.5 h-3.5" fill={votes.get(`${entry.id}`) === 'up' ? 'currentColor' : 'none'} viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M14 9V5a3 3 0 00-3-3l-4 9v11h11.28a2 2 0 002-1.7l1.38-9a2 2 0 00-2-2.3H14z" />
+                        </svg>
+                      </button>
+                      <button
+                        onClick={() => handleVote(entry.id!, 'down')}
+                        className={`p-0.5 rounded transition-colors ${
+                          votes.get(`${entry.id}`) === 'down'
+                            ? 'text-red'
+                            : 'text-muted/30 hover:text-red/70'
+                        }`}
+                        title="Irrelevant remediation"
+                      >
+                        <svg className="w-3.5 h-3.5" fill={votes.get(`${entry.id}`) === 'down' ? 'currentColor' : 'none'} viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M10 15v4a3 3 0 003 3l4-9V2H5.72a2 2 0 00-2 1.7l-1.38 9a2 2 0 002 2.3H10z" />
+                        </svg>
+                      </button>
+                      <button
+                        onClick={async () => {
+                          if (!confirm(`Permanently exclude this runbook from all "${alert.name}" alerts?`)) return;
+                          const ok = await createRunbookExclusion(alert.name, entry.id!);
+                          if (ok) {
+                            fetchRunbookExclusions(alert.name).then(setExclusions);
+                          }
+                        }}
+                        className="p-0.5 rounded transition-colors text-muted/30 hover:text-red/70"
+                        title="Permanently exclude from this alert type"
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+                        </svg>
+                      </button>
+                      <button
+                        onClick={async () => {
+                          if (!confirm('Delete this runbook entry permanently?')) return;
+                          const ok = await deleteRunbookEntry(entry.id!);
+                          if (ok) {
+                            fetchRunbookMatches(alert.name, host || undefined).then(setMatches);
+                          }
+                        }}
+                        className="p-0.5 rounded transition-colors text-muted/30 hover:text-red/70"
+                        title="Delete this runbook entry"
+                      >
+                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <div className="text-[10px] text-muted mb-0.5 truncate">
+                  Alert: {entry.alert_name?.substring(0, 80)}
+                </div>
+                <div className="text-xs text-text whitespace-pre-wrap">{entry.remediation}</div>
               </div>
-              <div className="text-[10px] text-muted mb-0.5 truncate">
-                Alert: {entry.alert_name?.substring(0, 80)}
-              </div>
-              <div className="text-xs text-text whitespace-pre-wrap">{entry.remediation}</div>
             </div>
           ))}
         </div>
       ) : (
         <div className="text-xs text-muted mb-3">
           No past remediations found for similar alerts. Be the first to document one.
+        </div>
+      )}
+
+      {/* Excluded runbooks indicator */}
+      {excludedMatches.length > 0 && (
+        <div className="mb-3">
+          <button
+            onClick={() => setShowExcluded(!showExcluded)}
+            className="text-[10px] text-muted hover:text-text transition-colors"
+          >
+            {excludedMatches.length} runbook{excludedMatches.length > 1 ? 's' : ''} excluded
+            {showExcluded ? ' \u25B2' : ' \u25BC'}
+          </button>
+          {showExcluded && (
+            <div className="space-y-1.5 mt-2">
+              {excludedMatches.map(entry => {
+                const excl = exclusions.find(e => e.runbook_entry_id === entry.id);
+                return (
+                  <div key={entry.id} className="bg-bg/50 rounded-md p-2 border border-border/50 opacity-60">
+                    <div className="flex items-center gap-2 text-[10px] text-muted">
+                      <span className="text-red">Excluded</span>
+                      {excl && <span>by {excl.excluded_by}</span>}
+                      <button
+                        onClick={async () => {
+                          if (!excl) return;
+                          const ok = await deleteRunbookExclusion(excl.id);
+                          if (ok) fetchRunbookExclusions(alert.name).then(setExclusions);
+                        }}
+                        className="ml-auto text-muted/50 hover:text-accent text-[10px] transition-colors"
+                      >
+                        Unblock
+                      </button>
+                    </div>
+                    <div className="text-[10px] text-muted truncate mt-0.5">{entry.remediation?.substring(0, 100)}</div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 

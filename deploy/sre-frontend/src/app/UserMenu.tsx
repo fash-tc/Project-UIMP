@@ -26,7 +26,7 @@ export default function UserMenu() {
   }
 
   async function handleLogout() {
-    await fetch('/api/runbook/auth/logout', { method: 'POST' });
+    await fetch('/api/auth/logout', { method: 'POST' });
     window.location.href = '/portal/login';
   }
 

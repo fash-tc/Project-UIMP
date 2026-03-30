@@ -1,16 +1,25 @@
 'use client';
 
-import { useEffect, useState, useMemo, useCallback } from 'react';
-import { Alert } from '@/lib/types';
+import { useState, useMemo, useEffect } from 'react';
+import { Alert, AlertState } from '@/lib/types';
 import {
-  fetchAlerts,
   parseAIEnrichment,
-  severityColor,
   severityBg,
+  severityColor,
   timeAgo,
   alertStartTime,
   getSourceLabel,
+  overrideSeverity,
+  forceEnrich,
 } from '@/lib/keep-api';
+
+const ZABBIX_URLS: Record<string, string> = {
+  'domains-shared': 'https://zabbix.prod-domains-shared.bra2.tucows.systems',
+  'ascio': 'https://zabbix.ascio.com',
+  'hostedemail': 'https://zabbix.a.tucows.com',
+  'enom': 'https://zabbix.enom.net',
+  'iaas': 'https://zabbix.tucows.cloud',
+};
 
 type SortField = 'severity' | 'name' | 'host' | 'noise' | 'time';
 type SortDir = 'asc' | 'desc';
@@ -19,9 +28,14 @@ const SEVERITY_ORDER: Record<string, number> = {
   critical: 0, high: 1, warning: 2, low: 3, info: 4, unknown: 5,
 };
 
-export default function AlertExplorer() {
-  const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [loading, setLoading] = useState(true);
+export interface AlertsTableViewProps {
+  alerts: Alert[];
+  alertStates?: Map<string, AlertState>;
+  loading: boolean;
+  onAlertClick: (alert: Alert) => void;
+}
+
+export default function AlertsTableView({ alerts, alertStates, loading, onAlertClick }: AlertsTableViewProps) {
   const [search, setSearch] = useState('');
   const [sevFilter, setSevFilter] = useState<string>('all');
   const [statusFilter, setStatusFilter] = useState<string>('active');
@@ -29,23 +43,7 @@ export default function AlertExplorer() {
   const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [pageSize, setPageSize] = useState(25);
   const [currentPage, setCurrentPage] = useState(0);
-
-  const load = useCallback(async () => {
-    try {
-      const data = await fetchAlerts(250);
-      setAlerts(data);
-    } catch {
-      // silent
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-    const interval = setInterval(load, 30000);
-    return () => clearInterval(interval);
-  }, [load]);
+  const [severityDropdown, setSeverityDropdown] = useState<string | null>(null);
 
   const enrichedAlerts = useMemo(() => {
     return alerts.map(a => ({
@@ -126,7 +124,7 @@ export default function AlertExplorer() {
   }
 
   const sortIndicator = (field: SortField) =>
-    sortField === field ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
+    sortField === field ? (sortDir === 'asc' ? ' \u25B2' : ' \u25BC') : '';
 
   if (loading) {
     return (
@@ -138,8 +136,6 @@ export default function AlertExplorer() {
 
   return (
     <div className="space-y-4">
-      <h1 className="text-2xl font-bold text-text-bright">Alert Explorer</h1>
-
       {/* Filters */}
       <div className="flex flex-wrap gap-3 items-center">
         <input
@@ -211,22 +207,107 @@ export default function AlertExplorer() {
                   const host = alert.hostName || alert.hostname || '';
                   const source = getSourceLabel(alert);
 
+                  const alertState = alertStates?.get(alert.fingerprint);
+                  const displaySeverity = alertState?.severity_override || sev;
+
                   return (
                     <tr
                       key={alert.fingerprint || alert.id}
-                      className="border-b border-border/50 hover:bg-surface-hover transition-colors"
+                      className="border-b border-border/50 hover:bg-surface-hover transition-colors cursor-pointer"
+                      onClick={() => onAlertClick(alert)}
                     >
                       <td className="table-cell">
-                        <span className={`badge ${severityBg(sev)}`}>{sev}</span>
+                        <div className="relative">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSeverityDropdown(severityDropdown === alert.fingerprint ? null : alert.fingerprint);
+                            }}
+                            className={`text-xs px-1.5 py-0.5 rounded border ${severityBg(displaySeverity)} ${severityColor(displaySeverity)} cursor-pointer hover:ring-1 hover:ring-accent/50 transition-all`}
+                            title={alertState?.severity_override ? 'Overridden severity' : 'Click to override severity'}
+                          >
+                            {displaySeverity}
+                            {alertState?.severity_override && <span className="ml-0.5 opacity-60">•</span>}
+                          </button>
+                          {severityDropdown === alert.fingerprint && (
+                            <div className="absolute z-50 top-full mt-1 left-0 bg-surface border border-border rounded-md shadow-lg py-1 min-w-[100px]">
+                              {['critical', 'high', 'warning', 'info'].map(s => (
+                                <button
+                                  key={s}
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    await overrideSeverity(alert.fingerprint, s);
+                                    setSeverityDropdown(null);
+                                  }}
+                                  className={`block w-full text-left text-xs px-3 py-1.5 hover:bg-surface-hover transition-colors ${severityColor(s)}`}
+                                >
+                                  {s}
+                                </button>
+                              ))}
+                              {alertState?.severity_override && (
+                                <button
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    await overrideSeverity(alert.fingerprint, 'none');
+                                    setSeverityDropdown(null);
+                                  }}
+                                  className="block w-full text-left text-xs px-3 py-1.5 hover:bg-surface-hover transition-colors text-muted border-t border-border"
+                                >
+                                  Reset to AI
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
                       </td>
                       <td className="table-cell">
-                        <a
-                          href={`/portal/alerts/${alert.fingerprint}`}
-                          className="text-text-bright hover:text-accent transition-colors"
-                        >
-                          {(alert.name || 'Unknown').substring(0, 50)}
-                          {(alert.name?.length ?? 0) > 50 ? '...' : ''}
-                        </a>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="text-text-bright hover:text-accent transition-colors">
+                            {(alert.name || 'Unknown').substring(0, 50)}
+                            {(alert.name?.length ?? 0) > 50 ? '...' : ''}
+                          </span>
+                          {alertStates?.get(alert.fingerprint)?.incident_jira_key && (
+                            <a
+                              href={alertStates.get(alert.fingerprint)!.incident_jira_url || '#'}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                              title={`Incident created by ${alertStates.get(alert.fingerprint)!.incident_created_by || 'unknown'}${alertStates.get(alert.fingerprint)!.incident_created_at ? ', ' + timeAgo(alertStates.get(alert.fingerprint)!.incident_created_at!) : ''}`}
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-purple/10 border border-purple/30 text-purple whitespace-nowrap hover:bg-purple/20 transition-all duration-200"
+                            >
+                              <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101" />
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M10.172 13.828a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.102 1.101" />
+                              </svg>
+                              {alertStates.get(alert.fingerprint)!.incident_jira_key}
+                            </a>
+                          )}
+                          {alertStates?.get(alert.fingerprint)?.escalated_to && (
+                            <span
+                              title={`Escalated by ${alertStates.get(alert.fingerprint)!.escalated_by || 'unknown'}${alertStates.get(alert.fingerprint)!.escalated_at ? ', ' + timeAgo(alertStates.get(alert.fingerprint)!.escalated_at!) : ''}`}
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-amber/10 border border-amber/30 text-amber whitespace-nowrap transition-all duration-200"
+                            >
+                              <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M5 10l7-7m0 0l7 7m-7-7v18" />
+                              </svg>
+                              {alertStates.get(alert.fingerprint)!.escalated_to}
+                            </span>
+                          )}
+                          {alert.triggerId && alert.zabbixInstance && ZABBIX_URLS[alert.zabbixInstance] && (
+                            <a
+                              href={`${ZABBIX_URLS[alert.zabbixInstance]}/zabbix.php?action=problem.view&filter_triggerids[]=${alert.triggerId}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center text-muted/50 hover:text-blue-400 transition-colors ml-1"
+                              title="View in Zabbix"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                              </svg>
+                            </a>
+                          )}
+                        </div>
                         {alert.description && alert.description !== alert.name && (
                           <div className="text-xs text-muted mt-0.5 truncate max-w-xs font-mono">
                             {alert.description.substring(0, 80)}
@@ -252,7 +333,20 @@ export default function AlertExplorer() {
                         )}
                       </td>
                       <td className="table-cell text-xs text-muted max-w-xs truncate">
-                        {enrichment?.summary || '--'}
+                        {enrichment?.summary || (
+                          !alert.note ? (
+                            <button
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                await forceEnrich(alert.fingerprint);
+                              }}
+                              className="text-xs text-muted animate-pulse hover:text-accent transition-colors cursor-pointer"
+                              title="Click to force enrichment"
+                            >
+                              Enriching...
+                            </button>
+                          ) : '--'
+                        )}
                       </td>
                       <td className="table-cell text-xs text-muted whitespace-nowrap">
                         {timeAgo(alertStartTime(alert))}

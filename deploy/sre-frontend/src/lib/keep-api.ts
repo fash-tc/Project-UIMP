@@ -1,4 +1,4 @@
-import { Alert, AIEnrichment, AlertStats, SREFeedback, RunbookEntry, AIInstruction, AIFeedbackSummary, AlertState } from './types';
+import { Alert, AIEnrichment, AlertStats, SREFeedback, RunbookEntry, AIInstruction, AIFeedbackSummary, AlertState, RunbookFeedback, SituationSummary, SuggestedMerge, SREFeedbackEntry, RunbookExclusion, PaginatedResponse, IncidentAssessment, WebhookSubscriber, WebhookDelivery, StatuspageComponent, StatuspageIncident } from './types';
 
 const API_BASE = '/api/keep';
 
@@ -259,9 +259,33 @@ export async function submitFeedback(
   return res.ok;
 }
 
+export async function submitStructuredFeedback(data: {
+  alert_name: string;
+  hostname: string;
+  service: string;
+  severity_correction: string;
+  cause_correction: string;
+  remediation_correction: string;
+  full_text: string;
+}): Promise<boolean> {
+  try {
+    const res = await fetch('/api/runbook/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 // ── Runbook API ──────────────────────────────────────
 
 const RUNBOOK_BASE = '/api/runbook';
+const AUTH_BASE = '/api/auth';
+const ALERT_STATE_BASE = '/api/alert-states';
+const LOKI_BASE = '/api/loki';
 
 export async function fetchRunbookMatches(
   alertName: string,
@@ -323,6 +347,44 @@ export async function resolveAlert(fingerprint: string): Promise<boolean> {
       }),
     });
     return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function resolveAlerts(fingerprints: string[]): Promise<boolean> {
+  try {
+    const results = await Promise.all(
+      fingerprints.map(fp => resolveAlert(fp))
+    );
+    return results.every(ok => ok);
+  } catch {
+    return false;
+  }
+}
+
+export async function unresolveAlert(fingerprint: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/alerts/enrich`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fingerprint,
+        enrichments: { status: 'firing' },
+      }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function unresolveAlerts(fingerprints: string[]): Promise<boolean> {
+  try {
+    const results = await Promise.all(
+      fingerprints.map(fp => unresolveAlert(fp))
+    );
+    return results.every(ok => ok);
   } catch {
     return false;
   }
@@ -409,12 +471,18 @@ export interface RegistryHealthData {
 
 export async function fetchRegistryHealth(): Promise<RegistryHealthData | null> {
   try {
-    const res = await fetch(`${RUNBOOK_BASE}/registry-health`);
+    const res = await fetch(`${LOKI_BASE}/registry-health`);
     if (!res.ok) return null;
     return await res.json();
   } catch {
     return null;
   }
+}
+
+export async function fetchRegistryTrends(operatorId: string, rangeSeconds: number = 86400) {
+  const res = await fetch(`${LOKI_BASE}/registry-trends?operator=${encodeURIComponent(operatorId)}&range_seconds=${rangeSeconds}`);
+  if (!res.ok) throw new Error(`Registry trends failed: ${res.status}`);
+  return res.json();
 }
 
 // ── Loki Logs ────────────────────────────────────────
@@ -437,7 +505,7 @@ export async function queryLokiLogs(
   limit = 200,
   range = 3600,
 ): Promise<LogQueryResult> {
-  const res = await fetch(`${RUNBOOK_BASE}/logs/query`, {
+  const res = await fetch(`${LOKI_BASE}/logs/query`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, limit, range }),
@@ -508,7 +576,7 @@ export async function fetchAIFeedbackSummary(): Promise<AIFeedbackSummary | null
 
 export async function fetchAlertStates(): Promise<AlertState[]> {
   try {
-    const res = await fetch(`${RUNBOOK_BASE}/alert-states`);
+    const res = await fetch(`${ALERT_STATE_BASE}`);
     if (!res.ok) return [];
     return await res.json();
   } catch {
@@ -521,7 +589,7 @@ export async function toggleInvestigating(
   alertName: string,
 ): Promise<{ status: string; investigating_user: string | null } | null> {
   try {
-    const res = await fetch(`${RUNBOOK_BASE}/alert-states/investigate`, {
+    const res = await fetch(`${ALERT_STATE_BASE}/investigate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fingerprint, alert_name: alertName }),
@@ -539,7 +607,7 @@ export async function acknowledgeAlerts(
   firingStarts: Record<string, string>,
 ): Promise<boolean> {
   try {
-    const res = await fetch(`${RUNBOOK_BASE}/alert-states/acknowledge`, {
+    const res = await fetch(`${ALERT_STATE_BASE}/acknowledge`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fingerprints, alert_names: alertNames, firing_starts: firingStarts }),
@@ -552,7 +620,7 @@ export async function acknowledgeAlerts(
 
 export async function unacknowledgeAlerts(fingerprints: string[]): Promise<boolean> {
   try {
-    const res = await fetch(`${RUNBOOK_BASE}/alert-states/unacknowledge`, {
+    const res = await fetch(`${ALERT_STATE_BASE}/unacknowledge`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fingerprints }),
@@ -565,7 +633,7 @@ export async function unacknowledgeAlerts(fingerprints: string[]): Promise<boole
 
 export async function markAlertsUpdated(fingerprints: string[]): Promise<boolean> {
   try {
-    const res = await fetch(`${RUNBOOK_BASE}/alert-states/mark-updated`, {
+    const res = await fetch(`${ALERT_STATE_BASE}/mark-updated`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fingerprints }),
@@ -573,5 +641,627 @@ export async function markAlertsUpdated(fingerprints: string[]): Promise<boolean
     return res.ok;
   } catch {
     return false;
+  }
+}
+
+// ── Escalation API ───────────────────────────────────
+
+const ESCALATION_BASE = '/api/escalation';
+
+export async function fetchEscalationTeams(): Promise<{id: string; name: string}[]> {
+  try {
+    const res = await fetch(`${ESCALATION_BASE}/teams`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch { return []; }
+}
+
+export async function fetchEscalationUsers(): Promise<{id: string; name: string; email: string}[]> {
+  try {
+    const res = await fetch(`${ESCALATION_BASE}/users`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch { return []; }
+}
+
+export async function escalateAlert(data: {
+  team_id?: string;
+  user_ids?: string[];
+  alert_name: string;
+  severity: string;
+  hostname?: string;
+  message: string;
+}): Promise<{success: boolean; error?: string}> {
+  try {
+    const res = await fetch(`${ESCALATION_BASE}/escalate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return await res.json();
+  } catch {
+    return { success: false, error: 'Network error' };
+  }
+}
+
+export async function forceEnrich(fingerprint: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/force-enrich`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fingerprint }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function storeIncidentState(
+  fingerprint: string,
+  jiraKey: string,
+  jiraUrl: string,
+): Promise<void> {
+  await fetch('/api/alert-states/incident', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ fingerprint, jira_key: jiraKey, jira_url: jiraUrl }),
+  });
+}
+
+export async function storeEscalationState(
+  fingerprint: string,
+  escalatedTo: string,
+): Promise<void> {
+  await fetch('/api/alert-states/escalation', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ fingerprint, escalated_to: escalatedTo }),
+  });
+}
+
+export async function submitRunbookFeedback(
+  fingerprint: string,
+  alertName: string,
+  entryId: number,
+  vote: 'up' | 'down' | 'none',
+): Promise<void> {
+  await fetch('/api/alert-states/runbook-feedback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ fingerprint, alert_name: alertName, entry_id: entryId, vote }),
+  });
+}
+
+export async function fetchRunbookFeedback(
+  entryIds: number[],
+  fingerprint: string,
+): Promise<RunbookFeedback[]> {
+  if (entryIds.length === 0) return [];
+  const res = await fetch(`/api/alert-states/runbook-feedback?entry_ids=${entryIds.join(',')}&fingerprint=${encodeURIComponent(fingerprint)}`, {
+    credentials: 'include',
+  });
+  if (!res.ok) return [];
+  return res.json();
+}
+
+export async function fetchSituationSummary(): Promise<SituationSummary | null> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/situation-summary`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data.one_liner) return null;
+    return data as SituationSummary;
+  } catch {
+    return null;
+  }
+}
+
+export async function overrideSeverity(fingerprint: string, severity: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/severity-override`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fingerprint, severity }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function overrideSeverityBulk(fingerprints: string[], severity: string): Promise<boolean> {
+  try {
+    const results = await Promise.all(
+      fingerprints.map(fp => overrideSeverity(fp, severity))
+    );
+    return results.every(r => r);
+  } catch {
+    return false;
+  }
+}
+
+export async function invalidateSummary(): Promise<void> {
+  try {
+    await fetch(`${ALERT_STATE_BASE}/invalidate-summary`, { method: 'POST' });
+  } catch {}
+}
+
+// ── Silence Rules ──────────────────────────────────
+
+export interface SilenceRule {
+  id: number;
+  alert_name_pattern: string;
+  hostname_pattern: string | null;
+  created_by: string;
+  created_at: string;
+  expires_at: string;
+  reason: string;
+  active: number;
+}
+
+export async function fetchSilenceRules(): Promise<SilenceRule[]> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/silence-rules`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function createSilenceRule(
+  alertNamePattern: string,
+  durationSeconds: number,
+  hostnamePattern?: string,
+  reason?: string,
+): Promise<{ id: number; expires_at: string } | null> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/silence-rules`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        alert_name_pattern: alertNamePattern,
+        hostname_pattern: hostnamePattern || null,
+        duration_seconds: durationSeconds,
+        reason: reason || '',
+      }),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function cancelSilenceRule(ruleId: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/silence-rules/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: ruleId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Check if an alert name matches a pattern (supports wildcards * and comma-separated patterns) */
+function matchesNamePattern(alertName: string, pattern: string): boolean {
+  const name = alertName.toLowerCase();
+  // Support comma-separated patterns: "High Memory Utilization, High CPU Utilization"
+  const patterns = pattern.includes(',') ? pattern.split(',').map(p => p.trim()) : [pattern.trim()];
+  for (const p of patterns) {
+    const pat = p.toLowerCase();
+    if (pat.includes('*')) {
+      // Wildcard matching: "High * Utilization" matches "High CPU Utilization on host"
+      const regexStr = pat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*');
+      if (new RegExp(regexStr, 'i').test(name)) return true;
+    } else {
+      // Substring match
+      if (name.includes(pat)) return true;
+    }
+  }
+  return false;
+}
+
+/** Check if a hostname matches a pattern (supports wildcards * and comma-separated) */
+function matchesHostPattern(hostname: string, pattern: string): boolean {
+  const patterns = pattern.includes(',') ? pattern.split(',').map(p => p.trim()) : [pattern.trim()];
+  for (const p of patterns) {
+    const hostPattern = p.toLowerCase();
+    if (hostPattern.includes('*')) {
+      const regexStr = hostPattern.replace(/\./g, '\\.').replace(/\*/g, '.*');
+      const regex = new RegExp('(^|\\.)' + regexStr + '$', 'i');
+      if (regex.test(hostname)) return true;
+    } else {
+      if (hostname.toLowerCase().includes(hostPattern)) return true;
+    }
+  }
+  return false;
+}
+
+/** Check if an alert matches any active silence rule */
+export function isAlertSilenced(
+  alertName: string,
+  hostname: string,
+  rules: SilenceRule[],
+): SilenceRule | null {
+  const now = new Date().toISOString();
+  for (const rule of rules) {
+    if (!rule.active || rule.expires_at < now) continue;
+    // Check alert name pattern
+    if (!matchesNamePattern(alertName, rule.alert_name_pattern)) continue;
+    // Check hostname pattern if specified
+    if (rule.hostname_pattern) {
+      if (!matchesHostPattern(hostname, rule.hostname_pattern)) continue;
+    }
+    return rule;
+  }
+  return null;
+}
+
+// ── SRE Feedback (New Multi-Entry System) ─────────────────
+
+export async function fetchSREFeedback(fingerprint: string): Promise<SREFeedbackEntry[]> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/sre-feedback?fingerprint=${encodeURIComponent(fingerprint)}`, {
+      credentials: 'include',
+    });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchAllSREFeedback(params: {
+  page?: number;
+  limit?: number;
+  search?: string;
+  rating?: string;
+  user?: string;
+  sort?: string;
+} = {}): Promise<PaginatedResponse<SREFeedbackEntry>> {
+  try {
+    const qs = new URLSearchParams();
+    if (params.page) qs.set('page', String(params.page));
+    if (params.limit) qs.set('limit', String(params.limit));
+    if (params.search) qs.set('search', params.search);
+    if (params.rating) qs.set('rating', params.rating);
+    if (params.user) qs.set('user', params.user);
+    if (params.sort) qs.set('sort', params.sort);
+    const res = await fetch(`${ALERT_STATE_BASE}/sre-feedback/all?${qs.toString()}`, {
+      credentials: 'include',
+    });
+    if (!res.ok) return { items: [], total: 0, page: 1, limit: 50 };
+    return await res.json();
+  } catch {
+    return { items: [], total: 0, page: 1, limit: 50 };
+  }
+}
+
+export async function submitSREFeedback(data: {
+  fingerprint: string;
+  alert_name: string;
+  rating?: string;
+  corrected_severity?: string;
+  corrected_noise?: number;
+  comment?: string;
+}): Promise<{ id: number } | null> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/sre-feedback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function updateSREFeedback(id: number, data: {
+  rating?: string;
+  corrected_severity?: string;
+  corrected_noise?: number;
+  comment?: string;
+}): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/sre-feedback/update`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ id, ...data }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function deleteSREFeedback(id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/sre-feedback/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ id }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function bulkDeleteSREFeedback(ids: number[]): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/sre-feedback/bulk-delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ ids }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function voteSREFeedback(id: number, vote: 'up' | 'down' | 'none'): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/sre-feedback/vote`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ id, vote }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ── Runbook Exclusions ─────────────────────────────────
+
+export async function fetchRunbookExclusions(alertName: string): Promise<RunbookExclusion[]> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/runbook-exclusions?alert_name=${encodeURIComponent(alertName)}`, {
+      credentials: 'include',
+    });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchAllRunbookExclusions(params: {
+  page?: number;
+  limit?: number;
+  search?: string;
+} = {}): Promise<PaginatedResponse<RunbookExclusion>> {
+  try {
+    const qs = new URLSearchParams();
+    if (params.page) qs.set('page', String(params.page));
+    if (params.limit) qs.set('limit', String(params.limit));
+    if (params.search) qs.set('search', params.search);
+    const res = await fetch(`${ALERT_STATE_BASE}/runbook-exclusions/all?${qs.toString()}`, {
+      credentials: 'include',
+    });
+    if (!res.ok) return { items: [], total: 0, page: 1, limit: 50 };
+    return await res.json();
+  } catch {
+    return { items: [], total: 0, page: 1, limit: 50 };
+  }
+}
+
+export async function createRunbookExclusion(alertName: string, runbookEntryId: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/runbook-exclusions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ alert_name: alertName, runbook_entry_id: runbookEntryId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function deleteRunbookExclusion(id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/runbook-exclusions/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ id }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ── Maintenance Events ─────────────────────────────────
+
+export interface MaintenanceEvent {
+  id: number;
+  source_type: string;
+  title: string;
+  summary: string | null;
+  vendor: string;
+  severity: string | null;
+  start_time: string;
+  end_time: string | null;
+  impact: string | null;
+  status: string | null;
+  permalink: string;
+  ingested_at: string;
+  event_type: string;
+}
+
+export async function fetchMaintenanceEvents(): Promise<MaintenanceEvent[]> {
+  try {
+    const res = await fetch('/api/maintenance/active-now');
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.results || [];
+  } catch {
+    return [];
+  }
+}
+
+// Re-export SuggestedMerge so consumers can import from keep-api if needed
+export type { SuggestedMerge };
+
+// ── Incident Notification APIs ───────────────────────
+
+const MAINT_BASE = '/api/maintenance';
+
+export async function assessIncidentDescription(title: string, description: string): Promise<IncidentAssessment> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/incident/assess`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, description }),
+    });
+    return await res.json();
+  } catch {
+    return { grade: '?', feedback: 'Failed to connect to assessment service.' };
+  }
+}
+
+export async function sendIncidentWebhook(title: string, description: string, started_at?: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/incident/webhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, description, started_at }),
+    });
+    return await res.json();
+  } catch {
+    return { ok: false, error: 'Network error' };
+  }
+}
+
+export async function fetchStatuspageComponents(): Promise<StatuspageComponent[]> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/statuspage/components`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function createStatuspageIncident(data: {
+  name: string;
+  body: string;
+  component_ids: string[];
+  status: string;
+  impact_override: string;
+}): Promise<{ result?: StatuspageIncident; error?: string }> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/statuspage/incident`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const json = await res.json();
+    if (!res.ok) return { error: json.error || `HTTP ${res.status}` };
+    return { result: json };
+  } catch {
+    return { error: 'Network error' };
+  }
+}
+
+// ── Webhook Management APIs ──────────────────────────
+
+export async function fetchWebhookSubscribers(): Promise<WebhookSubscriber[]> {
+  try {
+    const res = await fetch(`${MAINT_BASE}/webhooks/subscribers`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function createWebhookSubscriber(name: string, url: string): Promise<{ subscriber?: WebhookSubscriber; error?: string }> {
+  try {
+    const res = await fetch(`${MAINT_BASE}/webhooks/subscribers`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, url }),
+    });
+    const json = await res.json();
+    if (!res.ok) return { error: json.error || json.detail || `HTTP ${res.status}` };
+    return { subscriber: json };
+  } catch {
+    return { error: 'Network error' };
+  }
+}
+
+export async function updateWebhookSubscriber(id: number, data: Partial<{ name: string; url: string; is_active: boolean }>): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${MAINT_BASE}/webhooks/subscribers/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return { ok: res.ok, error: res.ok ? undefined : `HTTP ${res.status}` };
+  } catch {
+    return { ok: false, error: 'Network error' };
+  }
+}
+
+export async function deleteWebhookSubscriber(id: number): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${MAINT_BASE}/webhooks/subscribers/${id}`, { method: 'DELETE' });
+    return { ok: res.ok };
+  } catch {
+    return { ok: false, error: 'Network error' };
+  }
+}
+
+export async function rotateWebhookSecret(id: number): Promise<{ secret?: string; error?: string }> {
+  try {
+    const res = await fetch(`${MAINT_BASE}/webhooks/subscribers/${id}/rotate-secret`, { method: 'POST' });
+    const json = await res.json();
+    if (!res.ok) return { error: json.error || `HTTP ${res.status}` };
+    return { secret: json.secret };
+  } catch {
+    return { error: 'Network error' };
+  }
+}
+
+export async function testWebhookDelivery(id: number): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${MAINT_BASE}/webhooks/test/${id}`, { method: 'POST' });
+    return { ok: res.ok };
+  } catch {
+    return { ok: false, error: 'Network error' };
+  }
+}
+
+export async function fetchWebhookDeliveries(subscriberId?: number, success?: boolean): Promise<WebhookDelivery[]> {
+  try {
+    const params = new URLSearchParams();
+    if (subscriberId !== undefined) params.set('subscriber_id', String(subscriberId));
+    if (success !== undefined) params.set('success', String(success));
+    const qs = params.toString();
+    const res = await fetch(`${MAINT_BASE}/webhooks/deliveries${qs ? '?' + qs : ''}`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
   }
 }
