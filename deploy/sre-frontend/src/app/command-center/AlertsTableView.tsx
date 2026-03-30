@@ -14,10 +14,11 @@ import {
 } from '@/lib/keep-api';
 
 const ZABBIX_URLS: Record<string, string> = {
-  'domains-shared': 'https://zabbix.bra2.tucows.cloud',
-  'ascio': 'https://zabbix.ascio.net',
-  'hostedemail': 'https://zabbix.hostedemail.com',
+  'domains-shared': 'https://zabbix.prod-domains-shared.bra2.tucows.systems',
+  'ascio': 'https://zabbix.ascio.com',
+  'hostedemail': 'https://zabbix.a.tucows.com',
   'enom': 'https://zabbix.enom.net',
+  'iaas': 'https://zabbix.tucows.cloud',
 };
 
 type SortField = 'severity' | 'name' | 'host' | 'noise' | 'time';

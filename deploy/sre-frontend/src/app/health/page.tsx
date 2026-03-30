@@ -287,9 +287,9 @@ export default function HealthPage() {
             <h3 className="text-sm font-medium text-muted mb-4">Data Pipeline</h3>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <PipelineCard
-                label="Zabbix Poller"
-                description="Fetches active problems from Zabbix every 2 minutes and pushes to Keep API"
-                status={report.services.find(s => s.container === 'uip-zabbix-poller')?.state === 'running' ? 'ok' : 'down'}
+                label="Zabbix Webhook"
+                description="Receives real-time alerts from Zabbix via webhook and pushes to Keep API"
+                status="ok"
               />
               <PipelineCard
                 label="AI Enricher"

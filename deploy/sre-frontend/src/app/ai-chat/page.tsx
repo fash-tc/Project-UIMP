@@ -2,12 +2,12 @@
 
 export default function AIChatPage() {
   return (
-    <div className="w-full h-[calc(100vh-4rem)]">
+    <div className="flex flex-col h-[calc(100vh-4rem)] w-full">
       <iframe
         src="/ai-chat-api/"
-        className="w-full h-full border-0"
+        className="flex-1 w-full border-0"
+        allow="clipboard-write; microphone"
         title="AI Chat"
-        allow="clipboard-write"
       />
     </div>
   );

@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useMemo, useCallback } from 'react';
 import { Alert } from '@/lib/types';
-import { fetchAlerts, parseAIEnrichment, timeAgo, alertStartTime, fetchRegistryHealth, RegistryHealthData, RegistryHealthOperator, fetchRegistryTrends } from '@/lib/keep-api';
+import { fetchAlerts, parseAIEnrichment, timeAgo, alertStartTime, fetchRegistryHealth, RegistryHealthData, RegistryHealthOperator, fetchRegistryTrends, MaintenanceEvent, fetchMaintenanceEvents } from '@/lib/keep-api';
 import {
   REGISTRY_OPERATORS,
   TLD_OPERATOR_MAP,
@@ -11,6 +11,7 @@ import {
   buildRegistryMailto,
   detectRegistryFromAlert,
   RegistryMatch,
+  matchMaintenanceToOperators,
 } from '@/lib/registry';
 
 interface RegistryAlert {
@@ -25,12 +26,19 @@ export default function RegistryContactsPage() {
   const [loadingAlerts, setLoadingAlerts] = useState(true);
   const [tldFilter, setTldFilter] = useState('');
   const [healthData, setHealthData] = useState<RegistryHealthData | null>(null);
+  const [maintenanceEvents, setMaintenanceEvents] = useState<MaintenanceEvent[]>([]);
 
   useEffect(() => {
     fetchAlerts(250).then(a => {
       setAlerts(a);
       setLoadingAlerts(false);
     }).catch(() => setLoadingAlerts(false));
+  }, []);
+
+  useEffect(() => {
+    fetchMaintenanceEvents().then(setMaintenanceEvents);
+    const interval = setInterval(() => fetchMaintenanceEvents().then(setMaintenanceEvents), 60000);
+    return () => clearInterval(interval);
   }, []);
 
   const [loadingHealth, setLoadingHealth] = useState(false);
@@ -96,6 +104,18 @@ export default function RegistryContactsPage() {
     }
     return map;
   }, [registryAlerts]);
+
+  const maintenanceByOperator = useMemo(() => {
+    const map: Record<string, MaintenanceEvent[]> = {};
+    for (const m of maintenanceEvents) {
+      const ops = matchMaintenanceToOperators(m.vendor, m.title);
+      for (const opId of ops) {
+        if (!map[opId]) map[opId] = [];
+        map[opId].push(m);
+      }
+    }
+    return map;
+  }, [maintenanceEvents]);
 
   return (
     <div className="space-y-6">
@@ -189,6 +209,7 @@ export default function RegistryContactsPage() {
             alertCount={alertsByOperator[op.id]?.length || 0}
             alerts={alertsByOperator[op.id] || []}
             health={healthData?.operators[op.id] || null}
+            maintenance={maintenanceByOperator[op.id] || []}
             isSelected={selectedOperator?.id === op.id}
             onSelect={() => setSelectedOperator(selectedOperator?.id === op.id ? null : op)}
           />
@@ -207,6 +228,7 @@ export default function RegistryContactsPage() {
           operator={selectedOperator}
           alerts={alertsByOperator[selectedOperator.id] || []}
           health={healthData?.operators[selectedOperator.id] || null}
+          maintenance={maintenanceByOperator[selectedOperator.id] || []}
           onClose={() => setSelectedOperator(null)}
         />
       )}
@@ -216,11 +238,12 @@ export default function RegistryContactsPage() {
 
 /* ── Operator Card ── */
 
-function OperatorCard({ operator, alertCount, alerts, health, isSelected, onSelect }: {
+function OperatorCard({ operator, alertCount, alerts, health, maintenance, isSelected, onSelect }: {
   operator: RegistryOperator;
   alertCount: number;
   alerts: RegistryAlert[];
   health: RegistryHealthOperator | null;
+  maintenance: MaintenanceEvent[];
   isSelected: boolean;
   onSelect: () => void;
 }) {
@@ -231,6 +254,7 @@ function OperatorCard({ operator, alertCount, alerts, health, isSelected, onSele
     <div
       className={`stat-card cursor-pointer ${
         alertCount > 0 ? 'border-orange/40 bg-orange/5' :
+        maintenance.length > 0 ? 'border-yellow/40 bg-yellow/5' :
         health?.status === 'down' ? 'border-red/40 bg-red/5' :
         health?.status === 'degraded' ? 'border-orange/40 bg-orange/5' : ''
       } ${isSelected ? 'ring-2 ring-accent' : ''}`}
@@ -243,6 +267,11 @@ function OperatorCard({ operator, alertCount, alerts, health, isSelected, onSele
             {alertCount > 0 && (
               <span className="badge bg-orange/10 border-orange/30 text-orange text-[10px] flex-shrink-0">
                 {alertCount} alert{alertCount !== 1 ? 's' : ''}
+              </span>
+            )}
+            {maintenance.length > 0 && (
+              <span className="badge bg-yellow/10 border-yellow/30 text-yellow text-[10px] flex-shrink-0">
+                Maint Active
               </span>
             )}
           </div>
@@ -491,10 +520,11 @@ const RESP_CODE_DESC: Record<string, string> = {
 
 /* ── Operator Detail Modal ── */
 
-function OperatorDetailModal({ operator, alerts, health, onClose }: {
+function OperatorDetailModal({ operator, alerts, health, maintenance, onClose }: {
   operator: RegistryOperator;
   alerts: RegistryAlert[];
   health: RegistryHealthOperator | null;
+  maintenance: MaintenanceEvent[];
   onClose: () => void;
 }) {
   useEffect(() => {
@@ -595,6 +625,34 @@ function OperatorDetailModal({ operator, alerts, health, onClose }: {
                   </div>
                 );
               })}
+            </div>
+          )}
+
+          {/* Active Maintenance Windows */}
+          {maintenance.length > 0 && (
+            <div className="bg-yellow/5 border border-yellow/30 rounded-lg px-4 py-3 space-y-2">
+              <h3 className="text-xs font-medium text-yellow">
+                {maintenance.length} Active Maintenance Window{maintenance.length !== 1 ? 's' : ''}
+              </h3>
+              {maintenance.map(m => (
+                <div key={m.id} className="flex items-center gap-2 text-xs">
+                  <div className="w-2 h-2 rounded-full bg-yellow flex-shrink-0 animate-pulse" />
+                  <a
+                    href={m.permalink}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-text-bright hover:text-accent truncate flex-1"
+                  >
+                    {m.title}
+                  </a>
+                  <span className="text-muted">{m.vendor}</span>
+                  {m.end_time && (
+                    <span className="text-muted">
+                      until {new Date(m.end_time).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })}
+                    </span>
+                  )}
+                </div>
+              ))}
             </div>
           )}
 

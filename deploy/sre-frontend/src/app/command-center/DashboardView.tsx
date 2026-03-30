@@ -11,15 +11,20 @@ import {
   alertStartTime,
   getSourceLabel,
   overrideSeverity,
+  overrideSeverityBulk,
   forceEnrich,
+  isAlertSilenced,
+  SilenceRule,
 } from '@/lib/keep-api';
 import SituationCard from './SituationCard';
+import IncidentWizard from './IncidentWizard';
 
 const ZABBIX_URLS: Record<string, string> = {
-  'domains-shared': 'https://zabbix.bra2.tucows.cloud',
-  'ascio': 'https://zabbix.ascio.net',
-  'hostedemail': 'https://zabbix.hostedemail.com',
+  'domains-shared': 'https://zabbix.prod-domains-shared.bra2.tucows.systems',
+  'ascio': 'https://zabbix.ascio.com',
+  'hostedemail': 'https://zabbix.a.tucows.com',
   'enom': 'https://zabbix.enom.net',
+  'iaas': 'https://zabbix.tucows.cloud',
 };
 
 /* ── Alert Grouping (duplicated from page-level helpers) ── */
@@ -51,10 +56,19 @@ function getParentDomain(hostname: string): string {
   if (!hostname) return '';
   const parts = hostname.split('.');
   if (parts.length <= 2) return hostname;
-  return parts.slice(1).join('.');
+  // Normalize: strip trailing digits from each part so dns1/dns2 -> dns, host01/host02 -> host
+  const parent = parts.slice(1).join('.');
+  return parent;
 }
 
-function buildAlertGroups(alerts: Alert[], sortKey: string = 'severity', sortDir: 'asc' | 'desc' = 'desc'): AlertGroup[] {
+/** Normalize a domain by stripping trailing digits from each segment.
+ *  e.g. "dns1.tucows.net" -> "dns.tucows.net", "host02.prod.aws" -> "host.prod.aws" */
+function normalizeDomain(domain: string): string {
+  if (!domain) return '';
+  return domain.split('.').map(p => p.replace(/\d+$/, '')).join('.');
+}
+
+function buildAlertGroups(alerts: Alert[], sortKey: string = 'severity', sortDir: 'asc' | 'desc' = 'desc', alertStatesMap?: Map<string, AlertState>): AlertGroup[] {
   const sevOrder: Record<string, number> = { critical: 0, high: 1, warning: 2, low: 3, info: 4, unknown: 5 };
   const sevNames = ['critical', 'high', 'warning', 'low', 'info', 'unknown'];
 
@@ -63,10 +77,16 @@ function buildAlertGroups(alerts: Alert[], sortKey: string = 'severity', sortDir
     const host = alert.hostName || alert.hostname || '';
     const base = extractAlertBase(alert.name || '', host);
     const parent = getParentDomain(host);
-    const key = `${base}::${parent}`;
+    // Use normalized domain for grouping key so dns1.tucows.net and dns2.tucows.net merge
+    const normalizedParent = normalizeDomain(parent);
+    const key = `${base}::${normalizedParent}`;
 
     if (!domainMap.has(key)) {
-      const label = parent ? `${base} — ${parent}` : base;
+      // Use the normalized domain as display label (with wildcard hint if different from raw)
+      const displayParent = normalizedParent !== parent && parent
+        ? parent.split('.').map(p => p.replace(/\d+$/, '') ? p.replace(/\d+$/, '*') : p).join('.')
+        : parent;
+      const label = displayParent ? `${base} — ${displayParent}` : base;
       domainMap.set(key, { key, label, alerts: [], highestSeverity: 'unknown' });
     }
     domainMap.get(key)!.alerts.push(alert);
@@ -97,7 +117,9 @@ function buildAlertGroups(alerts: Alert[], sortKey: string = 'severity', sortDir
   const result = multiGroups.map(g => {
     let best = 5;
     for (const a of g.alerts) {
-      const sev = parseAIEnrichment(a.note)?.assessed_severity ?? 'unknown';
+      // Severity override takes precedence over AI enrichment
+      const override = alertStatesMap?.get(a.fingerprint)?.severity_override;
+      const sev = override || parseAIEnrichment(a.note)?.assessed_severity || 'unknown';
       best = Math.min(best, sevOrder[sev] ?? 5);
     }
     g.highestSeverity = sevNames[best];
@@ -410,9 +432,13 @@ export interface DashboardViewProps {
   onUnacknowledge: (alert: Alert) => void;
   onGroupAcknowledge: (fingerprints: string[], names: Record<string, string>, starts: Record<string, string>) => void;
   onGroupResolve: (fingerprints: string[]) => Promise<void>;
+  onGroupUnresolve?: (fingerprints: string[]) => Promise<void>;
   onForceEnrich?: (fingerprint: string) => Promise<void>;
   onRefresh: () => void;
   sseUpdateTrigger?: number;
+  silenceRules?: SilenceRule[];
+  onSilenceGroup?: (alertNamePattern: string, durationSeconds: number, hostnamePattern?: string) => Promise<void>;
+  onCancelSilence?: (ruleId: number) => Promise<void>;
 }
 
 function isSuppressedNote(note: string | undefined | null): boolean {
@@ -430,8 +456,13 @@ export default function DashboardView({
   onUnacknowledge,
   onGroupAcknowledge,
   onGroupResolve,
+  onGroupUnresolve,
   onForceEnrich,
+  onRefresh,
   sseUpdateTrigger,
+  silenceRules = [],
+  onSilenceGroup,
+  onCancelSilence,
 }: DashboardViewProps) {
   const [sevFilter, setSevFilter] = useState<string | null>(null);
   const [clusterFilter, setClusterFilter] = useState<string[] | null>(null);
@@ -442,14 +473,26 @@ export default function DashboardView({
   const [currentPage, setCurrentPage] = useState(0);
   const [groupView, setGroupView] = useState(true);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
-  const [dashboardTab, setDashboardTab] = useState<'firing' | 'acknowledged' | 'suppressed'>('firing');
+  const [dashboardTab, setDashboardTab] = useState<'firing' | 'acknowledged' | 'suppressed' | 'silenced'>('firing');
+  const [silenceDropdown, setSilenceDropdown] = useState<string | null>(null);
+  const [showIncidentWizard, setShowIncidentWizard] = useState(false);
 
   const activeAlerts = alerts.filter(a => a.status !== 'resolved' && a.status !== 'ok');
   const suppressedAlerts = activeAlerts.filter(a => isSuppressedNote(a.note));
   const nonSuppressedAlerts = activeAlerts.filter(a => !isSuppressedNote(a.note));
-  const firingAlerts = nonSuppressedAlerts.filter(a => !alertStates.get(a.fingerprint)?.acknowledged_by);
-  const ackedAlerts = nonSuppressedAlerts.filter(a => !!alertStates.get(a.fingerprint)?.acknowledged_by);
-  const tabAlerts = dashboardTab === 'firing' ? firingAlerts : dashboardTab === 'acknowledged' ? ackedAlerts : suppressedAlerts;
+  // Separate silenced alerts (matched by active silence rules)
+  const silencedAlerts = nonSuppressedAlerts.filter(a => {
+    const host = a.hostName || a.hostname || '';
+    return isAlertSilenced(a.name || '', host, silenceRules) !== null;
+  });
+  const silencedFingerprints = new Set(silencedAlerts.map(a => a.fingerprint));
+  const nonSilencedAlerts = nonSuppressedAlerts.filter(a => !silencedFingerprints.has(a.fingerprint));
+  const firingAlerts = nonSilencedAlerts.filter(a => !alertStates.get(a.fingerprint)?.acknowledged_by);
+  const ackedAlerts = nonSilencedAlerts.filter(a => !!alertStates.get(a.fingerprint)?.acknowledged_by);
+  const tabAlerts = dashboardTab === 'firing' ? firingAlerts
+    : dashboardTab === 'acknowledged' ? ackedAlerts
+    : dashboardTab === 'silenced' ? silencedAlerts
+    : suppressedAlerts;
 
   const stats = useMemo(() => computeStats(firingAlerts), [firingAlerts]);
 
@@ -506,7 +549,7 @@ export default function DashboardView({
     return arr;
   }, [filteredAlerts, sortKey, sortDir]);
 
-  const alertGroups = useMemo(() => groupView ? buildAlertGroups(sortedAlerts, sortKey, sortDir) : [], [sortedAlerts, groupView, sortKey, sortDir]);
+  const alertGroups = useMemo(() => groupView ? buildAlertGroups(sortedAlerts, sortKey, sortDir, alertStates) : [], [sortedAlerts, groupView, sortKey, sortDir, alertStates]);
 
   const displayAlerts = clusterFilter
     ? filteredAlerts.filter(a => clusterFilter.includes(a.fingerprint))
@@ -558,6 +601,7 @@ export default function DashboardView({
   }
 
   const [resolvingGroups, setResolvingGroups] = useState<Set<string>>(new Set());
+  const [groupSevDropdown, setGroupSevDropdown] = useState<string | null>(null);
 
   async function handleGroupResolve(group: AlertGroup) {
     if (!confirm(`Resolve all ${group.alerts.length} alerts in "${group.label}"?`)) return;
@@ -576,11 +620,13 @@ export default function DashboardView({
 
   return (
     <div className="space-y-6">
-      {/* Situation Summary Card */}
-      <SituationCard
-        sseUpdateTrigger={sseUpdateTrigger}
-        onClusterClick={(fps) => setClusterFilter(fps.length > 0 ? fps : null)}
-      />
+      {/* Situation Summary Card — only show when there are firing alerts */}
+      {alerts.length > 0 && (
+        <SituationCard
+          sseUpdateTrigger={sseUpdateTrigger}
+          onClusterClick={(fps) => setClusterFilter(fps.length > 0 ? fps : null)}
+        />
+      )}
 
       {/* Stat Cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -615,6 +661,18 @@ export default function DashboardView({
         >
           Acknowledged ({ackedAlerts.length})
         </button>
+        {(silencedAlerts.length > 0 || silenceRules.length > 0) && (
+          <button
+            onClick={() => setDashboardTab('silenced')}
+            className={`px-4 py-1.5 rounded-md text-xs font-medium transition-colors ${
+              dashboardTab === 'silenced'
+                ? 'bg-accent text-white'
+                : 'text-muted hover:text-text-bright'
+            }`}
+          >
+            Silenced ({silencedAlerts.length}{silenceRules.length > 0 ? ` · ${silenceRules.length} rule${silenceRules.length > 1 ? 's' : ''}` : ''})
+          </button>
+        )}
         {suppressedAlerts.length > 0 && (
           <button
             onClick={() => setDashboardTab('suppressed')}
@@ -627,7 +685,23 @@ export default function DashboardView({
             Suppressed ({suppressedAlerts.length})
           </button>
         )}
+        {/* Create Incident (global) */}
+        <button
+          onClick={() => setShowIncidentWizard(!showIncidentWizard)}
+          className={`ml-auto px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+            showIncidentWizard
+              ? 'bg-orange/20 text-orange'
+              : 'text-orange hover:bg-orange/10'
+          }`}
+        >
+          Create Incident
+        </button>
       </div>
+
+      {/* Incident Wizard (global — not tied to a specific alert) */}
+      {showIncidentWizard && (
+        <IncidentWizard onClose={() => setShowIncidentWizard(false)} />
+      )}
 
       {/* Active filter indicator */}
       {hasFilter && (
@@ -711,7 +785,77 @@ export default function DashboardView({
               </tr>
             </thead>
             <tbody>
-              {dashboardTab === 'suppressed' ? (
+              {dashboardTab === 'silenced' ? (
+                <>
+                  {/* Active silence rules summary */}
+                  {silenceRules.length > 0 && (
+                    <tr>
+                      <td colSpan={6} className="px-5 py-3 bg-yellow/5 border-b border-yellow/20">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-xs font-medium text-yellow">Active silence rules:</span>
+                          {silenceRules.map(rule => (
+                            <span key={rule.id} className="inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded bg-surface border border-border text-muted">
+                              <span className="text-text-bright">{rule.alert_name_pattern}</span>
+                              {rule.hostname_pattern && <span className="text-muted">on {rule.hostname_pattern}</span>}
+                              <span className="text-muted/60">expires {timeAgo(rule.expires_at).replace(' ago', '').replace('just now', 'now')}</span>
+                              {onCancelSilence && (
+                                <button
+                                  onClick={() => onCancelSilence(rule.id)}
+                                  className="text-red/60 hover:text-red transition-colors ml-0.5"
+                                  title="Cancel silence rule"
+                                >
+                                  &times;
+                                </button>
+                              )}
+                            </span>
+                          ))}
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                  {silencedAlerts.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="table-cell text-center text-muted py-8">
+                        No silenced alerts
+                      </td>
+                    </tr>
+                  ) : (
+                    silencedAlerts.map(alert => {
+                      const host = alert.hostName || alert.hostname || '';
+                      const source = getSourceLabel(alert);
+                      const rule = isAlertSilenced(alert.name || '', host, silenceRules);
+                      const enrichment = parseAIEnrichment(alert.note);
+                      const summary = enrichment?.summary || '';
+                      return (
+                        <tr key={alert.fingerprint || alert.id} className="border-b border-border/50 hover:bg-surface-hover transition-colors">
+                          <td className="table-cell">
+                            <span className="badge bg-yellow/10 text-yellow border border-yellow/30">silenced</span>
+                          </td>
+                          <td className="table-cell">
+                            <button
+                              onClick={() => onAlertClick(alert)}
+                              className="text-left text-text-bright hover:text-accent transition-colors"
+                            >
+                              {alert.name?.substring(0, 60) || 'Unknown'}
+                            </button>
+                            {rule && (
+                              <div className="text-[10px] text-muted mt-0.5">
+                                Rule: &quot;{rule.alert_name_pattern}&quot;{rule.hostname_pattern ? ` on ${rule.hostname_pattern}` : ''} by {rule.created_by}
+                              </div>
+                            )}
+                          </td>
+                          <td className="table-cell text-muted text-xs font-mono">{host}</td>
+                          <td className="table-cell text-xs text-muted">{source}</td>
+                          <td className="table-cell text-xs text-muted max-w-xs">
+                            <div className="truncate">{summary || '--'}</div>
+                          </td>
+                          <td className="table-cell text-xs text-muted">{timeAgo(alertStartTime(alert))}</td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </>
+              ) : dashboardTab === 'suppressed' ? (
                 sortedAlerts.length === 0 ? (
                   <tr>
                     <td colSpan={6} className="table-cell text-center text-muted py-8">
@@ -795,6 +939,45 @@ export default function DashboardView({
                               })))}
                               {dashboardTab === 'firing' && (
                                 <>
+                                  <div className="relative">
+                                    <button
+                                      onClick={(e) => { e.stopPropagation(); setGroupSevDropdown(groupSevDropdown === group.key ? null : group.key); }}
+                                      className="text-[10px] px-2 py-0.5 rounded border border-border text-muted hover:text-yellow hover:border-yellow/50 transition-colors"
+                                    >
+                                      Set Severity
+                                    </button>
+                                    {groupSevDropdown === group.key && (
+                                      <div className="absolute z-50 top-full mt-1 right-0 bg-surface border border-border rounded-md shadow-lg py-1 min-w-[100px]"
+                                        onClick={(e) => e.stopPropagation()}
+                                      >
+                                        {['critical', 'high', 'warning', 'info'].map(s => (
+                                          <button
+                                            key={s}
+                                            onClick={async () => {
+                                              const fps = group.alerts.map(a => a.fingerprint);
+                                              await overrideSeverityBulk(fps, s);
+                                              setGroupSevDropdown(null);
+                                              onRefresh();
+                                            }}
+                                            className={`block w-full text-left text-xs px-3 py-1.5 hover:bg-surface-hover transition-colors ${severityColor(s)}`}
+                                          >
+                                            {s}
+                                          </button>
+                                        ))}
+                                        <button
+                                          onClick={async () => {
+                                            const fps = group.alerts.map(a => a.fingerprint);
+                                            await overrideSeverityBulk(fps, 'none');
+                                            setGroupSevDropdown(null);
+                                            onRefresh();
+                                          }}
+                                          className="block w-full text-left text-xs px-3 py-1.5 hover:bg-surface-hover transition-colors text-muted border-t border-border"
+                                        >
+                                          Reset to AI
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
                                   <button
                                     onClick={(e) => { e.stopPropagation(); handleGroupAck(group); }}
                                     className="text-[10px] px-2 py-0.5 rounded border border-border text-muted hover:text-green hover:border-green/50 transition-colors"
@@ -808,6 +991,65 @@ export default function DashboardView({
                                   >
                                     {resolvingGroups.has(group.key) ? 'Resolving...' : 'Resolve Group'}
                                   </button>
+                                  {onSilenceGroup && (
+                                    <div className="relative">
+                                      <button
+                                        onClick={(e) => { e.stopPropagation(); setSilenceDropdown(silenceDropdown === group.key ? null : group.key); }}
+                                        className="text-[10px] px-2 py-0.5 rounded border border-border text-muted hover:text-yellow hover:border-yellow/50 transition-colors"
+                                      >
+                                        Silence
+                                      </button>
+                                      {silenceDropdown === group.key && (() => {
+                                        const alertBase = group.label.split(' — ')[0] || group.label;
+                                        const hostPart = group.label.split(' — ')[1] || undefined;
+                                        const durations = [
+                                          { label: '1 hour', seconds: 3600 },
+                                          { label: '4 hours', seconds: 14400 },
+                                          { label: '8 hours', seconds: 28800 },
+                                          { label: '24 hours', seconds: 86400 },
+                                          { label: '7 days', seconds: 604800 },
+                                        ];
+                                        return (
+                                        <div className="absolute z-50 top-full mt-1 right-0 bg-surface border border-border rounded-md shadow-lg py-1 min-w-[180px]"
+                                          onClick={(e) => e.stopPropagation()}
+                                        >
+                                          <div className="px-3 py-1 text-[10px] text-muted uppercase tracking-wide">Silence this alert</div>
+                                          {durations.map(opt => (
+                                            <button
+                                              key={`alert-${opt.seconds}`}
+                                              onClick={async () => {
+                                                await onSilenceGroup(alertBase, opt.seconds, hostPart);
+                                                setSilenceDropdown(null);
+                                              }}
+                                              className="block w-full text-left text-xs px-3 py-1.5 hover:bg-surface-hover transition-colors text-text"
+                                            >
+                                              {opt.label}
+                                            </button>
+                                          ))}
+                                          {hostPart && (
+                                            <>
+                                              <div className="border-t border-border my-1" />
+                                              <div className="px-3 py-1 text-[10px] text-muted uppercase tracking-wide">Silence all on {hostPart}</div>
+                                              {durations.map(opt => (
+                                                <button
+                                                  key={`host-${opt.seconds}`}
+                                                  onClick={async () => {
+                                                    // Use wildcard * to match all alert names on this host pattern
+                                                    await onSilenceGroup('*', opt.seconds, hostPart);
+                                                    setSilenceDropdown(null);
+                                                  }}
+                                                  className="block w-full text-left text-xs px-3 py-1.5 hover:bg-surface-hover transition-colors text-yellow"
+                                                >
+                                                  {opt.label}
+                                                </button>
+                                              ))}
+                                            </>
+                                          )}
+                                        </div>
+                                        );
+                                      })()}
+                                    </div>
+                                  )}
                                 </>
                               )}
                             </span>

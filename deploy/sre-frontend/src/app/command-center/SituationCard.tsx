@@ -61,18 +61,18 @@ export default function SituationCard({ onClusterClick, sseUpdateTrigger }: Situ
     <div className="mb-4">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-4 py-2 bg-surface border border-border rounded-lg hover:bg-surface-hover transition-colors text-left"
+        className="w-full flex items-start gap-2 px-4 py-2.5 bg-surface border border-border rounded-lg hover:bg-surface-hover transition-colors text-left"
       >
-        <span className={`w-2.5 h-2.5 rounded-full ${severityDotColor(worstSeverity)} shrink-0`} />
-        <span className="text-xs font-medium text-accent shrink-0">✦ AI Summary</span>
-        <span className="text-sm text-text-bright flex-1 truncate">
+        <span className={`w-2.5 h-2.5 rounded-full ${severityDotColor(worstSeverity)} shrink-0 mt-1`} />
+        <span className="text-xs font-medium text-accent shrink-0 mt-0.5">✦ AI Summary</span>
+        <span className="text-sm text-text-bright flex-1">
           {summary.one_liner || 'Generating situation summary...'}
         </span>
-        <span className="text-xs text-muted shrink-0">
+        <span className="text-xs text-muted shrink-0 mt-0.5">
           {summary.generated_at ? timeAgo(summary.generated_at) : ''}
         </span>
         <svg
-          className={`w-4 h-4 text-muted transition-transform ${expanded ? 'rotate-180' : ''}`}
+          className={`w-4 h-4 text-muted transition-transform shrink-0 mt-0.5 ${expanded ? 'rotate-180' : ''}`}
           fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
         >
           <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />

@@ -1,13 +1,12 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Alert, AIEnrichment, SREFeedback, RunbookEntry, AlertState, SSEEvent, RunbookFeedback } from '@/lib/types';
+import { Alert, AIEnrichment, RunbookEntry, AlertState, SSEEvent, RunbookFeedback } from '@/lib/types';
 import { useSSE } from '@/hooks/useSSE';
 import {
   fetchAlerts,
   parseAIEnrichment,
-  parseSREFeedback,
-  submitFeedback,
+  submitSREFeedback,
   submitStructuredFeedback,
   severityColor,
   severityBg,
@@ -17,6 +16,8 @@ import {
   submitRunbookEntry,
   resolveAlert,
   resolveAlerts,
+  unresolveAlert,
+  unresolveAlerts,
   silenceAlert,
   createJiraIncident,
   fetchAlertStates,
@@ -33,11 +34,19 @@ import {
   storeEscalationState,
   submitRunbookFeedback,
   fetchRunbookFeedback,
+  fetchSilenceRules,
+  createSilenceRule,
+  cancelSilenceRule,
+  SilenceRule,
+  MaintenanceEvent,
+  fetchMaintenanceEvents,
 } from '@/lib/keep-api';
 import { getClientUsername } from '@/lib/auth';
-import { detectRegistryFromAlert, buildRegistryMailto } from '@/lib/registry';
+import { detectRegistryFromAlert, buildRegistryMailto, matchMaintenanceToOperators } from '@/lib/registry';
 import DashboardView from './DashboardView';
 import AlertsTableView from './AlertsTableView';
+import KnowledgeBasePage from './KnowledgeBasePage';
+import IncidentWizard from './IncidentWizard';
 
 export default function CommandCenter() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
@@ -48,24 +57,33 @@ export default function CommandCenter() {
   const [refreshing, setRefreshing] = useState(false);
   const [selectedAlert, setSelectedAlert] = useState<Alert | null>(null);
   const [alertStates, setAlertStates] = useState<Map<string, AlertState>>(new Map());
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'alerts'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'alerts' | 'knowledge-base'>('dashboard');
   const [situationTrigger, setSituationTrigger] = useState(0);
+  const [silenceRules, setSilenceRules] = useState<SilenceRule[]>([]);
+  const [maintenanceEvents, setMaintenanceEvents] = useState<MaintenanceEvent[]>([]);
 
   const load = useCallback(async () => {
     try {
-      const [data, states] = await Promise.all([fetchAlerts(250), fetchAlertStates()]);
+      const [data, states, rules, maint] = await Promise.all([fetchAlerts(250), fetchAlertStates(), fetchSilenceRules(), fetchMaintenanceEvents()]);
 
       // Build states map
       let stateMap = new Map<string, AlertState>();
       for (const s of states) stateMap.set(s.alert_fingerprint, s);
 
-      // Re-fire detection: check acked alerts for new firingStartTime
+      // Re-fire detection: check alerts with any persisted state for new firingStartTime
+      // This catches acked alerts, investigated alerts, and alerts with stale Jira tickets
       const refired: string[] = [];
       for (const alert of data) {
         const st = stateMap.get(alert.fingerprint);
-        if (st?.acknowledged_by && st.ack_firing_start) {
-          const cur = alert.firingStartTime || alert.startedAt || '';
-          if (cur && cur !== st.ack_firing_start) refired.push(alert.fingerprint);
+        if (!st) continue;
+        const hasState = st.acknowledged_by || st.investigating_user || st.incident_jira_key;
+        if (!hasState) continue;
+        const cur = alert.firingStartTime || alert.startedAt || '';
+        if (!cur) continue;
+        // Compare against ack_firing_start if acked, or against the state timestamp
+        const stateTime = st.ack_firing_start || st.investigating_since || st.incident_created_at || st.acknowledged_at || '';
+        if (stateTime && new Date(cur).getTime() > new Date(stateTime).getTime()) {
+          refired.push(alert.fingerprint);
         }
       }
       if (refired.length > 0) {
@@ -77,6 +95,8 @@ export default function CommandCenter() {
 
       setAlerts(data);
       setAlertStates(stateMap);
+      setSilenceRules(rules);
+      setMaintenanceEvents(maint);
       setLastUpdated(new Date());
       setError(null);
     } catch (e: unknown) {
@@ -94,6 +114,12 @@ export default function CommandCenter() {
 
     if (event.type === 'situation_update') {
       setSituationTrigger(prev => prev + 1);
+      return;
+    }
+
+    if (event.type === 'silence_created' || event.type === 'silence_cancelled') {
+      // Refresh silence rules on any change
+      fetchSilenceRules().then(rules => setSilenceRules(rules));
       return;
     }
 
@@ -120,6 +146,11 @@ export default function CommandCenter() {
             break;
           case 'force_enrich':
             break;
+          case 'severity_override':
+            next.set(fp, { ...existing, severity_override: event.severity === 'none' ? null : (event.severity || null), severity_override_by: event.user || null });
+            break;
+          case 'runbook_feedback':
+            break;
         }
       }
 
@@ -134,7 +165,15 @@ export default function CommandCenter() {
               next.set(fp, { ...existing, acknowledged_by: null, acknowledged_at: null, ack_firing_start: null, is_updated: 0 });
               break;
             case 'mark_updated':
-              next.set(fp, { ...existing, acknowledged_by: null, acknowledged_at: null, is_updated: 1 });
+              next.set(fp, { ...existing,
+                acknowledged_by: null, acknowledged_at: null, ack_firing_start: null,
+                investigating_user: null, investigating_since: null,
+                incident_jira_key: null, incident_jira_url: null,
+                incident_created_by: null, incident_created_at: null,
+                escalated_to: null, escalated_by: null, escalated_at: null,
+                severity_override: null, severity_override_by: null,
+                is_updated: 1,
+              });
               break;
           }
         }
@@ -176,6 +215,11 @@ export default function CommandCenter() {
 
   async function handleGroupResolve(fingerprints: string[]) {
     await resolveAlerts(fingerprints);
+    load();
+  }
+
+  async function handleGroupUnresolve(fingerprints: string[]) {
+    await unresolveAlerts(fingerprints);
     load();
   }
 
@@ -237,10 +281,18 @@ export default function CommandCenter() {
         >
           All Alerts
         </button>
+        <button
+          onClick={() => setActiveTab('knowledge-base')}
+          className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+            activeTab === 'knowledge-base' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-white'
+          }`}
+        >
+          Knowledge Base
+        </button>
       </div>
 
       {/* Tab Content */}
-      {activeTab === 'dashboard' ? (
+      {activeTab === 'dashboard' && (
         <DashboardView
           alerts={alerts}
           alertStates={alertStates}
@@ -251,11 +303,22 @@ export default function CommandCenter() {
           onUnacknowledge={handleUnacknowledge}
           onGroupAcknowledge={handleGroupAcknowledge}
           onGroupResolve={handleGroupResolve}
+          onGroupUnresolve={handleGroupUnresolve}
           onForceEnrich={async (fp: string) => { await forceEnrich(fp); load(); }}
           onRefresh={load}
           sseUpdateTrigger={situationTrigger}
+          silenceRules={silenceRules}
+          onSilenceGroup={async (alertNamePattern, durationSeconds, hostnamePattern) => {
+            await createSilenceRule(alertNamePattern, durationSeconds, hostnamePattern);
+            load();
+          }}
+          onCancelSilence={async (ruleId) => {
+            await cancelSilenceRule(ruleId);
+            load();
+          }}
         />
-      ) : (
+      )}
+      {activeTab === 'alerts' && (
         <AlertsTableView
           alerts={alerts}
           alertStates={alertStates}
@@ -263,6 +326,7 @@ export default function CommandCenter() {
           onAlertClick={setSelectedAlert}
         />
       )}
+      {activeTab === 'knowledge-base' && <KnowledgeBasePage />}
 
       {/* Alert Detail Modal */}
       {selectedAlert && (
@@ -273,6 +337,7 @@ export default function CommandCenter() {
           alertState={alertStates.get(selectedAlert.fingerprint)}
           onInvestigate={() => handleInvestigate(selectedAlert)}
           onAcknowledge={() => handleAcknowledge(selectedAlert)}
+          maintenanceEvents={maintenanceEvents}
         />
       )}
     </div>
@@ -318,13 +383,14 @@ function RefreshControl({ refreshInterval, onRefreshIntervalChange, onRefresh, r
 
 /* ── Alert Detail Modal ── */
 
-function AlertDetailModal({ alert, onClose, onRefresh, alertState, onInvestigate, onAcknowledge }: {
+function AlertDetailModal({ alert, onClose, onRefresh, alertState, onInvestigate, onAcknowledge, maintenanceEvents = [] }: {
   alert: Alert;
   onClose: () => void;
   onRefresh: () => void;
   alertState?: AlertState;
   onInvestigate?: () => void;
   onAcknowledge?: () => void;
+  maintenanceEvents?: MaintenanceEvent[];
 }) {
   const enrichment = parseAIEnrichment(alert.note);
   const host = alert.hostName || alert.hostname || 'Unknown';
@@ -379,7 +445,7 @@ function AlertDetailModal({ alert, onClose, onRefresh, alertState, onInvestigate
           </div>
 
           {/* Actions */}
-          <AlertActions alert={alert} enrichment={enrichment} onAlertChanged={onRefresh} alertState={alertState} onInvestigate={onInvestigate} onAcknowledge={onAcknowledge} />
+          <AlertActions alert={alert} enrichment={enrichment} onAlertChanged={onRefresh} alertState={alertState} onInvestigate={onInvestigate} onAcknowledge={onAcknowledge} maintenanceEvents={maintenanceEvents} />
 
           {/* Description / Metric Values */}
           {alert.description && alert.description !== alert.name && (
@@ -479,17 +545,13 @@ function AlertDetailModal({ alert, onClose, onRefresh, alertState, onInvestigate
           )}
 
           {/* SRE Feedback */}
-          {enrichment && (
-            <ModalFeedbackPanel
-              fingerprint={alert.fingerprint}
-              currentNote={alert.note}
-              existingFeedback={parseSREFeedback(alert.note)}
-              enrichment={enrichment}
-              onFeedbackSubmitted={onRefresh}
-              alertName={alert.name}
-              hostname={alert.hostName || alert.hostname || ''}
-            />
-          )}
+          <ModalFeedbackPanel
+            fingerprint={alert.fingerprint}
+            enrichment={enrichment}
+            onFeedbackSubmitted={onRefresh}
+            alertName={alert.name || ''}
+            hostname={alert.hostName || alert.hostname || ''}
+          />
 
           {/* Runbook & Remediation */}
           <RunbookPanel alert={alert} />
@@ -557,34 +619,26 @@ function ModalDetailCard({ title, content, icon }: { title: string; content: str
 
 function ModalFeedbackPanel({
   fingerprint,
-  currentNote,
-  existingFeedback,
   enrichment,
   onFeedbackSubmitted,
   alertName,
   hostname,
 }: {
   fingerprint: string;
-  currentNote: string | undefined | null;
-  existingFeedback: SREFeedback | null;
-  enrichment: { assessed_severity: string; noise_score: number };
+  enrichment: { assessed_severity: string; noise_score: number } | null;
   onFeedbackSubmitted?: () => void;
   alertName: string;
   hostname: string;
 }) {
-  const [rating, setRating] = useState<'positive' | 'negative' | null>(
-    existingFeedback?.rating === 'positive' ? 'positive' :
-    existingFeedback?.rating ? 'negative' : null
-  );
-  const [correctedSeverity, setCorrectedSeverity] = useState(existingFeedback?.corrected_severity ?? '');
-  const [correctedNoise, setCorrectedNoise] = useState(existingFeedback?.corrected_noise?.toString() ?? '');
+  const [rating, setRating] = useState<'positive' | 'negative' | null>(null);
+  const [correctedSeverity, setCorrectedSeverity] = useState('');
+  const [correctedNoise, setCorrectedNoise] = useState('');
   const [causeCorrection, setCauseCorrection] = useState('');
   const [remediationCorrection, setRemediationCorrection] = useState('');
-  const [comment, setComment] = useState(existingFeedback?.comment ?? '');
-  const [sreUser] = useState(() => existingFeedback?.sre_user || getClientUsername() || '');
+  const [comment, setComment] = useState('');
+  const [sreUser] = useState(() => getClientUsername() || '');
   const [submitting, setSubmitting] = useState(false);
-  const [submitted, setSubmitted] = useState(!!existingFeedback);
-  const [editing, setEditing] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
   const [justSubmitted, setJustSubmitted] = useState(false);
   const [submitError, setSubmitError] = useState(false);
 
@@ -593,18 +647,23 @@ function ModalFeedbackPanel({
     setSubmitting(true);
     setSubmitError(false);
 
-    const feedback: SREFeedback = {
-      rating: rating === 'negative' && !correctedSeverity && !correctedNoise ? 'negative' :
-              rating === 'negative' ? 'correction' : 'positive',
-      corrected_severity: correctedSeverity || undefined,
-      corrected_noise: correctedNoise ? parseInt(correctedNoise, 10) : undefined,
-      comment: comment.slice(0, 500) || undefined,
-      sre_user: sreUser || undefined,
-    };
+    const computedRating = rating === 'negative' && (correctedSeverity || correctedNoise) ? 'correction' : rating;
+    const combinedComment = [
+      comment,
+      causeCorrection ? `Cause correction: ${causeCorrection}` : '',
+      remediationCorrection ? `Remediation correction: ${remediationCorrection}` : '',
+    ].filter(Boolean).join('\n').slice(0, 2000) || undefined;
 
-    // Submit both legacy (note-based) and structured feedback in parallel
-    const [ok] = await Promise.all([
-      submitFeedback(fingerprint, currentNote, feedback),
+    // Submit to new API and structured feedback in parallel
+    const [result] = await Promise.all([
+      submitSREFeedback({
+        fingerprint,
+        alert_name: alertName,
+        rating: computedRating,
+        corrected_severity: correctedSeverity || undefined,
+        corrected_noise: correctedNoise ? parseInt(correctedNoise, 10) : undefined,
+        comment: combinedComment,
+      }),
       submitStructuredFeedback({
         alert_name: alertName,
         hostname: hostname,
@@ -616,10 +675,15 @@ function ModalFeedbackPanel({
       }),
     ]);
     setSubmitting(false);
-    if (ok) {
+    if (result) {
       setSubmitted(true);
-      setEditing(false);
       setJustSubmitted(true);
+      setRating(null);
+      setCorrectedSeverity('');
+      setCorrectedNoise('');
+      setCauseCorrection('');
+      setRemediationCorrection('');
+      setComment('');
       if (onFeedbackSubmitted) {
         setTimeout(onFeedbackSubmitted, 500);
       }
@@ -655,39 +719,7 @@ function ModalFeedbackPanel({
         </div>
       )}
 
-      {submitted && !editing ? (
-        <div className="space-y-2">
-          <div className="flex items-center gap-2 text-sm">
-            <span className={`text-base ${rating === 'positive' ? 'text-green' : 'text-red'}`}>
-              {rating === 'positive' ? '\u2713' : '\u2717'}
-            </span>
-            <span className="text-text text-xs">
-              {rating === 'positive' ? 'Confirmed accurate' : 'Needs correction'}
-            </span>
-            {sreUser && <span className="text-muted text-[10px]">by {sreUser}</span>}
-          </div>
-          {(correctedSeverity || correctedNoise) && (
-            <div className="flex gap-3 text-[10px] text-muted">
-              {correctedSeverity && (
-                <span>Severity: <span className={`font-medium ${severityColor(correctedSeverity)}`}>{correctedSeverity}</span></span>
-              )}
-              {correctedNoise && (
-                <span>Noise: <span className="font-medium text-text">{correctedNoise}/10</span></span>
-              )}
-            </div>
-          )}
-          {comment && (
-            <div className="text-xs text-text bg-bg rounded-md p-2 border border-border">{comment}</div>
-          )}
-          <button
-            onClick={() => { setEditing(true); setJustSubmitted(false); }}
-            className="text-[10px] text-accent hover:text-accent-hover transition-colors"
-          >
-            Update feedback
-          </button>
-        </div>
-      ) : (
-        <div className="space-y-3">
+      <div className="space-y-3">
           <div>
             <div className="text-[10px] text-muted mb-1.5">Is this analysis accurate?</div>
             <div className="flex gap-2">
@@ -723,7 +755,7 @@ function ModalFeedbackPanel({
                   onChange={(e) => setCorrectedSeverity(e.target.value)}
                   className="w-full bg-bg border border-border rounded-md px-2 py-1.5 text-xs text-text focus:border-accent focus:outline-none"
                 >
-                  <option value="">No change ({enrichment.assessed_severity})</option>
+                  <option value="">No change ({enrichment?.assessed_severity || 'unknown'})</option>
                   <option value="critical">Critical</option>
                   <option value="high">High</option>
                   <option value="warning">Warning</option>
@@ -738,7 +770,7 @@ function ModalFeedbackPanel({
                   onChange={(e) => setCorrectedNoise(e.target.value)}
                   className="w-full bg-bg border border-border rounded-md px-2 py-1.5 text-xs text-text focus:border-accent focus:outline-none"
                 >
-                  <option value="">No change ({enrichment.noise_score}/10)</option>
+                  <option value="">No change ({enrichment?.noise_score ?? '?'}/10)</option>
                   {[1,2,3,4,5,6,7,8,9,10].map(n => (
                     <option key={n} value={n}>{n}/10 {n <= 3 ? '(actionable)' : n >= 7 ? '(noise)' : ''}</option>
                   ))}
@@ -803,38 +835,32 @@ function ModalFeedbackPanel({
               >
                 {submitting ? 'Submitting...' : 'Submit'}
               </button>
-              {editing && (
-                <button
-                  onClick={() => setEditing(false)}
-                  className="px-3 py-1.5 rounded-md border border-border text-muted text-xs hover:text-text transition-colors"
-                >
-                  Cancel
-                </button>
-              )}
             </div>
           )}
         </div>
-      )}
     </div>
   );
 }
 
-function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvestigate, onAcknowledge }: {
+function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvestigate, onAcknowledge, maintenanceEvents = [] }: {
   alert: Alert;
   enrichment: AIEnrichment | null;
   onAlertChanged: () => void;
   alertState?: AlertState;
   onInvestigate?: () => void;
   onAcknowledge?: () => void;
+  maintenanceEvents?: MaintenanceEvent[];
 }) {
   const [resolving, setResolving] = useState(false);
-  const [resolved, setResolved] = useState(false);
+  const [resolved, setResolved] = useState(alert.status === 'resolved' || alert.status === 'ok');
+  const [unresolving, setUnresolving] = useState(false);
   const [showSilenceMenu, setShowSilenceMenu] = useState(false);
   const [silencing, setSilencing] = useState(false);
   const [silenced, setSilenced] = useState<string | null>(null);
   const [silenceError, setSilenceError] = useState(false);
   const [showIncidentForm, setShowIncidentForm] = useState(false);
   const [incidentResult, setIncidentResult] = useState<{ key: string; url: string } | null>(null);
+  const [showIncidentWizard, setShowIncidentWizard] = useState(false);
   const [showEscalation, setShowEscalation] = useState(false);
   const [escalationType, setEscalationType] = useState<'team' | 'user'>('team');
   const [escalationTarget, setEscalationTarget] = useState('');
@@ -855,6 +881,14 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
       })
     : null;
 
+  // Find maintenance events matching this alert's registry operator
+  const matchedMaintenance = registryMatch
+    ? maintenanceEvents.filter(m => {
+        const ops = matchMaintenanceToOperators(m.vendor, m.title);
+        return ops.includes(registryMatch.operator.id);
+      })
+    : [];
+
   async function handleResolve() {
     if (!confirm('Resolve this alert? It will be marked as resolved in Keep.')) return;
     setResolving(true);
@@ -862,6 +896,17 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
     setResolving(false);
     if (ok) {
       setResolved(true);
+      onAlertChanged();
+    }
+  }
+
+  async function handleUnresolve() {
+    if (!confirm('Unresolve this alert? It will be marked as firing again.')) return;
+    setUnresolving(true);
+    const ok = await unresolveAlert(alert.fingerprint);
+    setUnresolving(false);
+    if (ok) {
+      setResolved(false);
       onAlertChanged();
     }
   }
@@ -883,57 +928,116 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap gap-2">
-        {/* Resolve */}
-        <button
-          onClick={handleResolve}
-          disabled={resolving || resolved}
-          className={`px-3 py-1.5 rounded-md border text-xs font-medium transition-all ${
-            resolved
-              ? 'border-green/40 bg-green/10 text-green cursor-default'
-              : 'border-border text-muted hover:border-green/50 hover:text-green hover:bg-green/5'
-          } disabled:opacity-60`}
-        >
-          {resolved ? '\u2713 Resolved' : resolving ? 'Resolving...' : 'Resolve'}
-        </button>
-
-        {/* Silence */}
+        {/* Status Dropdown (Acknowledge, Resolve, Silence, Investigate) */}
         <div className="relative">
           <button
             onClick={() => setShowSilenceMenu(!showSilenceMenu)}
-            disabled={silencing || !!silenced}
-            className={`px-3 py-1.5 rounded-md border text-xs font-medium transition-all ${
-              silenced
-                ? 'border-yellow/40 bg-yellow/10 text-yellow cursor-default'
-                : 'border-border text-muted hover:border-yellow/50 hover:text-yellow hover:bg-yellow/5'
-            } disabled:opacity-60`}
+            className={`px-3 py-1.5 rounded-md border text-xs font-medium transition-all inline-flex items-center gap-1 ${
+              showSilenceMenu
+                ? 'border-accent/40 bg-accent/10 text-accent'
+                : 'border-border text-muted hover:border-accent/50 hover:text-accent hover:bg-accent/5'
+            }`}
           >
-            {silenced ? `Silenced (${silenced})` : silencing ? 'Silencing...' : 'Silence'}
+            Status
+            <svg className="w-3 h-3 opacity-60" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
           </button>
           {showSilenceMenu && (
             <>
               <div className="fixed inset-0 z-10" onClick={() => setShowSilenceMenu(false)} />
-              <div className="absolute top-full left-0 mt-1 bg-surface border border-border rounded-lg shadow-xl z-20 py-1 min-w-[140px]">
-                {[
-                  { label: '30 minutes', seconds: 1800 },
-                  { label: '1 hour', seconds: 3600 },
-                  { label: '4 hours', seconds: 14400 },
-                  { label: '8 hours', seconds: 28800 },
-                  { label: '24 hours', seconds: 86400 },
-                ].map(opt => (
+              <div className="absolute top-full left-0 mt-1 bg-surface border border-border rounded-lg shadow-xl z-20 py-1 min-w-[200px]">
+                {/* Acknowledge */}
+                {onAcknowledge && !alertState?.acknowledged_by && (
                   <button
-                    key={opt.seconds}
-                    onClick={() => handleSilence(opt.seconds)}
-                    className="w-full text-left px-3 py-1.5 text-xs text-text hover:bg-surface-hover transition-colors"
+                    onClick={() => { onAcknowledge(); setShowSilenceMenu(false); }}
+                    className="w-full text-left px-3 py-2 text-xs text-text hover:bg-surface-hover transition-colors flex items-center gap-2"
                   >
-                    {opt.label}
+                    <svg className="w-3 h-3 text-green" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                    </svg>
+                    Acknowledge
                   </button>
-                ))}
+                )}
+                {alertState?.acknowledged_by && (
+                  <div className="px-3 py-2 text-xs text-green flex items-center gap-2">
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                    </svg>
+                    Acked by {alertState.acknowledged_by}
+                  </div>
+                )}
+
+                {/* Resolve / Unresolve */}
+                {resolved ? (
+                  <button
+                    onClick={() => { handleUnresolve(); setShowSilenceMenu(false); }}
+                    disabled={unresolving}
+                    className="w-full text-left px-3 py-2 text-xs text-yellow hover:bg-surface-hover transition-colors flex items-center gap-2 disabled:opacity-60"
+                  >
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                    {unresolving ? 'Unresolving...' : 'Unresolve'}
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => { handleResolve(); setShowSilenceMenu(false); }}
+                    disabled={resolving}
+                    className="w-full text-left px-3 py-2 text-xs text-text hover:bg-surface-hover transition-colors flex items-center gap-2 disabled:opacity-60"
+                  >
+                    <svg className="w-3 h-3 text-green" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    {resolving ? 'Resolving...' : 'Resolve'}
+                  </button>
+                )}
+
+                {/* Investigate */}
+                {onInvestigate && (
+                  <button
+                    onClick={() => { onInvestigate(); setShowSilenceMenu(false); }}
+                    className={`w-full text-left px-3 py-2 text-xs hover:bg-surface-hover transition-colors flex items-center gap-2 ${
+                      alertState?.investigating_user ? 'text-blue' : 'text-text'
+                    }`}
+                  >
+                    <svg className="w-3 h-3 text-blue" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                    </svg>
+                    {alertState?.investigating_user ? `Investigating (${alertState.investigating_user})` : 'Investigate'}
+                  </button>
+                )}
+
+                {/* Silence durations */}
+                <div className="border-t border-border mt-1 pt-1">
+                  <div className="px-3 py-1 text-[10px] text-muted uppercase tracking-wider">Silence</div>
+                  {silenced ? (
+                    <div className="px-3 py-2 text-xs text-yellow flex items-center gap-2">
+                      Silenced ({silenced})
+                    </div>
+                  ) : (
+                    [
+                      { label: '30 minutes', seconds: 1800 },
+                      { label: '1 hour', seconds: 3600 },
+                      { label: '4 hours', seconds: 14400 },
+                      { label: '8 hours', seconds: 28800 },
+                      { label: '24 hours', seconds: 86400 },
+                    ].map(opt => (
+                      <button
+                        key={opt.seconds}
+                        onClick={() => { handleSilence(opt.seconds); setShowSilenceMenu(false); }}
+                        disabled={silencing}
+                        className="w-full text-left px-3 py-1.5 text-xs text-text hover:bg-surface-hover transition-colors pl-6"
+                      >
+                        {opt.label}
+                      </button>
+                    ))
+                  )}
+                </div>
               </div>
             </>
           )}
         </div>
 
-        {/* Create Incident */}
+        {/* Create Ticket (Jira) */}
         {incidentResult ? (
           <a
             href={incidentResult.url}
@@ -952,9 +1056,21 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
                 : 'border-border text-muted hover:border-accent/50 hover:text-accent hover:bg-accent/5'
             }`}
           >
-            Create Incident
+            Create Ticket
           </button>
         )}
+
+        {/* Create Incident (webhook + statuspage) */}
+        <button
+          onClick={() => setShowIncidentWizard(!showIncidentWizard)}
+          className={`px-3 py-1.5 rounded-md border text-xs font-medium transition-all ${
+            showIncidentWizard
+              ? 'border-orange/40 bg-orange/10 text-orange'
+              : 'border-border text-muted hover:border-orange/50 hover:text-orange hover:bg-orange/5'
+          }`}
+        >
+          Create Incident
+        </button>
 
         {/* Escalate (Grafana IRM) */}
         <button
@@ -996,43 +1112,24 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
           </a>
         )}
 
-        {/* Investigate Toggle */}
-        {onInvestigate && (
-          <button
-            onClick={onInvestigate}
-            className={`px-3 py-1.5 rounded-md border text-xs font-medium transition-all inline-flex items-center gap-1 ${
-              alertState?.investigating_user
-                ? 'border-blue/40 bg-blue/10 text-blue'
-                : 'border-border text-muted hover:border-blue/50 hover:text-blue hover:bg-blue/5'
-            }`}
+        {/* Maintenance Active */}
+        {matchedMaintenance.length > 0 && matchedMaintenance.slice(0, 2).map(m => (
+          <a
+            key={m.id}
+            href={m.permalink}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="px-3 py-1.5 rounded-md border border-yellow/30 bg-yellow/10 text-yellow text-xs font-medium hover:bg-yellow/20 transition-all inline-flex items-center gap-1"
+            title={m.title}
           >
             <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
             </svg>
-            {alertState?.investigating_user ? `Investigating (${alertState.investigating_user})` : 'Investigate'}
-          </button>
-        )}
+            Maint: {m.title.length > 30 ? m.title.substring(0, 30) + '...' : m.title}
+            {m.end_time && ` until ${new Date(m.end_time).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}`}
+          </a>
+        ))}
 
-        {/* Acknowledge */}
-        {onAcknowledge && !alertState?.acknowledged_by && (
-          <button
-            onClick={onAcknowledge}
-            className="px-3 py-1.5 rounded-md border border-border text-muted text-xs font-medium hover:border-green/50 hover:text-green hover:bg-green/5 transition-all inline-flex items-center gap-1"
-          >
-            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-            </svg>
-            Acknowledge
-          </button>
-        )}
-        {alertState?.acknowledged_by && (
-          <span className="px-3 py-1.5 rounded-md border border-green/40 bg-green/10 text-green text-xs font-medium inline-flex items-center gap-1">
-            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-            </svg>
-            Acked by {alertState.acknowledged_by}
-          </span>
-        )}
       </div>
 
       {silenceError && (
@@ -1051,6 +1148,14 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
             setShowIncidentForm(false);
           }}
           onCancel={() => setShowIncidentForm(false)}
+        />
+      )}
+
+      {/* Incident Wizard (webhook + statuspage) */}
+      {showIncidentWizard && (
+        <IncidentWizard
+          alert={alert}
+          onClose={() => setShowIncidentWizard(false)}
         />
       )}
 
@@ -1101,14 +1206,14 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
               if (!escalationTarget) return;
               setEscalating(true);
               setEscalationError('');
+              const host = alert.hostName || alert.hostname || '';
               const result = await escalateAlert({
                 team_id: escalationType === 'team' ? escalationTarget : undefined,
                 user_ids: escalationType === 'user' ? [escalationTarget] : undefined,
                 alert_name: alert.name || 'Unknown',
-                severity: enrichment?.assessed_severity || alert.severity || 'unknown',
-                summary: enrichment?.summary || alert.description || '',
+                severity: alert.severity || 'unknown',
+                hostname: host,
                 message: escalationMessage,
-                uip_link: typeof window !== 'undefined' ? window.location.href : '',
               });
               setEscalating(false);
               if (result.success) {
@@ -1246,7 +1351,7 @@ function IncidentForm({ alert, enrichment, onCreated, onCancel }: {
   return (
     <div className="bg-bg/60 border border-accent/20 rounded-lg p-4 space-y-3">
       <div className="flex items-center justify-between">
-        <h4 className="text-sm font-semibold text-accent">Create Jira Incident (OCCIR)</h4>
+        <h4 className="text-sm font-semibold text-accent">Create Ticket (OCCIR)</h4>
         <button onClick={onCancel} className="text-muted hover:text-text text-xs transition-colors">Cancel</button>
       </div>
 
@@ -1339,7 +1444,7 @@ function IncidentForm({ alert, enrichment, onCreated, onCancel }: {
           disabled={submitting || !summary.trim()}
           className="px-4 py-1.5 rounded-md bg-accent text-bg font-medium text-xs hover:bg-accent-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          {submitting ? (pastedImages.length > 0 ? 'Creating & uploading...' : 'Creating...') : 'Create Incident'}
+          {submitting ? (pastedImages.length > 0 ? 'Creating & uploading...' : 'Creating...') : 'Create Ticket'}
         </button>
       </div>
     </div>
@@ -1365,7 +1470,7 @@ function RunbookPanel({ alert }: { alert: Alert }) {
         setMatches(entries);
         const entryIds = entries.map((e: RunbookEntry) => e.id).filter(Boolean) as number[];
         if (entryIds.length > 0) {
-          fetchRunbookFeedback(entryIds).then((feedback: RunbookFeedback[]) => {
+          fetchRunbookFeedback(entryIds, alert.fingerprint).then((feedback: RunbookFeedback[]) => {
             const voteMap = new Map<string, 'up' | 'down'>();
             for (const fb of feedback) {
               voteMap.set(`${fb.runbook_entry_id}`, fb.vote);
@@ -1424,7 +1529,7 @@ function RunbookPanel({ alert }: { alert: Alert }) {
         setMatches(entries);
         const entryIds = entries.map((e: RunbookEntry) => e.id).filter(Boolean) as number[];
         if (entryIds.length > 0) {
-          fetchRunbookFeedback(entryIds).then((feedback: RunbookFeedback[]) => {
+          fetchRunbookFeedback(entryIds, alert.fingerprint).then((feedback: RunbookFeedback[]) => {
             const voteMap = new Map<string, 'up' | 'down'>();
             for (const fb of feedback) {
               voteMap.set(`${fb.runbook_entry_id}`, fb.vote);

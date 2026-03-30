@@ -117,6 +117,11 @@ export interface SSEEvent {
   escalated_to?: string;
   entry_id?: number;
   vote?: string;
+  severity?: string;
+  rule_id?: number;
+  alert_name_pattern?: string;
+  hostname_pattern?: string;
+  expires_at?: string;
   timestamp: string;
 }
 
@@ -128,6 +133,36 @@ export interface RunbookFeedback {
   vote: 'up' | 'down';
   user: string;
   created_at: string;
+}
+
+export interface SREFeedbackEntry {
+  id: number;
+  alert_fingerprint: string;
+  alert_name: string;
+  rating: 'positive' | 'negative' | 'correction';
+  corrected_severity?: string;
+  corrected_noise?: number;
+  comment?: string;
+  user: string;
+  created_at: string;
+  updated_at: string;
+  vote_score: number;
+  user_vote?: 'up' | 'down' | null;
+}
+
+export interface RunbookExclusion {
+  id: number;
+  alert_name: string;
+  runbook_entry_id: number;
+  excluded_by: string;
+  created_at: string;
+}
+
+export interface PaginatedResponse<T> {
+  items: T[];
+  total: number;
+  page: number;
+  limit: number;
 }
 
 export interface ClusterInfo {
@@ -162,4 +197,44 @@ export interface SituationSummary {
   generated_at: string;
   alert_hash: string;
   suggested_merges?: SuggestedMerge[];
+}
+
+// ── Incident Notification Types ──────────────────────
+
+export interface IncidentAssessment {
+  grade: string;
+  feedback: string;
+}
+
+export interface WebhookSubscriber {
+  id: number;
+  name: string;
+  url: string;
+  is_active: boolean;
+  created_at: string;
+  secret?: string;  // only returned on creation/rotation
+}
+
+export interface WebhookDelivery {
+  id: number;
+  subscriber_id: number;
+  subscriber_name?: string;
+  timestamp: string;
+  http_status: number | null;
+  attempts: number;
+  success: boolean;
+  is_test: boolean;
+}
+
+export interface StatuspageComponent {
+  id: string;
+  name: string;
+  status: string;
+  description: string;
+}
+
+export interface StatuspageIncident {
+  id: string;
+  shortlink: string;
+  status: string;
 }

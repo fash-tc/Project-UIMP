@@ -251,6 +251,11 @@ services:
       JIRA_BASE_URL: "https://wiki-tucows.atlassian.net"
       JIRA_EMAIL: "${JIRA_EMAIL}"
       JIRA_API_TOKEN: "${JIRA_API_TOKEN}"
+      OLLAMA_URL: "http://ollama:11434"
+      MAINT_DASHBOARD_URL: "http://10.177.154.174"
+      GRAFANA_WEBHOOK_SECRET: "${GRAFANA_WEBHOOK_SECRET}"
+      STATUSPAGE_API_KEY: "${STATUSPAGE_API_KEY}"
+      STATUSPAGE_PAGE_ID: "l7mgndhgstnc"
     deploy:
       resources:
         limits:

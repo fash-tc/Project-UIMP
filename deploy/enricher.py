@@ -24,11 +24,45 @@ FLAP_WINDOW = int(os.environ.get("FLAP_WINDOW_SECONDS", "600"))
 DEDUP_WINDOW = int(os.environ.get("DEDUP_WINDOW_SECONDS", "1800"))
 NOISE_THRESHOLD = int(os.environ.get("NOISE_THRESHOLD", "8"))
 ALERT_STATE_API_URL = os.environ.get("ALERT_STATE_API_URL", "http://alert-state-api:8092")
+MAINT_API_URL = os.environ.get("MAINT_API_URL", "http://10.177.154.174/api/active-now")
+STALE_RESOLVE_SECONDS = int(os.environ.get("STALE_RESOLVE_SECONDS", "7200"))  # Auto-resolve after 2h with no update
 
 enriched_cache = {}  # {fingerprint: timestamp} — entries expire after 600s
 
 # In-memory tracking for noise suppression
 recent_enrichments = {}  # fingerprint -> {alert_name, host, enrichment_text, noise_score, enriched_at, resolve_count, last_resolved_at}
+
+# Vendor keyword -> operator IDs for maintenance correlation
+VENDOR_OPERATOR_MAP = {
+    'verisign': ['verisign'],
+    'centralnic': ['centralnic'],
+    'afilias': ['identity-digital'],
+    'identity digital': ['identity-digital'],
+    'donuts': ['identity-digital'],
+    'neustar': ['godaddy-registry'],
+    'godaddy registry': ['godaddy-registry'],
+    'godaddy': ['godaddy-registry'],
+    'cira': ['cira'],
+    'nominet': ['nominet'],
+    'pir': ['pir'],
+    'afnic': ['afnic'],
+    'eurid': ['eurid'],
+    'denic': ['denic'],
+    'sidn': ['sidn'],
+    'red.es': ['red'],
+    'gmo': ['gmo-registry'],
+    'google': ['google-registry'],
+    'ari': ['ari-registry'],
+    'corenic': ['corenic'],
+    'nic.at': ['nic-at'],
+    'switch': ['switch'],
+    'registro': ['registro'],
+    'nicit': ['nicit'],
+    'opensrs': ['trs'],
+    'tucows registry': ['trs'],
+}
+
+REGISTRY_KEYWORDS = ["registry", "registrar", "epp", "whois", "rdap", "tld", "proxy", "domain"]
 
 _last_summary_hash = ""
 _last_summary_time = 0
@@ -256,6 +290,118 @@ def fetch_runbook_feedback(entry_ids):
     except Exception as e:
         log.debug(f"Runbook feedback fetch failed (non-fatal): {e}")
         return []
+
+
+def fetch_sre_feedback_by_name(alert_name):
+    """Fetch all SRE feedback entries for an alert name (for learning)."""
+    from urllib.parse import quote
+    url = f"{ALERT_STATE_API_URL}/api/alert-states/sre-feedback/by-alert-name?name={quote(alert_name)}"
+    try:
+        req = Request(url, headers={"Accept": "application/json"})
+        resp = urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log.warning(f"Failed to fetch SRE feedback for '{alert_name}': {e}")
+    return []
+
+
+def fetch_sre_feedback_by_fingerprint(fingerprint):
+    """Fetch SRE feedback for a specific alert instance."""
+    from urllib.parse import quote
+    url = f"{ALERT_STATE_API_URL}/api/alert-states/sre-feedback?fingerprint={quote(fingerprint)}"
+    try:
+        req = Request(url, headers={"Accept": "application/json"})
+        resp = urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log.warning(f"Failed to fetch SRE feedback for fp {fingerprint[:16]}: {e}")
+    return []
+
+
+def fetch_active_maintenance():
+    """Fetch currently active maintenance events from the maintenance API."""
+    try:
+        req = Request(MAINT_API_URL, headers={"Accept": "application/json"})
+        resp = urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        return data.get("results", []) if isinstance(data, dict) else []
+    except Exception as e:
+        log.debug(f"Maintenance API fetch failed (non-fatal): {e}")
+        return []
+
+
+def match_maintenance_to_alert(alert, maintenance_events):
+    """Check if any active maintenance events are related to this alert."""
+    name = alert.get("name", "").lower()
+    description = (alert.get("description", "") or "").lower()
+    host = (alert.get("hostName", "") or alert.get("hostname", "") or "").lower()
+    combined = f"{name} {description} {host}"
+
+    # Only check registry-related alerts
+    is_registry = any(kw in combined for kw in REGISTRY_KEYWORDS)
+    if not is_registry:
+        return []
+
+    matched = []
+    for event in maintenance_events:
+        vendor = (event.get("vendor", "") or "").lower()
+        title = (event.get("title", "") or "").lower()
+        event_text = f"{vendor} {title}"
+
+        for keyword, operator_ids in VENDOR_OPERATOR_MAP.items():
+            if keyword in event_text and keyword in combined:
+                matched.append(event)
+                break
+            # Also check if vendor keyword matches any part of the alert
+            if keyword in event_text:
+                # Check if alert mentions any TLD or registry term that links to this vendor
+                for kw in REGISTRY_KEYWORDS:
+                    if kw in combined:
+                        matched.append(event)
+                        break
+                break
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for m in matched:
+        mid = m.get("id", id(m))
+        if mid not in seen:
+            seen.add(mid)
+            unique.append(m)
+    return unique
+
+
+def fetch_runbook_exclusions(alert_name):
+    """Fetch runbook exclusions for an alert name."""
+    from urllib.parse import quote
+    url = f"{ALERT_STATE_API_URL}/api/alert-states/runbook-exclusions?alert_name={quote(alert_name)}"
+    try:
+        req = Request(url, headers={"Accept": "application/json"})
+        resp = urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log.warning(f"Failed to fetch runbook exclusions for '{alert_name}': {e}")
+    return []
+
+
+def fetch_runbook_feedback_aggregate(entry_ids):
+    """Fetch aggregate vote scores for runbook entries across all alerts."""
+    if not entry_ids:
+        return {}
+    ids_str = ",".join(str(i) for i in entry_ids)
+    url = f"{ALERT_STATE_API_URL}/api/alert-states/runbook-feedback/aggregate?entry_ids={ids_str}"
+    try:
+        req = Request(url, headers={"Accept": "application/json"})
+        resp = urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        log.warning(f"Failed to fetch runbook feedback aggregate: {e}")
+    return {}
 
 
 def fetch_ai_instructions():
@@ -511,62 +657,125 @@ def build_enrichment_prompt(alert, similar_alerts):
 
     # Legacy lessons context (secondary signal)
     lessons_context = feedback_tracker.build_lessons_context(alert)
-    direct_feedback = parse_sre_feedback(alert.get("note", "") or "")
+
+    # Fetch SRE feedback from alert-state-api (replaces note-field parsing)
+    fingerprint = alert.get("fingerprint", "")
+
+    # Historical feedback for learning (all instances of this alert)
+    sre_feedback_historical = fetch_sre_feedback_by_name(name)
+    # Current instance feedback
+    sre_feedback_current = fetch_sre_feedback_by_fingerprint(fingerprint)
+
+    # Build SRE feedback prompt section
     direct_fb_context = ""
-    if direct_feedback:
-        direct_fb_context = f"\nDIRECT SRE FEEDBACK ON THIS ALERT:\n  Rating: {direct_feedback.get('rating', 'none')}\n"
-        if direct_feedback.get("corrected_severity"):
-            direct_fb_context += f"  SRE says correct severity is: {direct_feedback['corrected_severity']}\n"
-        if direct_feedback.get("corrected_noise"):
-            direct_fb_context += f"  SRE says correct noise score is: {direct_feedback['corrected_noise']}/10\n"
-        if direct_feedback.get("comment"):
-            direct_fb_context += f'  SRE comment: "{direct_feedback["comment"][:200]}"\n'
-        direct_fb_context += "  IMPORTANT: Respect the SRE's corrections in your assessment.\n"
+    if sre_feedback_current:
+        direct_fb_context += "\nDIRECT SRE FEEDBACK ON THIS ALERT INSTANCE:\n"
+        for fb in sre_feedback_current:
+            vote_label = ""
+            vs = fb.get("vote_score", 0)
+            if vs > 0:
+                vote_label = f" [SRE TEAM CONSENSUS, +{vs}]"
+            elif vs < 0:
+                vote_label = f" [DISPUTED, {vs}]"
+            direct_fb_context += f"  - {fb.get('user', 'SRE')}: {fb.get('rating', 'unknown')}{vote_label}\n"
+            if fb.get("corrected_severity"):
+                direct_fb_context += f"    Corrected severity: {fb['corrected_severity']}\n"
+            if fb.get("corrected_noise") is not None:
+                direct_fb_context += f"    Corrected noise: {fb['corrected_noise']}/10\n"
+            if fb.get("comment"):
+                direct_fb_context += f"    Comment: {fb['comment']}\n"
+
+    if sre_feedback_historical:
+        # Filter out entries already shown in current instance
+        current_ids = {fb.get("id") for fb in sre_feedback_current}
+        historical_only = [fb for fb in sre_feedback_historical if fb.get("id") not in current_ids]
+        if historical_only:
+            direct_fb_context += "\nHISTORICAL SRE FEEDBACK ON SIMILAR ALERTS:\n"
+            for fb in historical_only[:10]:  # Limit to top 10
+                vote_label = ""
+                vs = fb.get("vote_score", 0)
+                if vs > 0:
+                    vote_label = f" [VALIDATED, +{vs}]"
+                elif vs < 0:
+                    vote_label = f" [DISPUTED, {vs}]"
+                else:
+                    vote_label = " [UNVALIDATED]"
+                direct_fb_context += f"  - {fb.get('user', 'SRE')}: {fb.get('rating', 'unknown')}{vote_label}\n"
+                if fb.get("corrected_severity"):
+                    direct_fb_context += f"    Corrected severity: {fb['corrected_severity']}\n"
+                if fb.get("corrected_noise") is not None:
+                    direct_fb_context += f"    Corrected noise: {fb['corrected_noise']}/10\n"
+                if fb.get("comment"):
+                    direct_fb_context += f"    Comment: {fb['comment']}\n"
+
+    if direct_fb_context:
+        direct_fb_context += "\nIMPORTANT: Respect the SRE's corrections in your assessment. Feedback with positive vote scores represents team consensus.\n"
+
+    # Fallback: if no API feedback found, try legacy note-field parsing
+    if not sre_feedback_current and not sre_feedback_historical:
+        legacy_feedback = parse_sre_feedback(alert.get("note", "") or "")
+        if legacy_feedback:
+            direct_fb_context = f"\nDIRECT SRE FEEDBACK ON THIS ALERT:\n"
+            direct_fb_context += f"  Rating: {legacy_feedback.get('rating', 'unknown')}\n"
+            if legacy_feedback.get("corrected_severity"):
+                direct_fb_context += f"  Corrected severity: {legacy_feedback['corrected_severity']}\n"
+            if legacy_feedback.get("corrected_noise"):
+                direct_fb_context += f"  Corrected noise: {legacy_feedback['corrected_noise']}/10\n"
+            if legacy_feedback.get("comment"):
+                direct_fb_context += f"  Comment: {legacy_feedback['comment']}\n"
+            direct_fb_context += "\nIMPORTANT: Respect the SRE's corrections in your assessment.\n"
 
     # Runbook entries context (with SRE feedback integration)
     runbook_entries = fetch_runbook_entries(name, host, service)
 
-    # Fetch SRE feedback on runbook entries
+    # Fetch runbook exclusions
+    exclusions = fetch_runbook_exclusions(name)
+    excluded_ids = {e.get("runbook_entry_id") for e in exclusions}
+
+    # Filter out excluded entries
+    runbook_entries = [e for e in runbook_entries if e.get("id") not in excluded_ids]
+
+    # Fetch aggregate historical vote scores
     entry_ids = [e.get("id") for e in runbook_entries if e.get("id")]
-    feedback_rows = fetch_runbook_feedback(entry_ids)
+    agg_scores = fetch_runbook_feedback_aggregate(entry_ids) if entry_ids else {}
 
-    # Aggregate votes per entry_id: net score (up=+1, down=-1)
-    vote_scores = {}
-    for fb in feedback_rows:
-        eid = fb.get("runbook_entry_id")
-        v = 1 if fb.get("vote") == "up" else -1
-        vote_scores[eid] = vote_scores.get(eid, 0) + v
-
+    # Build runbook prompt section with vote weighting
     runbook_context = ""
     if runbook_entries:
-        good_lines = ["\nRUNBOOK ENTRIES (real SRE remediation experience for similar alerts — use as authoritative reference):"]
-        bad_lines = ["\nDOWNVOTED REMEDIATION (marked irrelevant by SREs — do NOT recommend these):"]
-        has_good = False
-        has_bad = False
+        upvoted = []
+        neutral = []
+        downvoted = []
         for entry in runbook_entries[:5]:
+            eid = str(entry.get("id", ""))
+            agg = agg_scores.get(eid, {})
+            net_score = agg.get("net_score", 0)
             date = (entry.get("created_at") or "unknown")[:10]
             user = entry.get("sre_user") or "unknown"
             e_name = (entry.get("alert_name") or "")[:60]
             e_host = entry.get("hostname") or "N/A"
             rem = (entry.get("remediation") or "")[:300]
-            eid = entry.get("id")
-            score = vote_scores.get(eid, 0)
-            line1 = f'  - [{date}, {user}] Alert: "{e_name}" | Host: {e_host}'
-            line2 = f'    Remediation: "{rem}"'
-            if score < 0:
-                bad_lines.append(line1)
-                bad_lines.append(line2)
-                has_bad = True
+            detail = f'  [{date}, {user}] Alert: "{e_name}" | Host: {e_host}\n    Remediation: "{rem}"'
+            if net_score > 0:
+                upvoted.append((detail, net_score))
+            elif net_score < 0:
+                downvoted.append((detail, net_score))
             else:
-                good_lines.append(line1)
-                good_lines.append(line2)
-                has_good = True
-        if has_good:
-            good_lines.append("  Apply these SRE-validated remediation steps to your REMEDIATION field when relevant.\n")
-            runbook_context += "\n".join(good_lines)
-        if has_bad:
-            bad_lines.append("  These have been flagged as unhelpful. Do not use them.\n")
-            runbook_context += "\n".join(bad_lines)
+                neutral.append(detail)
+
+        if upvoted:
+            runbook_context += "\nSRE-VALIDATED REMEDIATION (use as authoritative reference):\n"
+            for detail, score in upvoted:
+                runbook_context += f"  [+{score}] {detail}\n"
+            runbook_context += "  Apply these SRE-validated remediation steps to your REMEDIATION field when relevant.\n"
+        if neutral:
+            runbook_context += "\nRUNBOOK ENTRIES (unvalidated):\n"
+            for detail in neutral:
+                runbook_context += f"  {detail}\n"
+        if downvoted:
+            runbook_context += "\nLOW-CONFIDENCE REMEDIATION (historically disputed — use with caution):\n"
+            for detail, score in downvoted:
+                runbook_context += f"  [{score}] {detail}\n"
+            runbook_context += "  These have been flagged as unhelpful. Do not use them.\n"
 
     # Global AI instructions from SRE team
     ai_instructions = fetch_ai_instructions()
@@ -578,6 +787,20 @@ def build_enrichment_prompt(alert, similar_alerts):
             lines.append(f"  {i}. {text}")
         lines.append("  Apply these directives to your analysis.\n")
         instructions_context = "\n".join(lines)
+
+    # Maintenance context
+    maintenance_context = ""
+    try:
+        maintenance_events = fetch_active_maintenance()
+        maintenance_matches = match_maintenance_to_alert(alert, maintenance_events)
+        if maintenance_matches:
+            maintenance_context = "\nACTIVE MAINTENANCE WINDOWS (factor into noise/severity assessment):\n"
+            for m in maintenance_matches[:3]:
+                end = m.get("end_time", "unknown")
+                maintenance_context += f'  - "{m.get("title", "")}" ({m.get("vendor", "")}), until {end}\n'
+            maintenance_context += "  NOTE: Alerts during scheduled maintenance are typically high-noise (8-10/10). Consider this in your assessment.\n"
+    except Exception as e:
+        log.debug(f"Maintenance context build failed (non-fatal): {e}")
 
     return (
         "You are a senior SRE alert analyst for Tucows Domains, a major domain "
@@ -622,7 +845,8 @@ def build_enrichment_prompt(alert, similar_alerts):
         f"{lessons_context}"
         f"{direct_fb_context}"
         f"{runbook_context}"
-        f"{instructions_context}\n"
+        f"{instructions_context}"
+        f"{maintenance_context}\n"
         "Respond with a JSON object containing exactly these fields (keep values concise, 1-3 sentences):\n"
         '{"assessed_severity": "critical|high|warning|low|info",\n'
         '"likely_cause": "root cause hypothesis",\n'
@@ -862,6 +1086,39 @@ def clear_force_enrich(fingerprint):
         pass
 
 
+def fetch_silence_rules():
+    """Fetch active silence rules from alert-state-api."""
+    try:
+        req = Request(f"{ALERT_STATE_API_URL}/api/alert-states/silence-rules")
+        resp = urlopen(req, timeout=5)
+        return json.loads(resp.read())
+    except Exception:
+        return []
+
+
+def is_alert_silenced(alert, silence_rules):
+    """Check if an alert matches any active silence rule. Returns matched rule or None."""
+    import re as _re
+    name = (alert.get("name") or "").lower()
+    host = get_host(alert).lower()
+    for rule in silence_rules:
+        pattern = (rule.get("alert_name_pattern") or "").lower()
+        if not pattern or pattern not in name:
+            continue
+        host_pattern = rule.get("hostname_pattern")
+        if host_pattern:
+            hp = host_pattern.lower()
+            if "*" in hp:
+                regex_str = hp.replace(".", r"\.").replace("*", ".*")
+                if not _re.search(r"(^|\.)"+regex_str+r"$", host):
+                    continue
+            else:
+                if hp not in host:
+                    continue
+        return rule
+    return None
+
+
 # ── Alert Clustering ──────────────────────────────────────
 def cluster_alerts(active_alerts):
     """Group related active alerts using deterministic rules."""
@@ -996,7 +1253,53 @@ def merge_related_clusters(clusters):
             "hosts": sorted(set(all_hosts)),
         })
 
-    return merged
+    # Second pass: merge singletons and small clusters by domain suffix
+    # e.g., phx01.dns1.tucows.net and sea01.dns1.tucows.net share dns1.tucows.net
+    final = []
+    suffix_groups = {}
+    for c in merged:
+        label = c["label"]
+        parts = label.split(".")
+        # Use last 3 segments (or all if fewer) as suffix key, normalized
+        suffix_parts = parts[-3:] if len(parts) >= 3 else parts
+        suffix = ".".join(re.sub(r'\d+$', '', p) for p in suffix_parts)
+        suffix_groups.setdefault(suffix, []).append(c)
+
+    for suffix, group in suffix_groups.items():
+        if len(group) == 1:
+            final.append(group[0])
+            continue
+        # Only merge if total alert count > 1 (don't merge two unrelated singletons)
+        total = sum(c["count"] for c in group)
+        if total < 2:
+            final.extend(group)
+            continue
+        all_fps = []
+        all_names = []
+        all_hosts = []
+        top_sev = "info"
+        sev_order = {"critical": 0, "high": 1, "warning": 2, "low": 3, "info": 4}
+        for c in group:
+            all_fps.extend(c.get("fingerprints", []))
+            all_names.extend(c.get("alert_names", []))
+            all_hosts.extend(c.get("hosts", []))
+            c_sev = c.get("top_severity", "info")
+            if sev_order.get(c_sev, 5) < sev_order.get(top_sev, 5):
+                top_sev = c_sev
+        wild_label = "*." + suffix.replace(".", "*.") if not suffix.startswith("*") else suffix
+        # Clean up label: *.dns*.tucows*.net -> *.dns*.tucows.net
+        cid = "c_" + hashlib.sha256(",".join(sorted(all_fps)).encode()).hexdigest()[:12]
+        final.append({
+            "cluster_id": cid,
+            "label": wild_label,
+            "fingerprints": all_fps,
+            "alert_names": all_names,
+            "top_severity": top_sev,
+            "count": len(all_fps),
+            "hosts": sorted(set(all_hosts)),
+        })
+
+    return final
 
 
 def generate_situation_summary(clusters, active_alerts, resolved_count):
@@ -1136,6 +1439,181 @@ Rules:
     return summary
 
 
+# ── Zabbix verification for stale alert auto-resolve ──
+
+import ssl as _ssl
+
+_zabbix_ssl_ctx = _ssl.create_default_context()
+_zabbix_ssl_ctx.check_hostname = False
+_zabbix_ssl_ctx.verify_mode = _ssl.CERT_NONE
+
+# Zabbix instances the enricher can verify against (URL + credentials).
+# Only instances with credentials are checked; others are skipped.
+ZABBIX_INSTANCES = {
+    "domains-shared": {
+        "url": "https://zabbix.prod-domains-shared.bra2.tucows.systems/api_jsonrpc.php",
+        "user": os.environ.get("ZABBIX_DS_USER", "uip-poller"),
+        "password": os.environ.get("ZABBIX_DS_PASS", "UipPoller2026!"),
+    },
+    "enom": {
+        "url": "https://zabbix.enom.net/api_jsonrpc.php",
+        "user": os.environ.get("ZABBIX_ENOM_USER", ""),
+        "password": os.environ.get("ZABBIX_ENOM_PASS", ""),
+    },
+}
+
+_zabbix_auth_cache = {}  # instance -> (auth_token, expiry_epoch)
+_last_stale_check = 0
+_STALE_CHECK_INTERVAL = 600  # Only run stale check every 10 minutes
+
+
+def _zabbix_api(instance_url, method, params, auth=None):
+    """Call Zabbix JSON-RPC API."""
+    body = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1, "auth": auth}).encode()
+    req = Request(instance_url, data=body, headers={"Content-Type": "application/json"})
+    resp = urlopen(req, timeout=10, context=_zabbix_ssl_ctx)
+    data = json.loads(resp.read())
+    if "error" in data:
+        raise Exception(data["error"].get("data", data["error"].get("message", str(data["error"]))))
+    return data["result"]
+
+
+def _zabbix_login(instance_key):
+    """Login to Zabbix and cache the auth token (reused for 30 min)."""
+    now = time.time()
+    cached = _zabbix_auth_cache.get(instance_key)
+    if cached and cached[1] > now:
+        return cached[0]
+    cfg = ZABBIX_INSTANCES.get(instance_key)
+    if not cfg or not cfg["user"] or not cfg["password"]:
+        return None
+    try:
+        auth = _zabbix_api(cfg["url"], "user.login", {"user": cfg["user"], "password": cfg["password"]})
+        _zabbix_auth_cache[instance_key] = (auth, now + 1800)
+        return auth
+    except Exception as e:
+        log.warning(f"Zabbix login failed for {instance_key}: {e}")
+        return None
+
+
+def _check_triggers_in_zabbix(instance_key, trigger_ids):
+    """Query Zabbix for trigger status. Returns set of trigger IDs that are still in PROBLEM state."""
+    cfg = ZABBIX_INSTANCES.get(instance_key)
+    if not cfg:
+        return None  # Unknown instance — can't verify
+    auth = _zabbix_login(instance_key)
+    if not auth:
+        return None  # Can't login — skip verification
+    try:
+        triggers = _zabbix_api(cfg["url"], "trigger.get", {
+            "triggerids": list(trigger_ids),
+            "output": ["triggerid", "value"],
+        }, auth)
+        # value "1" = PROBLEM, "0" = OK
+        return {t["triggerid"] for t in triggers if t["value"] == "1"}
+    except Exception as e:
+        log.warning(f"Zabbix trigger check failed for {instance_key}: {e}")
+        return None
+
+
+def auto_resolve_stale_alerts(active_alerts):
+    """Auto-resolve firing alerts whose triggers no longer exist or have resolved in Zabbix.
+
+    When Zabbix triggers are deleted (not resolved), no recovery webhook is sent,
+    leaving alerts stuck in 'firing' forever. This verifies against the Zabbix API
+    before resolving — only alerts whose triggers are deleted or in OK state get resolved.
+    """
+    global _last_stale_check
+    from datetime import datetime as _dt, timezone as _tz
+
+    now = time.time()
+    # Only run this check every _STALE_CHECK_INTERVAL seconds
+    if now - _last_stale_check < _STALE_CHECK_INTERVAL:
+        return
+    _last_stale_check = now
+
+    # Collect candidate alerts: must have a triggerId and zabbixInstance,
+    # and not have received an update recently (pre-filter to avoid unnecessary API calls)
+    candidates = []
+    for alert in active_alerts:
+        trigger_id = alert.get("triggerId")
+        instance = alert.get("zabbixInstance")
+        if not trigger_id or not instance:
+            continue
+        if instance not in ZABBIX_INSTANCES:
+            continue
+        # Pre-filter: only check alerts that haven't been updated in STALE_RESOLVE_SECONDS
+        last_received = alert.get("lastReceived") or alert.get("firingStartTime") or ""
+        if last_received:
+            try:
+                lr = last_received.replace("Z", "+00:00")
+                lr_epoch = _dt.fromisoformat(lr).timestamp()
+                if now - lr_epoch < STALE_RESOLVE_SECONDS:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        candidates.append(alert)
+
+    if not candidates:
+        return
+
+    # Group candidates by Zabbix instance
+    by_instance = {}
+    for alert in candidates:
+        inst = alert["zabbixInstance"]
+        by_instance.setdefault(inst, []).append(alert)
+
+    resolved_count = 0
+    for instance_key, alerts in by_instance.items():
+        trigger_ids = {a["triggerId"] for a in alerts}
+        log.info(f"Checking {len(trigger_ids)} stale trigger(s) against Zabbix ({instance_key})")
+
+        # Query Zabbix — returns set of trigger IDs still in PROBLEM state
+        still_problem = _check_triggers_in_zabbix(instance_key, trigger_ids)
+        if still_problem is None:
+            log.info(f"  Skipping — could not verify against Zabbix ({instance_key})")
+            continue
+
+        for alert in alerts:
+            tid = alert["triggerId"]
+            if tid in still_problem:
+                continue  # Trigger is still active in Zabbix — don't resolve
+
+            fp = alert.get("fingerprint", "")
+            name = alert.get("name", "unknown")
+            host = get_host(alert)
+            log.info(f"  Auto-resolving (trigger gone/OK in Zabbix): {name[:60]}")
+
+            resolve_payload = {
+                "id": f"auto-resolve-{fp[:16]}",
+                "triggerId": tid,
+                "name": name,
+                "status": "ok",
+                "severity": alert.get("severity", "warning"),
+                "hostName": host,
+                "lastReceived": _dt.now(_tz.utc).strftime("%Y.%m.%d %H:%M:%S"),
+                "description": f"Auto-resolved: trigger no longer active in Zabbix",
+                "tags": "[]",
+                "zabbixInstance": alert.get("zabbixInstance", ""),
+            }
+            try:
+                body = json.dumps(resolve_payload).encode()
+                req = Request(
+                    f"{KEEP_URL}/alerts/event/zabbix",
+                    data=body,
+                    method="POST",
+                    headers={"X-API-KEY": KEEP_API_KEY, "Content-Type": "application/json"},
+                )
+                urlopen(req, timeout=10)
+                enriched_cache[fp] = time.time()
+                resolved_count += 1
+            except Exception as e:
+                log.warning(f"  Failed to auto-resolve {name[:40]}: {e}")
+
+    if resolved_count:
+        log.info(f"Auto-resolved {resolved_count} alert(s) confirmed gone in Zabbix")
+
+
 def poll_and_enrich():
     # Prune expired cache entries (older than 10 minutes)
     now = time.time()
@@ -1189,13 +1667,24 @@ def poll_and_enrich():
 
     # Fetch force-enrich requests from SREs
     force_enrich_fps = fetch_force_enrich_fingerprints()
+    # Fetch active silence rules — silenced alerts skip enrichment entirely
+    silence_rules = fetch_silence_rules()
     suppressed_count = 0
+    silenced_count = 0
 
     enriched_count = 0
     for alert in active_alerts:
         fingerprint = alert.get("fingerprint", "")
         if not fingerprint or fingerprint in enriched_cache:
             continue
+
+        # Skip silenced alerts — no enrichment needed
+        if silence_rules and fingerprint not in force_enrich_fps:
+            matched_rule = is_alert_silenced(alert, silence_rules)
+            if matched_rule:
+                enriched_cache[fingerprint] = time.time()
+                silenced_count += 1
+                continue
 
         note = alert.get("note", "") or ""
         if "---AI-ENRICHMENT-V2---" in note or note.startswith("AI Summary:"):
@@ -1274,17 +1763,96 @@ def poll_and_enrich():
 
     if suppressed_count:
         log.info(f"Suppressed {suppressed_count} alerts (noise/flapping/dedup)")
+    if silenced_count:
+        log.info(f"Skipped {silenced_count} silenced alerts")
+
+    # ── Auto-resolve stale firing alerts ──
+    # Alerts that haven't received an update from Zabbix in STALE_RESOLVE_SECONDS
+    # are likely from deleted triggers — resolve them automatically.
+    if STALE_RESOLVE_SECONDS > 0:
+        auto_resolve_stale_alerts(active_alerts)
 
     # ── Clustering & Situation Summary ──
-    if active_alerts:
-        clusters = cluster_alerts(active_alerts)
+    # Exclude silenced alerts from clustering and summary
+    non_silenced_alerts = active_alerts
+    if silence_rules:
+        non_silenced_alerts = [a for a in active_alerts if not is_alert_silenced(a, silence_rules)]
+    if non_silenced_alerts:
+        clusters = cluster_alerts(non_silenced_alerts)
         clusters = merge_related_clusters(clusters)  # Merge clusters whose labels differ only by trailing digits
         multi_clusters = [c for c in clusters if c["count"] > 1]
         if multi_clusters:
             log.info(f"Clustered {sum(c['count'] for c in multi_clusters)} alerts into {len(multi_clusters)} groups")
-        generate_situation_summary(clusters, active_alerts, len(items) - len(active_alerts))
+        generate_situation_summary(clusters, non_silenced_alerts, len(items) - len(active_alerts))
 
     return enriched_count
+
+
+def migrate_note_feedback_to_api():
+    """One-time migration: move SRE feedback from alert note fields to alert-state-api."""
+    flag_path = "/data/.feedback_migrated"
+    if os.path.exists(flag_path):
+        return
+
+    log.info("Starting one-time SRE feedback migration from note fields...")
+    try:
+        alerts_data = keep_request("/alerts?limit=500")
+        if not alerts_data:
+            log.warning("Feedback migration: no alerts returned from Keep")
+            return
+        items = (
+            alerts_data.get("items", alerts_data)
+            if isinstance(alerts_data, dict)
+            else alerts_data
+        )
+        if not isinstance(items, list):
+            return
+
+        migrated = 0
+        for alert in items:
+            note = alert.get("note", "") or ""
+            if "---SRE-FEEDBACK---" not in note:
+                continue
+            feedback = parse_sre_feedback(note)
+            if not feedback:
+                continue
+            fingerprint = alert.get("fingerprint", "")
+            alert_name = alert.get("name", "")
+            if not fingerprint or not alert_name:
+                continue
+
+            try:
+                body = json.dumps({
+                    "fingerprint": fingerprint,
+                    "alert_name": alert_name,
+                    "rating": feedback.get("rating"),
+                    "corrected_severity": feedback.get("corrected_severity"),
+                    "corrected_noise": feedback.get("corrected_noise"),
+                    "comment": feedback.get("comment"),
+                    "user": feedback.get("sre_user", "migration"),
+                }).encode()
+                req = Request(
+                    f"{ALERT_STATE_API_URL}/api/alert-states/sre-feedback",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                )
+                urlopen(req, timeout=5)
+                migrated += 1
+            except Exception as e:
+                log.warning(f"Failed to migrate feedback for {fingerprint[:16]}: {e}")
+
+        # Write flag file
+        try:
+            os.makedirs("/data", exist_ok=True)
+            from datetime import datetime as _dt
+            with open(flag_path, "w") as f:
+                f.write(f"Migrated {migrated} feedback entries at {_dt.now().isoformat()}\n")
+        except OSError:
+            # /data may not be writable in all environments — log instead
+            log.info("Could not write migration flag file; migration will re-run next restart")
+        log.info(f"Feedback migration complete: {migrated} entries migrated")
+    except Exception as e:
+        log.error(f"Feedback migration failed: {e}")
 
 
 def main():
@@ -1295,6 +1863,9 @@ def main():
     if not wait_for_ollama():
         log.error("Cannot start without Ollama. Exiting.")
         return
+
+    # Run one-time migration of note-field feedback to alert-state-api
+    migrate_note_feedback_to_api()
 
     log.info("Testing LLM connectivity...")
     test = ollama_generate("Say 'ready' if you can process alerts.")

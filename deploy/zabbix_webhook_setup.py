@@ -10,6 +10,7 @@ Usage:
   python3 zabbix_webhook_setup.py test <instance>        # Test connectivity
   python3 zabbix_webhook_setup.py status <instance>      # Show current config
   python3 zabbix_webhook_setup.py teardown <instance>    # Remove config
+  python3 zabbix_webhook_setup.py dry-run <instance>     # Show what setup would do (no changes)
 
 Instances: domains-shared, ascio, hostedemail, enom, iaas
 """
@@ -57,11 +58,12 @@ INSTANCES = {
     "enom": {
         "zabbix_url": "https://zabbix.enom.net/api_jsonrpc.php",
         "display_name": "Enom Zabbix",
-        "zabbix_user": None,
-        "zabbix_pass": None,
-        "alert_group_ids": None,
+        "zabbix_user": "fash",
+        "zabbix_pass": "Nbpt6wev8rahsrafham@@",
+        "alert_group_ids": [],  # No host group filter — matches all groups (like Grafana action)
         "min_severity": "2",
         "excluded_trigger_ids": [],
+        "excluded_tag_names": ["dev"],  # Exclude events tagged with "dev"
     },
     "iaas": {
         "zabbix_url": "https://zabbix.tucows.cloud/api_jsonrpc.php",
@@ -82,6 +84,23 @@ ctx.verify_mode = ssl.CERT_NONE
 
 _req_id = 0
 _zabbix_url = None  # Set per-instance
+_zabbix_version = None  # Detected at login
+
+
+def _is_legacy_zabbix():
+    """Return True if Zabbix < 5.4 (uses 'alias'/'user' instead of 'username')."""
+    if not _zabbix_version:
+        return False
+    parts = _zabbix_version.split(".")
+    try:
+        return int(parts[0]) < 5 or (int(parts[0]) == 5 and int(parts[1]) < 4)
+    except (ValueError, IndexError):
+        return False
+
+
+def _user_field():
+    """Return the correct user identifier field for this Zabbix version."""
+    return "alias" if _is_legacy_zabbix() else "username"
 
 
 def zapi(method, params, auth=None):
@@ -134,7 +153,14 @@ def load_instance(name):
 
 
 def zlogin(cfg):
-    auth = zapi("user.login", {"user": cfg["zabbix_user"], "password": cfg["zabbix_pass"]})
+    global _zabbix_version
+    # Detect version first (no auth needed)
+    _zabbix_version = zapi("apiinfo.version", {})
+    print(f"  Zabbix version: {_zabbix_version} ({'legacy alias mode' if _is_legacy_zabbix() else 'modern username mode'})")
+
+    # Zabbix < 5.4 uses 'user', >= 5.4 uses 'username' for login
+    login_field = "user" if _is_legacy_zabbix() else "username"
+    auth = zapi("user.login", {login_field: cfg["zabbix_user"], "password": cfg["zabbix_pass"]})
     if not auth:
         raise RuntimeError("Zabbix login failed")
     return auth
@@ -254,10 +280,6 @@ def cmd_discover(cfg):
 
     auth = zlogin(cfg)
     try:
-        # Version
-        version = zapi("apiinfo.version", {})
-        print(f"Zabbix version: {version}\n")
-
         # Host groups with host counts
         print("=== Host Groups ===")
         groups = zapi("hostgroup.get", {
@@ -362,7 +384,7 @@ def find_user(auth, username):
     result = zapi(
         "user.get",
         {"output": "extend", "selectMedias": "extend", "selectUsrgrps": ["usrgrpid"],
-         "filter": {"username": username}},
+         "filter": {_user_field(): username}},
         auth,
     )
     return result[0] if result else None
@@ -417,17 +439,29 @@ def create_or_update_user(auth, cfg, mediatypeid):
         print(f"  Updated user '{username}' (id: {existing['userid']}, {len(all_medias)} media entries)")
         return existing["userid"]
     else:
-        result = zapi("user.create", {
-            "username": username,
+        user_def = {
+            _user_field(): username,
             "name": "UIP",
             "surname": "Alert Relay",
             "passwd": "Xk9#mPq4vL2nR7!jF5",
             "usrgrps": usrgrps,
-            "medias": [media_entry],
-            "roleid": "1",
-        }, auth)
+        }
+        # roleid only exists in Zabbix >= 5.2; legacy uses type
+        if not _is_legacy_zabbix():
+            user_def["roleid"] = "1"
+            user_def["medias"] = [media_entry]  # Modern Zabbix supports medias in create
+        else:
+            user_def["type"] = "3"  # Super admin on legacy Zabbix
+            # Zabbix < 5.2 doesn't support medias in user.create — add separately
+        result = zapi("user.create", user_def, auth)
         uid = result["userids"][0]
         print(f"  Created user '{username}' (id: {uid})")
+
+        # On legacy Zabbix, add media via user.update (supported since 3.0)
+        if _is_legacy_zabbix():
+            zapi("user.update", {"userid": uid, "user_medias": [media_entry]}, auth)
+            print(f"  Added media entry to user (legacy mode)")
+
         return uid
 
 
@@ -476,10 +510,11 @@ def create_or_update_action(auth, cfg, mediatypeid, userid):
         "value": cfg["min_severity"],
     })
 
-    # Not in maintenance
+    # Not in maintenance (value="" required by Zabbix 5.0)
     conditions.append({
         "conditiontype": "16",
         "operator": "11",
+        "value": "",
     })
 
     # Excluded triggers
@@ -490,7 +525,17 @@ def create_or_update_action(auth, cfg, mediatypeid, userid):
             "value": str(tid),
         })
 
-    action_filter = {"evaltype": "1", "conditions": conditions}
+    # Excluded event tag names (conditiontype 25 = event tag name, operator 3 = does not contain)
+    for tag_name in cfg.get("excluded_tag_names", []):
+        conditions.append({
+            "conditiontype": "25",
+            "operator": "3",
+            "value": tag_name,
+        })
+
+    # Use AND-OR based on whether we have host groups
+    # evaltype 0 = AND/OR, evaltype 1 = AND
+    action_filter = {"evaltype": "1" if conditions else "0", "conditions": conditions}
 
     action_def = {
         "name": name,
@@ -525,10 +570,10 @@ def cmd_setup(cfg):
     print(f"Instance key:  {cfg['instance_key']}")
     print()
 
-    if not cfg.get("alert_group_ids"):
-        print("ERROR: No alert_group_ids configured for this instance.")
+    if not cfg.get("alert_group_ids") and not cfg.get("excluded_tag_names"):
+        print("ERROR: No alert_group_ids or excluded_tag_names configured for this instance.")
         print(f"Run: python3 {sys.argv[0]} discover {cfg['instance_key']}")
-        print("Then update the INSTANCES config with the correct group IDs.")
+        print("Then update the INSTANCES config with the correct filters.")
         sys.exit(1)
 
     auth = zlogin(cfg)
@@ -691,9 +736,128 @@ def cmd_teardown(cfg):
         zlogout(auth)
 
 
+def cmd_dryrun(cfg):
+    """Show exactly what setup would create — no changes made."""
+    print(f"=== DRY RUN: {cfg['display_name']} ===")
+    print(f"Zabbix URL:    {cfg['zabbix_url']}")
+    print(f"Keep Webhook:  {KEEP_WEBHOOK_URL}")
+    print(f"Instance key:  {cfg['instance_key']}")
+    print()
+
+    auth = zlogin(cfg)
+    try:
+        # --- Media Type ---
+        mt_name = cfg["media_type_name"]
+        existing_mt = find_media_type(auth, mt_name)
+        if existing_mt:
+            print(f"[MEDIA TYPE] WOULD UPDATE existing '{mt_name}' (id: {existing_mt['mediatypeid']})")
+        else:
+            print(f"[MEDIA TYPE] WOULD CREATE '{mt_name}'")
+        print(f"  Type: webhook (4)")
+        print(f"  Script: {len(WEBHOOK_SCRIPT)} chars, POSTs to {KEEP_WEBHOOK_URL}")
+        print(f"  Parameters: {len(build_webhook_params(cfg['instance_key']))} fields")
+        print(f"  zabbixInstance: {cfg['instance_key']}")
+        print()
+
+        # --- Check for name collisions ---
+        print("[COLLISION CHECK] Searching for existing resources with similar names...")
+        all_mt = zapi("mediatype.get", {"output": ["name", "mediatypeid"]}, auth)
+        for m in all_mt:
+            if "keep" in m["name"].lower() or "uip" in m["name"].lower():
+                print(f"  Found media type: '{m['name']}' (id: {m['mediatypeid']})")
+        all_users = zapi("user.get", {"output": ["userid", _user_field()], "filter": {_user_field(): cfg["webhook_username"]}}, auth)
+        if all_users:
+            for u in all_users:
+                uname = u.get(_user_field(), u.get("alias", u.get("username", "?")))
+                print(f"  Found existing user: '{uname}' (id: {u['userid']})")
+        else:
+            print(f"  No existing user '{cfg['webhook_username']}' found")
+        all_actions = zapi("action.get", {"output": ["name", "actionid"], "eventsource": "0"}, auth)
+        for a in all_actions:
+            if "keep" in a["name"].lower() or "uip" in a["name"].lower():
+                print(f"  Found action: '{a['name']}' (id: {a['actionid']})")
+        print()
+
+        # --- User ---
+        username = cfg["webhook_username"]
+        existing_user = find_user(auth, username)
+        if existing_user:
+            uid = existing_user["userid"]
+            existing_medias = existing_user.get("medias", [])
+            print(f"[USER] WOULD UPDATE existing '{username}' (id: {uid})")
+            print(f"  Current media entries: {len(existing_medias)}")
+            for m in existing_medias:
+                mt_info = zapi("mediatype.get", {"output": ["name"], "mediatypeids": [m["mediatypeid"]]}, auth)
+                mt_label = mt_info[0]["name"] if mt_info else f"id={m['mediatypeid']}"
+                print(f"    - {mt_label} → sendto={m.get('sendto')}")
+            print(f"  WOULD ADD media entry: sendto='keep', severity=60 (Warning+), 24/7")
+            print(f"  ⚠ Would preserve {len(existing_medias)} existing media entries (filtering out sendto='keep' dupes)")
+        else:
+            print(f"[USER] WOULD CREATE '{username}'")
+            print(f"  Name: UIP Alert Relay")
+            print(f"  Type: {'type=3 (Super admin)' if _is_legacy_zabbix() else 'roleid=1'}")
+            usrgrps = get_user_groups_for_instance(auth, cfg)
+            grp_names = []
+            for g in usrgrps:
+                gi = zapi("usergroup.get", {"output": ["name"], "usrgrpids": [g["usrgrpid"]]}, auth)
+                grp_names.append(gi[0]["name"] if gi else g["usrgrpid"])
+            print(f"  Groups: {', '.join(grp_names)}")
+            print(f"  Media: sendto='keep', severity=60 (Warning+), 24/7")
+        print()
+
+        # --- Action ---
+        action_name = cfg["action_name"]
+        existing_action = find_action(auth, action_name)
+        if existing_action:
+            print(f"[ACTION] WOULD UPDATE existing '{action_name}' (id: {existing_action['actionid']})")
+        else:
+            print(f"[ACTION] WOULD CREATE '{action_name}'")
+
+        print(f"  Event source: triggers (0)")
+        print(f"  Filter conditions (AND):")
+
+        group_ids = cfg.get("alert_group_ids") or []
+        if group_ids:
+            for gid in group_ids:
+                gi = zapi("hostgroup.get", {"output": ["name"], "groupids": [gid]}, auth)
+                gname = gi[0]["name"] if gi else f"id={gid}"
+                print(f"    - Host group = {gname} (id: {gid})")
+        else:
+            print(f"    - (no host group filter — all groups)")
+
+        print(f"    - Severity >= {cfg['min_severity']} ({'Warning' if cfg['min_severity'] == '2' else cfg['min_severity']})")
+        print(f"    - Not in maintenance")
+
+        for tid in cfg.get("excluded_trigger_ids", []):
+            print(f"    - Trigger != {tid}")
+
+        for tag in cfg.get("excluded_tag_names", []):
+            print(f"    - Event tag name does not contain '{tag}'")
+
+        print(f"  Operations: send to '{username}' on problem, recovery, and update")
+        print()
+
+        # --- Summary ---
+        creates = sum([
+            existing_mt is None,
+            existing_user is None,
+            existing_action is None,
+        ])
+        updates = 3 - creates
+        print(f"=== SUMMARY: {creates} create(s), {updates} update(s), 0 deletes ===")
+        print(f"Resources that WILL NOT be touched:")
+        untouched_actions = [a for a in all_actions if "keep" not in a["name"].lower() and "uip" not in a["name"].lower()]
+        print(f"  {len(untouched_actions)} existing trigger actions (including ZabbixToGrafana, zabbixToAlerta)")
+        print(f"  {len(all_mt) - (1 if existing_mt else 0)} existing media types (including GrafanaWebhook)")
+        print(f"  All existing users except '{username}' (if it exists)")
+
+    finally:
+        zlogout(auth)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────
 
-COMMANDS = ["discover", "setup", "test", "status", "teardown"]
+COMMANDS = ["discover", "setup", "test", "status", "teardown", "dry-run"]
 
 
 def main():
@@ -706,6 +870,7 @@ def main():
         print("  test       Test connectivity to Keep and Zabbix API")
         print("  status     Show current webhook configuration")
         print("  teardown   Remove webhook configuration")
+        print("  dry-run    Show what setup would do without making changes")
         print()
         print("Instances:")
         for key, inst in INSTANCES.items():
@@ -722,6 +887,7 @@ def main():
         "test": cmd_test,
         "status": cmd_status,
         "teardown": cmd_teardown,
+        "dry-run": cmd_dryrun,
     }
 
     try:

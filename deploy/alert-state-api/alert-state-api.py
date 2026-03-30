@@ -59,6 +59,7 @@ def _init_db():
     db = sqlite3.connect(DB_PATH, check_same_thread=False)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA foreign_keys = ON")
     db.execute("""
         CREATE TABLE IF NOT EXISTS alert_states (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,6 +102,56 @@ def _init_db():
             alert_hash TEXT
         )
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS silence_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_name_pattern TEXT NOT NULL,
+            hostname_pattern TEXT DEFAULT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            reason TEXT DEFAULT '',
+            active INTEGER DEFAULT 1
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_silence_active ON silence_rules(active, expires_at)")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS sre_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_fingerprint TEXT NOT NULL,
+            alert_name TEXT NOT NULL,
+            rating TEXT,
+            corrected_severity TEXT,
+            corrected_noise INTEGER,
+            comment TEXT,
+            user TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sre_feedback_fp ON sre_feedback(alert_fingerprint)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_sre_feedback_name ON sre_feedback(alert_name)")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS sre_feedback_votes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feedback_id INTEGER NOT NULL REFERENCES sre_feedback(id) ON DELETE CASCADE,
+            user TEXT NOT NULL,
+            vote TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(feedback_id, user)
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS runbook_exclusions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_name TEXT NOT NULL,
+            runbook_entry_id INTEGER NOT NULL,
+            excluded_by TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(alert_name, runbook_entry_id)
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_runbook_excl_name ON runbook_exclusions(alert_name)")
     db.commit()
     # Add force_enrich column if it doesn't exist (migration)
     try:
@@ -225,7 +276,7 @@ class AlertStateHandler(BaseHTTPRequestHandler):
                 rows = [dict(r) for r in cursor.fetchall()]
             self._send_json(200, rows)
 
-        elif path == "/api/alert-states/runbook-feedback":
+        elif path == "/api/alert-states/runbook-feedback/aggregate":
             qs = parse_qs(parsed.query)
             entry_ids_str = qs.get("entry_ids", [""])[0]
             if not entry_ids_str:
@@ -239,10 +290,167 @@ class AlertStateHandler(BaseHTTPRequestHandler):
             with _db_lock:
                 placeholders = ",".join("?" * len(entry_ids))
                 cursor = db.execute(f"""
-                    SELECT * FROM runbook_feedback
+                    SELECT runbook_entry_id,
+                        SUM(CASE WHEN vote = 'up' THEN 1 ELSE 0 END) as up_votes,
+                        SUM(CASE WHEN vote = 'down' THEN 1 ELSE 0 END) as down_votes,
+                        SUM(CASE WHEN vote = 'up' THEN 1 WHEN vote = 'down' THEN -1 ELSE 0 END) as net_score,
+                        COUNT(DISTINCT alert_fingerprint) as alert_count
+                    FROM runbook_feedback
                     WHERE runbook_entry_id IN ({placeholders})
-                    ORDER BY created_at DESC
+                    GROUP BY runbook_entry_id
                 """, entry_ids)
+                rows = {str(r["runbook_entry_id"]): dict(r) for r in cursor.fetchall()}
+            self._send_json(200, rows)
+
+        elif path == "/api/alert-states/runbook-feedback":
+            qs = parse_qs(parsed.query)
+            entry_ids_str = qs.get("entry_ids", [""])[0]
+            fingerprint = qs.get("fingerprint", [""])[0]
+            if not entry_ids_str:
+                self._send_json(400, {"error": "entry_ids query param required"})
+                return
+            if not fingerprint:
+                self._send_json(400, {"error": "fingerprint query param required"})
+                return
+            try:
+                entry_ids = [int(x.strip()) for x in entry_ids_str.split(",") if x.strip()]
+            except ValueError:
+                self._send_json(400, {"error": "entry_ids must be comma-separated integers"})
+                return
+            with _db_lock:
+                placeholders = ",".join("?" * len(entry_ids))
+                cursor = db.execute(f"""
+                    SELECT * FROM runbook_feedback
+                    WHERE runbook_entry_id IN ({placeholders}) AND alert_fingerprint = ?
+                    ORDER BY created_at DESC
+                """, entry_ids + [fingerprint])
+                rows = [dict(r) for r in cursor.fetchall()]
+            self._send_json(200, rows)
+
+        elif path == "/api/alert-states/sre-feedback/all":
+            qs = parse_qs(parsed.query)
+            page = int(qs.get("page", ["1"])[0])
+            limit = min(int(qs.get("limit", ["50"])[0]), 200)
+            search = qs.get("search", [""])[0].strip()
+            rating_filter = qs.get("rating", [""])[0].strip()
+            user_filter = qs.get("user", [""])[0].strip()
+            sort = qs.get("sort", ["date"])[0].strip()
+            offset = (page - 1) * limit
+
+            conditions = []
+            params = []
+            if search:
+                conditions.append("(f.alert_name LIKE ? OR f.comment LIKE ?)")
+                params.extend([f"%{search}%", f"%{search}%"])
+            if rating_filter:
+                conditions.append("f.rating = ?")
+                params.append(rating_filter)
+            if user_filter:
+                conditions.append("f.user = ?")
+                params.append(user_filter)
+
+            where = "WHERE " + " AND ".join(conditions) if conditions else ""
+            order = "f.created_at DESC" if sort == "date" else "vote_score DESC"
+
+            with _db_lock:
+                count_row = db.execute(f"SELECT COUNT(*) as cnt FROM sre_feedback f {where}", params).fetchone()
+                total = count_row["cnt"]
+                cursor = db.execute(f"""
+                    SELECT f.*,
+                        COALESCE(SUM(CASE WHEN v.vote = 'up' THEN 1 WHEN v.vote = 'down' THEN -1 ELSE 0 END), 0) as vote_score
+                    FROM sre_feedback f
+                    LEFT JOIN sre_feedback_votes v ON v.feedback_id = f.id
+                    {where}
+                    GROUP BY f.id
+                    ORDER BY {order}
+                    LIMIT ? OFFSET ?
+                """, params + [limit, offset])
+                rows = [dict(r) for r in cursor.fetchall()]
+            self._send_json(200, {"items": rows, "total": total, "page": page, "limit": limit})
+
+        elif path == "/api/alert-states/sre-feedback/by-alert-name":
+            qs = parse_qs(parsed.query)
+            name = qs.get("name", [""])[0]
+            if not name:
+                self._send_json(400, {"error": "name query param required"})
+                return
+            with _db_lock:
+                cursor = db.execute("""
+                    SELECT f.*,
+                        COALESCE(SUM(CASE WHEN v.vote = 'up' THEN 1 WHEN v.vote = 'down' THEN -1 ELSE 0 END), 0) as vote_score
+                    FROM sre_feedback f
+                    LEFT JOIN sre_feedback_votes v ON v.feedback_id = f.id
+                    WHERE f.alert_name = ?
+                    GROUP BY f.id
+                    ORDER BY vote_score DESC, f.created_at DESC
+                """, (name,))
+                rows = [dict(r) for r in cursor.fetchall()]
+            self._send_json(200, rows)
+
+        elif path == "/api/alert-states/sre-feedback":
+            qs = parse_qs(parsed.query)
+            fingerprint = qs.get("fingerprint", [""])[0]
+            if not fingerprint:
+                self._send_json(400, {"error": "fingerprint query param required"})
+                return
+            username = _get_username_from_request(self)
+            with _db_lock:
+                cursor = db.execute("""
+                    SELECT f.*,
+                        COALESCE(SUM(CASE WHEN v.vote = 'up' THEN 1 WHEN v.vote = 'down' THEN -1 ELSE 0 END), 0) as vote_score
+                    FROM sre_feedback f
+                    LEFT JOIN sre_feedback_votes v ON v.feedback_id = f.id
+                    WHERE f.alert_fingerprint = ?
+                    GROUP BY f.id
+                    ORDER BY f.created_at DESC
+                """, (fingerprint,))
+                rows = [dict(r) for r in cursor.fetchall()]
+                # Add current user's vote to each entry
+                if username:
+                    for row in rows:
+                        vote_row = db.execute(
+                            "SELECT vote FROM sre_feedback_votes WHERE feedback_id = ? AND user = ?",
+                            (row["id"], username)
+                        ).fetchone()
+                        row["user_vote"] = vote_row["vote"] if vote_row else None
+                else:
+                    for row in rows:
+                        row["user_vote"] = None
+            self._send_json(200, rows)
+
+        elif path == "/api/alert-states/runbook-exclusions/all":
+            qs = parse_qs(parsed.query)
+            page = int(qs.get("page", ["1"])[0])
+            limit = min(int(qs.get("limit", ["50"])[0]), 200)
+            search = qs.get("search", [""])[0].strip()
+            offset = (page - 1) * limit
+
+            conditions = []
+            params = []
+            if search:
+                conditions.append("alert_name LIKE ?")
+                params.append(f"%{search}%")
+            where = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+            with _db_lock:
+                count_row = db.execute(f"SELECT COUNT(*) as cnt FROM runbook_exclusions {where}", params).fetchone()
+                total = count_row["cnt"]
+                cursor = db.execute(f"""
+                    SELECT * FROM runbook_exclusions {where} ORDER BY created_at DESC LIMIT ? OFFSET ?
+                """, params + [limit, offset])
+                rows = [dict(r) for r in cursor.fetchall()]
+            self._send_json(200, {"items": rows, "total": total, "page": page, "limit": limit})
+
+        elif path == "/api/alert-states/runbook-exclusions":
+            qs = parse_qs(parsed.query)
+            alert_name = qs.get("alert_name", [""])[0]
+            if not alert_name:
+                self._send_json(400, {"error": "alert_name query param required"})
+                return
+            with _db_lock:
+                cursor = db.execute("""
+                    SELECT * FROM runbook_exclusions WHERE alert_name = ? ORDER BY created_at DESC
+                """, (alert_name,))
                 rows = [dict(r) for r in cursor.fetchall()]
             self._send_json(200, rows)
 
@@ -298,6 +506,18 @@ class AlertStateHandler(BaseHTTPRequestHandler):
             with _sse_lock:
                 count = len(_sse_clients)
             self._send_json(200, {"connected_clients": count})
+
+        elif path == "/api/alert-states/silence-rules":
+            now = datetime.now(timezone.utc).isoformat()
+            with _db_lock:
+                # Auto-expire old rules
+                db.execute("UPDATE silence_rules SET active = 0 WHERE active = 1 AND expires_at < ?", (now,))
+                db.commit()
+                cursor = db.execute("""
+                    SELECT * FROM silence_rules WHERE active = 1 ORDER BY created_at DESC
+                """)
+                rows = [dict(r) for r in cursor.fetchall()]
+            self._send_json(200, rows)
 
         elif path == "/api/alert-states/situation-summary":
             with _db_lock:
@@ -445,7 +665,12 @@ class AlertStateHandler(BaseHTTPRequestHandler):
                     db.execute("""
                         UPDATE alert_states SET
                             acknowledged_by = NULL, acknowledged_at = NULL,
+                            investigating_user = NULL, investigating_since = NULL,
                             is_updated = 1, updated_detected_at = ?,
+                            incident_jira_key = NULL, incident_jira_url = NULL,
+                            incident_created_by = NULL, incident_created_at = NULL,
+                            escalated_to = NULL, escalated_by = NULL, escalated_at = NULL,
+                            severity_override = NULL, severity_override_by = NULL, severity_override_at = NULL,
                             updated_at = datetime('now')
                         WHERE alert_fingerprint = ?
                     """, (now, fp))
@@ -603,6 +828,224 @@ class AlertStateHandler(BaseHTTPRequestHandler):
             })
             self._send_json(200, {"status": "stored", "vote": vote})
 
+        elif path == "/api/alert-states/sre-feedback/update":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            feedback_id = data.get("id")
+            if not feedback_id:
+                self._send_json(400, {"error": "id is required"})
+                return
+            with _db_lock:
+                row = db.execute("SELECT user FROM sre_feedback WHERE id = ?", (feedback_id,)).fetchone()
+                if not row:
+                    self._send_json(404, {"error": "feedback not found"})
+                    return
+                if row["user"] != username:
+                    self._send_json(403, {"error": "only the original author can edit"})
+                    return
+                updates = []
+                params = []
+                for field in ["rating", "corrected_severity", "comment"]:
+                    if field in data:
+                        val = (data[field] or "").strip() or None
+                        if field == "comment" and val and len(val) > 2000:
+                            val = val[:2000]
+                        updates.append(f"{field} = ?")
+                        params.append(val)
+                if "corrected_noise" in data:
+                    updates.append("corrected_noise = ?")
+                    params.append(data["corrected_noise"])
+                if not updates:
+                    self._send_json(400, {"error": "no fields to update"})
+                    return
+                updates.append("updated_at = datetime('now')")
+                params.append(feedback_id)
+                db.execute(f"UPDATE sre_feedback SET {', '.join(updates)} WHERE id = ?", params)
+                db.commit()
+            _sse_broadcast("sre_feedback_updated", {"id": feedback_id, "user": username})
+            self._send_json(200, {"status": "updated"})
+
+        elif path == "/api/alert-states/sre-feedback/delete":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            feedback_id = data.get("id")
+            if not feedback_id:
+                self._send_json(400, {"error": "id is required"})
+                return
+            with _db_lock:
+                row = db.execute("SELECT id FROM sre_feedback WHERE id = ?", (feedback_id,)).fetchone()
+                if not row:
+                    self._send_json(404, {"error": "feedback not found"})
+                    return
+                db.execute("DELETE FROM sre_feedback WHERE id = ?", (feedback_id,))
+                db.commit()
+            _sse_broadcast("sre_feedback_deleted", {"id": feedback_id, "user": username})
+            log.info(f"{username} deleted feedback #{feedback_id}")
+            self._send_json(200, {"status": "deleted"})
+
+        elif path == "/api/alert-states/sre-feedback/vote":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            feedback_id = data.get("id")
+            vote = (data.get("vote") or "").strip()
+            if not feedback_id or vote not in ("up", "down", "none"):
+                self._send_json(400, {"error": "id and vote (up/down/none) required"})
+                return
+            now = datetime.now(timezone.utc).isoformat()
+            with _db_lock:
+                if vote == "none":
+                    db.execute("DELETE FROM sre_feedback_votes WHERE feedback_id = ? AND user = ?",
+                               (feedback_id, username))
+                else:
+                    db.execute("""
+                        INSERT INTO sre_feedback_votes (feedback_id, user, vote, created_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(feedback_id, user) DO UPDATE SET vote = excluded.vote, created_at = excluded.created_at
+                    """, (feedback_id, username, vote, now))
+                db.commit()
+            _sse_broadcast("sre_feedback_vote", {"feedback_id": feedback_id, "vote": vote, "user": username})
+            self._send_json(200, {"status": "stored", "vote": vote})
+
+        elif path == "/api/alert-states/sre-feedback/bulk-delete":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            ids = data.get("ids") or []
+            if not ids:
+                self._send_json(400, {"error": "ids list is required"})
+                return
+            with _db_lock:
+                placeholders = ",".join("?" * len(ids))
+                db.execute(f"DELETE FROM sre_feedback WHERE id IN ({placeholders})", ids)
+                db.commit()
+            _sse_broadcast("sre_feedback_bulk_deleted", {"ids": ids, "user": username})
+            log.info(f"{username} bulk-deleted {len(ids)} feedback entries")
+            self._send_json(200, {"status": "deleted", "count": len(ids)})
+
+        elif path == "/api/alert-states/sre-feedback":
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            # Auth: cookie-based for SREs, or body-provided user for internal services
+            username = _get_username_from_request(self)
+            if not username:
+                username = (data.get("user") or "").strip()
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            fingerprint = (data.get("fingerprint") or "").strip()
+            alert_name = (data.get("alert_name") or "").strip()
+            rating = (data.get("rating") or "").strip()
+            if not fingerprint or not alert_name:
+                self._send_json(400, {"error": "fingerprint and alert_name are required"})
+                return
+            if rating and rating not in ("positive", "negative", "correction"):
+                self._send_json(400, {"error": "rating must be positive, negative, or correction"})
+                return
+            corrected_severity = (data.get("corrected_severity") or "").strip() or None
+            corrected_noise = data.get("corrected_noise")
+            comment = (data.get("comment") or "").strip() or None
+            if comment and len(comment) > 2000:
+                comment = comment[:2000]
+            now = datetime.now(timezone.utc).isoformat()
+            with _db_lock:
+                cursor = db.execute("""
+                    INSERT INTO sre_feedback (alert_fingerprint, alert_name, rating, corrected_severity,
+                        corrected_noise, comment, user, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (fingerprint, alert_name, rating or None, corrected_severity,
+                      corrected_noise, comment, username, now, now))
+                feedback_id = cursor.lastrowid
+                db.commit()
+            _sse_broadcast("sre_feedback", {"fingerprint": fingerprint, "user": username, "id": feedback_id})
+            log.info(f"{username} submitted feedback #{feedback_id} for {fingerprint[:16]}")
+            self._send_json(200, {"status": "created", "id": feedback_id})
+
+        elif path == "/api/alert-states/runbook-exclusions/delete":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            exclusion_id = data.get("id")
+            if not exclusion_id:
+                self._send_json(400, {"error": "id is required"})
+                return
+            with _db_lock:
+                row = db.execute("SELECT id FROM runbook_exclusions WHERE id = ?", (exclusion_id,)).fetchone()
+                if not row:
+                    self._send_json(404, {"error": "exclusion not found"})
+                    return
+                db.execute("DELETE FROM runbook_exclusions WHERE id = ?", (exclusion_id,))
+                db.commit()
+            _sse_broadcast("runbook_exclusion_removed", {"id": exclusion_id, "user": username})
+            log.info(f"{username} removed runbook exclusion #{exclusion_id}")
+            self._send_json(200, {"status": "deleted"})
+
+        elif path == "/api/alert-states/runbook-exclusions":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            alert_name = (data.get("alert_name") or "").strip()
+            entry_id = data.get("runbook_entry_id")
+            if not alert_name or not entry_id:
+                self._send_json(400, {"error": "alert_name and runbook_entry_id are required"})
+                return
+            now = datetime.now(timezone.utc).isoformat()
+            with _db_lock:
+                try:
+                    cursor = db.execute("""
+                        INSERT INTO runbook_exclusions (alert_name, runbook_entry_id, excluded_by, created_at)
+                        VALUES (?, ?, ?, ?)
+                    """, (alert_name, entry_id, username, now))
+                    exclusion_id = cursor.lastrowid
+                    db.commit()
+                except sqlite3.IntegrityError:
+                    self._send_json(409, {"error": "exclusion already exists"})
+                    return
+            _sse_broadcast("runbook_exclusion", {"alert_name": alert_name, "entry_id": entry_id, "user": username})
+            log.info(f"{username} excluded runbook entry #{entry_id} from '{alert_name}'")
+            self._send_json(200, {"status": "created", "id": exclusion_id})
+
         elif path == "/api/alert-states/severity-override":
             username = _get_username_from_request(self)
             if not username:
@@ -645,6 +1088,64 @@ class AlertStateHandler(BaseHTTPRequestHandler):
             })
             log.info(f"{username} overrode severity to {severity} for {fingerprint[:16]}")
             self._send_json(200, {"status": "stored", "severity": severity})
+
+        elif path == "/api/alert-states/silence-rules":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            alert_name_pattern = (data.get("alert_name_pattern") or "").strip()
+            hostname_pattern = (data.get("hostname_pattern") or "").strip() or None
+            duration_seconds = data.get("duration_seconds", 3600)
+            reason = (data.get("reason") or "").strip()
+            if not alert_name_pattern:
+                self._send_json(400, {"error": "alert_name_pattern is required"})
+                return
+            now = datetime.now(timezone.utc)
+            from datetime import timedelta
+            expires_at = (now + timedelta(seconds=int(duration_seconds))).isoformat()
+            now_str = now.isoformat()
+            with _db_lock:
+                cursor = db.execute("""
+                    INSERT INTO silence_rules (alert_name_pattern, hostname_pattern, created_by,
+                        created_at, expires_at, reason, active)
+                    VALUES (?, ?, ?, ?, ?, ?, 1)
+                """, (alert_name_pattern, hostname_pattern, username, now_str, expires_at, reason))
+                rule_id = cursor.lastrowid
+                db.commit()
+            _sse_broadcast("silence_created", {
+                "rule_id": rule_id, "alert_name_pattern": alert_name_pattern,
+                "hostname_pattern": hostname_pattern, "user": username,
+                "expires_at": expires_at,
+            })
+            log.info(f"{username} created silence rule #{rule_id}: '{alert_name_pattern}' host='{hostname_pattern}' until {expires_at}")
+            self._send_json(200, {"status": "created", "id": rule_id, "expires_at": expires_at})
+
+        elif path == "/api/alert-states/silence-rules/cancel":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            rule_id = data.get("id")
+            if not rule_id:
+                self._send_json(400, {"error": "id is required"})
+                return
+            with _db_lock:
+                db.execute("UPDATE silence_rules SET active = 0 WHERE id = ?", (rule_id,))
+                db.commit()
+            _sse_broadcast("silence_cancelled", {"rule_id": rule_id, "user": username})
+            log.info(f"{username} cancelled silence rule #{rule_id}")
+            self._send_json(200, {"status": "cancelled", "id": rule_id})
 
         elif path == "/api/alert-states/invalidate-summary":
             with _db_lock:

@@ -29,6 +29,12 @@ JIRA_BASE_URL = os.environ.get("JIRA_BASE_URL", "")
 JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "")
 JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
 AUTH_SECRET = os.environ.get("AUTH_SECRET", "")
+AUTH_API_URL = os.environ.get("AUTH_API_URL", "http://auth-api:8093")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
+MAINT_DASHBOARD_URL = os.environ.get("MAINT_DASHBOARD_URL", "http://10.177.154.174")
+GRAFANA_WEBHOOK_SECRET = os.environ.get("GRAFANA_WEBHOOK_SECRET", "")
+STATUSPAGE_API_KEY = os.environ.get("STATUSPAGE_API_KEY", "")
+STATUSPAGE_PAGE_ID = os.environ.get("STATUSPAGE_PAGE_ID", "l7mgndhgstnc")
 
 STOP_WORDS = {
     "on", "the", "is", "for", "at", "in", "a", "an", "not", "to",
@@ -151,6 +157,146 @@ def tokenize(text):
     return {w for w in words if w and w not in STOP_WORDS}
 
 
+# ── Ollama AI Assessment ──────────────────────────────
+
+def ollama_generate(prompt, model="qwen2.5:3b"):
+    """Call Ollama /api/generate and return the response text."""
+    payload = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.3, "num_predict": 512},
+    }).encode()
+    req = Request(f"{OLLAMA_URL}/api/generate", data=payload,
+                  headers={"Content-Type": "application/json"})
+    try:
+        resp = urlopen(req, timeout=30)
+        data = json.loads(resp.read())
+        return data.get("response", "")
+    except Exception as e:
+        log.error(f"Ollama call failed: {e}")
+        return None
+
+
+def assess_incident_description(title, description):
+    """Use Ollama to grade an incident description for customer-appropriateness."""
+    prompt = f"""You are an SRE incident communication reviewer. Grade this incident notification that will be sent to CUSTOMERS and PARTNERS via webhook and statuspage.
+
+The description should be:
+- Customer-appropriate (no internal jargon, no hostnames, no internal IPs, no ticket numbers)
+- Clear about what is affected from the customer's perspective
+- Honest but not alarming
+- Free of technical implementation details customers don't need
+
+Title: {title}
+Description: {description}
+
+Grade on A-F:
+- A: Excellent — clear, professional, customer-appropriate
+- B: Good — minor improvements possible
+- C: Adequate — some internal jargon or unclear impact
+- D: Poor — too technical or vague for customers
+- F: Unacceptable — contains hostnames, IPs, or incomprehensible to customers
+
+Respond in EXACTLY this JSON format, no other text:
+{{"grade": "X", "feedback": "One or two sentences explaining the grade and what to improve."}}"""
+
+    raw = ollama_generate(prompt)
+    if not raw:
+        return {"grade": "?", "feedback": "AI assessment unavailable — Ollama did not respond."}
+    try:
+        return json.loads(raw.strip())
+    except json.JSONDecodeError:
+        # Fallback: extract grade letter from raw text
+        grade_match = re.search(r'"grade"\s*:\s*"([A-F?])"', raw)
+        grade = grade_match.group(1) if grade_match else "?"
+        return {"grade": grade, "feedback": raw.strip()[:500]}
+
+
+# ── Webhook & Statuspage helpers ──────────────────────
+
+def send_incident_webhook(title, description, started_at):
+    """Send incident notification to maintenance dashboard webhook system."""
+    if not GRAFANA_WEBHOOK_SECRET:
+        return False, "GRAFANA_WEBHOOK_SECRET not configured"
+    payload = json.dumps({
+        "event_type": "incident",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "incident": {
+            "title": title,
+            "description": description,
+            "source": "uip_sre",
+            "started_at": started_at or datetime.now(timezone.utc).isoformat(),
+            "raw_payload": {},
+        },
+    }).encode()
+    req = Request(f"{MAINT_DASHBOARD_URL}/api/webhooks/incidents",
+                  data=payload,
+                  headers={
+                      "Content-Type": "application/json",
+                      "X-Grafana-Secret": GRAFANA_WEBHOOK_SECRET,
+                  })
+    try:
+        resp = urlopen(req, timeout=10)
+        return True, None
+    except HTTPError as e:
+        body = e.read().decode()[:200]
+        return False, f"Webhook API {e.code}: {body}"
+    except Exception as e:
+        return False, str(e)
+
+
+def fetch_statuspage_components():
+    """Fetch components from Statuspage.io."""
+    if not STATUSPAGE_API_KEY:
+        return None, "STATUSPAGE_API_KEY not configured"
+    req = Request(
+        f"https://api.statuspage.io/v1/pages/{STATUSPAGE_PAGE_ID}/components",
+        headers={"Authorization": f"OAuth {STATUSPAGE_API_KEY}"},
+    )
+    try:
+        resp = urlopen(req, timeout=10)
+        data = json.loads(resp.read())
+        return [{"id": c["id"], "name": c["name"], "status": c.get("status", "operational"),
+                 "description": c.get("description", "")} for c in data], None
+    except Exception as e:
+        return None, str(e)
+
+
+def create_statuspage_incident(name, body, component_ids, status, impact):
+    """Create an incident on Statuspage.io."""
+    if not STATUSPAGE_API_KEY:
+        return None, "STATUSPAGE_API_KEY not configured"
+    payload = {
+        "incident": {
+            "name": name,
+            "body": body,
+            "status": status or "investigating",
+            "impact_override": impact or "minor",
+            "component_ids": component_ids or [],
+        }
+    }
+    req = Request(
+        f"https://api.statuspage.io/v1/pages/{STATUSPAGE_PAGE_ID}/incidents",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"OAuth {STATUSPAGE_API_KEY}",
+        },
+        method="POST",
+    )
+    try:
+        resp = urlopen(req, timeout=15)
+        data = json.loads(resp.read())
+        return {"id": data.get("id"), "shortlink": data.get("shortlink"),
+                "status": data.get("status")}, None
+    except HTTPError as e:
+        body = e.read().decode()[:500]
+        return None, f"Statuspage API {e.code}: {body}"
+    except Exception as e:
+        return None, str(e)
+
+
 def match_entries(db, alert_name, hostname=None, service=None, limit=10):
     """Find runbook entries relevant to the given alert, scored by relevance."""
     query_tokens = tokenize(alert_name)
@@ -234,14 +380,30 @@ def text_to_adf(text):
     return {"type": "doc", "version": 1, "content": content}
 
 
-def create_jira_incident(data, jira_email=None, jira_api_token=None):
-    """Create a Jira incident in the OCCIR project."""
+def _jira_api_url(path, cloud_id=None):
+    """Build Jira API URL — uses OAuth cloud API when cloud_id is provided, otherwise direct."""
+    if cloud_id:
+        return f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3{path}"
+    return f"{JIRA_BASE_URL}/rest/api/3{path}"
+
+
+def _jira_auth_header(oauth_token=None, jira_email=None, jira_api_token=None):
+    """Build Authorization header — prefers OAuth bearer, falls back to Basic."""
+    if oauth_token:
+        return f"Bearer {oauth_token}"
     email = jira_email or JIRA_EMAIL
     token = jira_api_token or JIRA_API_TOKEN
-    if not all([JIRA_BASE_URL, email, token]):
-        return None, "Jira integration not configured"
+    if email and token:
+        auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+        return f"Basic {auth}"
+    return None
 
-    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+
+def create_jira_incident(data, jira_email=None, jira_api_token=None, oauth_token=None, cloud_id=None):
+    """Create a Jira incident in the OCCIR project."""
+    auth_header = _jira_auth_header(oauth_token, jira_email, jira_api_token)
+    if not auth_header:
+        return None, "Jira integration not configured — connect your Jira account in Settings"
 
     fields = {
         "project": {"key": "OCCIR"},
@@ -260,12 +422,12 @@ def create_jira_incident(data, jira_email=None, jira_api_token=None):
     payload = json.dumps({"fields": fields}).encode()
 
     req = Request(
-        f"{JIRA_BASE_URL}/rest/api/3/issue",
+        _jira_api_url("/issue", cloud_id),
         data=payload,
         method="POST",
     )
     req.add_header("Content-Type", "application/json")
-    req.add_header("Authorization", f"Basic {auth}")
+    req.add_header("Authorization", auth_header)
 
     try:
         resp = urlopen(req, timeout=15)
@@ -279,7 +441,11 @@ def create_jira_incident(data, jira_email=None, jira_api_token=None):
         for i, att in enumerate(attachments):
             att_data = att.get("data", "")
             att_name = att.get("filename", f"screenshot_{i+1}.png")
-            err = attach_file_to_jira_issue(issue_key, att_data, att_name, email, token)
+            err = attach_file_to_jira_issue(
+                issue_key, att_data, att_name,
+                jira_email=jira_email, jira_api_token=jira_api_token,
+                oauth_token=oauth_token, cloud_id=cloud_id,
+            )
             if err:
                 attach_errors.append(err)
 
@@ -299,11 +465,10 @@ def create_jira_incident(data, jira_email=None, jira_api_token=None):
         return None, str(e)
 
 
-def attach_file_to_jira_issue(issue_key, base64_data, filename, jira_email=None, jira_api_token=None):
+def attach_file_to_jira_issue(issue_key, base64_data, filename, jira_email=None, jira_api_token=None, oauth_token=None, cloud_id=None):
     """Attach a base64-encoded file to an existing Jira issue."""
-    email = jira_email or JIRA_EMAIL
-    token = jira_api_token or JIRA_API_TOKEN
-    if not all([JIRA_BASE_URL, email, token]):
+    auth_header = _jira_auth_header(oauth_token, jira_email, jira_api_token)
+    if not auth_header:
         return "Jira integration not configured"
 
     try:
@@ -311,8 +476,6 @@ def attach_file_to_jira_issue(issue_key, base64_data, filename, jira_email=None,
     except Exception as e:
         log.error(f"Failed to decode attachment base64: {e}")
         return f"Invalid base64 data for {filename}"
-
-    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
 
     boundary = f"----UIPBoundary{id(file_bytes)}"
     body_parts = []
@@ -325,12 +488,12 @@ def attach_file_to_jira_issue(issue_key, base64_data, filename, jira_email=None,
     body = b"\r\n".join(body_parts)
 
     req = Request(
-        f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/attachments",
+        _jira_api_url(f"/issue/{issue_key}/attachments", cloud_id),
         data=body,
         method="POST",
     )
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-    req.add_header("Authorization", f"Basic {auth}")
+    req.add_header("Authorization", auth_header)
     req.add_header("X-Atlassian-Token", "no-check")
 
     try:
@@ -392,13 +555,49 @@ class RunbookHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/runbook/entries":
             limit = min(int(params.get("limit", ["50"])[0]), 200)
-            offset = int(params.get("offset", ["0"])[0])
-            cursor = db.execute(
-                "SELECT * FROM runbook_entries ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                (limit, offset),
-            )
-            rows = [row_to_dict(r) for r in cursor.fetchall()]
-            self._send_json(200, rows)
+            search = params.get("search", [""])[0].strip()
+            page_param = params.get("page", [None])[0]
+
+            # Build WHERE clause for search
+            where_clause = ""
+            sql_params = []
+            if search:
+                where_clause = (
+                    " WHERE alert_name LIKE ? OR hostname LIKE ? OR remediation LIKE ?"
+                )
+                like_val = f"%{search}%"
+                sql_params = [like_val, like_val, like_val]
+
+            if page_param is not None:
+                # Paginated response format
+                page = max(int(page_param), 1)
+                offset = (page - 1) * limit
+
+                total = db.execute(
+                    f"SELECT COUNT(*) FROM runbook_entries{where_clause}",
+                    sql_params,
+                ).fetchone()[0]
+
+                cursor = db.execute(
+                    f"SELECT * FROM runbook_entries{where_clause} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    sql_params + [limit, offset],
+                )
+                rows = [row_to_dict(r) for r in cursor.fetchall()]
+                self._send_json(200, {
+                    "items": rows,
+                    "total": total,
+                    "page": page,
+                    "limit": limit,
+                })
+            else:
+                # Legacy array response (backward compat)
+                offset = int(params.get("offset", ["0"])[0])
+                cursor = db.execute(
+                    f"SELECT * FROM runbook_entries{where_clause} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    sql_params + [limit, offset],
+                )
+                rows = [row_to_dict(r) for r in cursor.fetchall()]
+                self._send_json(200, rows)
 
         elif path == "/api/runbook/ai-instructions":
             cursor = db.execute(
@@ -482,6 +681,13 @@ class RunbookHandler(BaseHTTPRequestHandler):
                 self._send_json(200, row_to_dict(row))
             else:
                 self._send_json(404, {"error": "not found"})
+
+        elif path == "/api/runbook/statuspage/components":
+            components, error = fetch_statuspage_components()
+            if error:
+                self._send_json(502, {"error": error})
+            else:
+                self._send_json(200, components)
 
         else:
             self._send_json(404, {"error": "not found"})
@@ -605,27 +811,87 @@ class RunbookHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "summary is required"})
                 return
 
-            # Per-user Jira credentials (users table now lives in auth-api's DB,
-            # so this lookup will fail — fall back to global Jira creds)
-            user_jira_email, user_jira_token = None, None
+            # Try to get user's OAuth token from auth-api, fall back to global API key
             username = _get_username_from_request(self)
+            oauth_token, cloud_id = None, None
             if username:
                 try:
-                    user_row = db.execute(
-                        "SELECT jira_email, jira_api_token FROM users WHERE username = ?",
-                        (username,),
-                    ).fetchone()
-                    if user_row and user_row["jira_email"] and user_row["jira_api_token"]:
-                        user_jira_email = user_row["jira_email"]
-                        user_jira_token = user_row["jira_api_token"]
-                        log.info(f"Using per-user Jira creds for {username}")
-                except sqlite3.OperationalError:
-                    pass  # users table not in this DB, use global creds
+                    token_req = Request(
+                        f"{AUTH_API_URL}/api/auth/jira-token?username={username}",
+                    )
+                    token_resp = urlopen(token_req, timeout=5)
+                    token_data = json.loads(token_resp.read())
+                    oauth_token = token_data.get("access_token")
+                    cloud_id = token_data.get("cloud_id")
+                    if oauth_token:
+                        log.info(f"Using OAuth token for {username}")
+                except Exception as e:
+                    log.debug(f"No OAuth token for {username}: {e}")
 
-            result, error = create_jira_incident(data, user_jira_email, user_jira_token)
+            result, error = create_jira_incident(data, oauth_token=oauth_token, cloud_id=cloud_id)
             if error:
                 self._send_json(502, {"error": error})
             else:
+                self._send_json(201, result)
+
+        # ── Incident Notification Endpoints ───────────────
+
+        elif path == "/api/runbook/incident/assess":
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            title = (data.get("title") or "").strip()
+            description = (data.get("description") or "").strip()
+            if not description:
+                self._send_json(400, {"error": "description is required"})
+                return
+            result = assess_incident_description(title, description)
+            self._send_json(200, result)
+
+        elif path == "/api/runbook/incident/webhook":
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            title = (data.get("title") or "").strip()
+            description = (data.get("description") or "").strip()
+            if not title:
+                self._send_json(400, {"error": "title is required"})
+                return
+            started_at = data.get("started_at") or datetime.now(timezone.utc).isoformat()
+            ok, error = send_incident_webhook(title, description, started_at)
+            if ok:
+                log.info(f"Incident webhook sent: {title}")
+                self._send_json(200, {"ok": True})
+            else:
+                log.error(f"Incident webhook failed: {error}")
+                self._send_json(502, {"ok": False, "error": error})
+
+        elif path == "/api/runbook/statuspage/incident":
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            name = (data.get("name") or "").strip()
+            if not name:
+                self._send_json(400, {"error": "name is required"})
+                return
+            result, error = create_statuspage_incident(
+                name=name,
+                body=(data.get("body") or "").strip(),
+                component_ids=data.get("component_ids") or [],
+                status=data.get("status") or "investigating",
+                impact=data.get("impact_override") or "minor",
+            )
+            if error:
+                log.error(f"Statuspage incident failed: {error}")
+                self._send_json(502, {"error": error})
+            else:
+                log.info(f"Statuspage incident created: {result}")
                 self._send_json(201, result)
 
         else:
