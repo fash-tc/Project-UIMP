@@ -36,6 +36,12 @@ Zabbix Production
                   [n8n] (workflow automation for Slack routing, escalation)
 ```
 
+## Operations Guide
+
+For the full team handbook covering platform usage, architecture, troubleshooting, logs, restarts, and recovery procedures, see:
+
+- [UIP Operations Guide](docs/OPERATIONS_GUIDE.md)
+
 ### Services (Docker Compose)
 
 | Service | Purpose | Image |
