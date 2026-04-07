@@ -11,6 +11,10 @@ import {
   getSourceLabel,
   overrideSeverity,
   forceEnrich,
+  fetchAlertRules,
+  AlertRule,
+  matchHighlightRules,
+  colorWithAlpha,
 } from '@/lib/keep-api';
 
 const ZABBIX_URLS: Record<string, string> = {
@@ -21,7 +25,7 @@ const ZABBIX_URLS: Record<string, string> = {
   'iaas': 'https://zabbix.tucows.cloud',
 };
 
-type SortField = 'severity' | 'name' | 'host' | 'noise' | 'time';
+type SortField = 'severity' | 'name' | 'host' | 'noise' | 'time' | 'received';
 type SortDir = 'asc' | 'desc';
 
 const SEVERITY_ORDER: Record<string, number> = {
@@ -31,11 +35,24 @@ const SEVERITY_ORDER: Record<string, number> = {
 export interface AlertsTableViewProps {
   alerts: Alert[];
   alertStates?: Map<string, AlertState>;
+  customGroupByFingerprint?: Map<string, string>;
+  selectedFingerprints: Set<string>;
   loading: boolean;
   onAlertClick: (alert: Alert) => void;
+  onToggleSelectAlert: (fingerprint: string) => void;
+  onSetSelectedAlerts: (fingerprints: string[], selected: boolean) => void;
 }
 
-export default function AlertsTableView({ alerts, alertStates, loading, onAlertClick }: AlertsTableViewProps) {
+export default function AlertsTableView({
+  alerts,
+  alertStates,
+  customGroupByFingerprint,
+  selectedFingerprints,
+  loading,
+  onAlertClick,
+  onToggleSelectAlert,
+  onSetSelectedAlerts,
+}: AlertsTableViewProps) {
   const [search, setSearch] = useState('');
   const [sevFilter, setSevFilter] = useState<string>('all');
   const [statusFilter, setStatusFilter] = useState<string>('active');
@@ -44,6 +61,22 @@ export default function AlertsTableView({ alerts, alertStates, loading, onAlertC
   const [pageSize, setPageSize] = useState(25);
   const [currentPage, setCurrentPage] = useState(0);
   const [severityDropdown, setSeverityDropdown] = useState<string | null>(null);
+  const [highlightRules, setHighlightRules] = useState<AlertRule[]>([]);
+  const isResolvedView = statusFilter === 'resolved';
+
+  useEffect(() => {
+    fetchAlertRules('highlight').then(setHighlightRules);
+  }, []);
+
+  useEffect(() => {
+    if (statusFilter === 'resolved') {
+      setSortField('time');
+      setSortDir('desc');
+    } else if (sortField === 'received') {
+      setSortField('time');
+      setSortDir('desc');
+    }
+  }, [statusFilter, sortField]);
 
   const enrichedAlerts = useMemo(() => {
     return alerts.map(a => ({
@@ -98,7 +131,14 @@ export default function AlertsTableView({ alerts, alertStates, loading, onAlertC
             cmp = (a.enrichment?.noise_score ?? 5) - (b.enrichment?.noise_score ?? 5);
             break;
           case 'time':
-            cmp = (alertStartTime(a.alert) || '').localeCompare(alertStartTime(b.alert) || '');
+            cmp = (
+              statusFilter === 'resolved' ? (a.alert.lastReceived || '') : (alertStartTime(a.alert) || '')
+            ).localeCompare(
+              statusFilter === 'resolved' ? (b.alert.lastReceived || '') : (alertStartTime(b.alert) || '')
+            );
+            break;
+          case 'received':
+            cmp = (a.alert.lastReceived || '').localeCompare(b.alert.lastReceived || '');
             break;
         }
         return sortDir === 'desc' ? -cmp : cmp;
@@ -110,6 +150,8 @@ export default function AlertsTableView({ alerts, alertStates, loading, onAlertC
   const paginatedAlerts = pageSize === 0
     ? filtered
     : filtered.slice(safePage * pageSize, (safePage + 1) * pageSize);
+  const visibleFingerprints = paginatedAlerts.map(({ alert }) => alert.fingerprint);
+  const allVisibleSelected = visibleFingerprints.length > 0 && visibleFingerprints.every(fp => selectedFingerprints.has(fp));
 
   // Reset to page 0 when filters or page size change
   useEffect(() => { setCurrentPage(0); }, [search, sevFilter, statusFilter, pageSize]);
@@ -175,6 +217,13 @@ export default function AlertsTableView({ alerts, alertStates, loading, onAlertC
           <table className="w-full">
             <thead>
               <tr className="border-b border-border">
+                <th className="table-header w-10">
+                  <input
+                    type="checkbox"
+                    checked={allVisibleSelected}
+                    onChange={(e) => onSetSelectedAlerts(visibleFingerprints, e.target.checked)}
+                  />
+                </th>
                 <th className="table-header cursor-pointer select-none" onClick={() => toggleSort('severity')}>
                   Severity{sortIndicator('severity')}
                 </th>
@@ -188,16 +237,27 @@ export default function AlertsTableView({ alerts, alertStates, loading, onAlertC
                 <th className="table-header cursor-pointer select-none" onClick={() => toggleSort('noise')}>
                   Noise{sortIndicator('noise')}
                 </th>
-                <th className="table-header">AI Summary</th>
-                <th className="table-header cursor-pointer select-none" onClick={() => toggleSort('time')}>
-                  Time{sortIndicator('time')}
-                </th>
+                {isResolvedView ? (
+                  <>
+                    <th className="table-header cursor-pointer select-none" onClick={() => toggleSort('time')}>
+                      Last Received{sortIndicator('time')}
+                    </th>
+                    <th className="table-header">AI Summary</th>
+                  </>
+                ) : (
+                  <>
+                    <th className="table-header">AI Summary</th>
+                    <th className="table-header cursor-pointer select-none" onClick={() => toggleSort('time')}>
+                      Time{sortIndicator('time')}
+                    </th>
+                  </>
+                )}
               </tr>
             </thead>
             <tbody>
               {paginatedAlerts.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="table-cell text-center text-muted py-8">
+                  <td colSpan={8} className="table-cell text-center text-muted py-8">
                     No matching alerts
                   </td>
                 </tr>
@@ -209,13 +269,34 @@ export default function AlertsTableView({ alerts, alertStates, loading, onAlertC
 
                   const alertState = alertStates?.get(alert.fingerprint);
                   const displaySeverity = alertState?.severity_override || sev;
+                  const hl = matchHighlightRules(alert, highlightRules);
 
                   return (
                     <tr
                       key={alert.fingerprint || alert.id}
-                      className="border-b border-border/50 hover:bg-surface-hover transition-colors cursor-pointer"
+                      className={`border-b border-border/50 hover:bg-surface-hover transition-colors cursor-pointer ${selectedFingerprints.has(alert.fingerprint) ? 'bg-accent/5' : ''}`}
+                      style={hl ? (
+                        hl.style === 'box'
+                          ? {
+                              borderLeft: `3px solid ${hl.color}`,
+                              backgroundColor: colorWithAlpha(hl.color, 0.12),
+                              boxShadow: `inset 0 0 0 1px ${colorWithAlpha(hl.color, 0.28)}`,
+                            }
+                          : { borderLeft: `3px solid ${hl.color}` }
+                      ) : undefined}
                       onClick={() => onAlertClick(alert)}
                     >
+                      <td className="table-cell">
+                        <input
+                          type="checkbox"
+                          checked={selectedFingerprints.has(alert.fingerprint)}
+                          onChange={(e) => {
+                            e.stopPropagation();
+                            onToggleSelectAlert(alert.fingerprint);
+                          }}
+                          onClick={(e) => e.stopPropagation()}
+                        />
+                      </td>
                       <td className="table-cell">
                         <div className="relative">
                           <button
@@ -266,6 +347,19 @@ export default function AlertsTableView({ alerts, alertStates, loading, onAlertC
                             {(alert.name || 'Unknown').substring(0, 50)}
                             {(alert.name?.length ?? 0) > 50 ? '...' : ''}
                           </span>
+                          {hl?.label && (
+                            <span
+                              className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium whitespace-nowrap"
+                              style={{ backgroundColor: `${hl.color}20`, color: hl.color, border: `1px solid ${hl.color}40` }}
+                            >
+                              {hl.label}
+                            </span>
+                          )}
+                          {customGroupByFingerprint?.get(alert.fingerprint) && (
+                            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium whitespace-nowrap bg-accent/10 border border-accent/30 text-accent">
+                              {customGroupByFingerprint.get(alert.fingerprint)}
+                            </span>
+                          )}
                           {alertStates?.get(alert.fingerprint)?.incident_jira_key && (
                             <a
                               href={alertStates.get(alert.fingerprint)!.incident_jira_url || '#'}
@@ -332,25 +426,51 @@ export default function AlertsTableView({ alerts, alertStates, loading, onAlertC
                           <span className="text-xs text-muted">--</span>
                         )}
                       </td>
-                      <td className="table-cell text-xs text-muted max-w-xs truncate">
-                        {enrichment?.summary || (
-                          !alert.note ? (
-                            <button
-                              onClick={async (e) => {
-                                e.stopPropagation();
-                                await forceEnrich(alert.fingerprint);
-                              }}
-                              className="text-xs text-muted animate-pulse hover:text-accent transition-colors cursor-pointer"
-                              title="Click to force enrichment"
-                            >
-                              Enriching...
-                            </button>
-                          ) : '--'
-                        )}
-                      </td>
-                      <td className="table-cell text-xs text-muted whitespace-nowrap">
-                        {timeAgo(alertStartTime(alert))}
-                      </td>
+                      {isResolvedView ? (
+                        <>
+                          <td className="table-cell text-xs text-muted whitespace-nowrap">
+                            {timeAgo(alert.lastReceived)}
+                          </td>
+                          <td className="table-cell text-xs text-muted max-w-[14rem] truncate">
+                            {enrichment?.summary || (
+                              !alert.note ? (
+                                <button
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    await forceEnrich(alert.fingerprint);
+                                  }}
+                                  className="text-xs text-muted animate-pulse hover:text-accent transition-colors cursor-pointer"
+                                  title="Click to force enrichment"
+                                >
+                                  Enriching...
+                                </button>
+                              ) : '--'
+                            )}
+                          </td>
+                        </>
+                      ) : (
+                        <>
+                          <td className="table-cell text-xs text-muted max-w-xs truncate">
+                            {enrichment?.summary || (
+                              !alert.note ? (
+                                <button
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    await forceEnrich(alert.fingerprint);
+                                  }}
+                                  className="text-xs text-muted animate-pulse hover:text-accent transition-colors cursor-pointer"
+                                  title="Click to force enrichment"
+                                >
+                                  Enriching...
+                                </button>
+                              ) : '--'
+                            )}
+                          </td>
+                          <td className="table-cell text-xs text-muted whitespace-nowrap">
+                            {timeAgo(alertStartTime(alert))}
+                          </td>
+                        </>
+                      )}
                     </tr>
                   );
                 })

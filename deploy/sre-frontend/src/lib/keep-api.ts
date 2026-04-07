@@ -1,9 +1,10 @@
-import { Alert, AIEnrichment, AlertStats, SREFeedback, RunbookEntry, AIInstruction, AIFeedbackSummary, AlertState, RunbookFeedback, SituationSummary, SuggestedMerge, SREFeedbackEntry, RunbookExclusion, PaginatedResponse, IncidentAssessment, WebhookSubscriber, WebhookDelivery, StatuspageComponent, StatuspageIncident } from './types';
+import { Alert, AIEnrichment, AlertStats, SREFeedback, RunbookEntry, AIInstruction, AIFeedbackSummary, AlertState, RunbookFeedback, SituationSummary, SuggestedMerge, SREFeedbackEntry, RunbookExclusion, PaginatedResponse, IncidentAssessment, WebhookSubscriber, WebhookDelivery, StatuspageComponent, StatuspageComponentUpdate, StatuspageIncident, Role, UserProfile, CustomAlertGroup, SharedMaintenanceAuthConfig } from './types';
 
 const API_BASE = '/api/keep';
 
 const SOURCE_LABELS: Record<string, string> = {
   zabbix: 'Zabbix',
+  'grafana-irm': 'Grafana IRM',
   'domains-shared': 'Domains Shared Zabbix',
   'ascio': 'Ascio Zabbix',
   'hostedemail': 'HostedEmail Zabbix',
@@ -31,6 +32,118 @@ async function keepFetch(path: string) {
   const res = await fetch(`${API_BASE}${path}`);
   if (!res.ok) throw new Error(`Keep API ${res.status}: ${path}`);
   return res.json();
+}
+
+async function readResponseBody(res: Response): Promise<any> {
+  const contentType = res.headers.get('content-type') || '';
+  try {
+    if (contentType.includes('application/json')) {
+      return await res.json();
+    }
+    return await res.text();
+  } catch {
+    return null;
+  }
+}
+
+function extractResponseError(body: any, fallback: string): string {
+  if (typeof body === 'string') {
+    const normalized = body.replace(/\s+/g, ' ').trim();
+    if (!normalized || normalized.startsWith('<')) {
+      return fallback;
+    }
+    return normalized.slice(0, 200);
+  }
+  if (body && typeof body === 'object') {
+    return body.error || body.detail || body.message || fallback;
+  }
+  return fallback;
+}
+
+const MAINT_AUTH_STORAGE_KEY = 'ump-auth-token';
+
+function getMaintenanceAuthToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return window.sessionStorage.getItem(MAINT_AUTH_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function setMaintenanceAuthToken(token: string | null) {
+  if (typeof window === 'undefined') return;
+  try {
+    if (token) {
+      window.sessionStorage.setItem(MAINT_AUTH_STORAGE_KEY, token);
+    } else {
+      window.sessionStorage.removeItem(MAINT_AUTH_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage failures in private browsing or restricted contexts.
+  }
+}
+
+function getMaintenanceWriteHeaders(): Record<string, string> | null {
+  const token = getMaintenanceAuthToken();
+  if (!token) return null;
+  return { Authorization: `Bearer ${token}` };
+}
+
+function extractMaintenanceWriteError(body: any, fallback: string): string {
+  const message = extractResponseError(body, fallback);
+  if (/missing bearer token/i.test(message)) {
+    return 'Maintenance API auth required. Sign in to Maintenance Auth on this page and retry.';
+  }
+  if (/invalid token/i.test(message)) {
+    return 'Maintenance API token expired or invalid. Sign in to Maintenance Auth again.';
+  }
+  if (/validation error/i.test(message) || /field required/i.test(message)) {
+    return 'Maintenance API auth required. Sign in to Maintenance Auth on this page and retry.';
+  }
+  return message;
+}
+
+const HIGHLIGHT_COLOR_ALIASES: Record<string, string> = {
+  red: '#ef4444',
+  orange: '#f97316',
+  yellow: '#eab308',
+  green: '#22c55e',
+  blue: '#3b82f6',
+  purple: '#a855f7',
+  gray: '#6b7280',
+};
+
+export function normalizeHighlightColor(color?: string | null): string {
+  if (!color) return '#ef4444';
+  const normalized = color.trim().toLowerCase();
+  return HIGHLIGHT_COLOR_ALIASES[normalized] || color;
+}
+
+export function colorWithAlpha(color: string | undefined | null, alpha: number): string {
+  const normalized = normalizeHighlightColor(color);
+  if (/^#[0-9a-f]{6}$/i.test(normalized)) {
+    const clamped = Math.max(0, Math.min(1, alpha));
+    const alphaHex = Math.round(clamped * 255).toString(16).padStart(2, '0');
+    return `${normalized}${alphaHex}`;
+  }
+  return normalized;
+}
+
+function normalizeWebhookDelivery(raw: any): WebhookDelivery {
+  return {
+    id: raw.id,
+    subscriber_id: raw.subscriber_id,
+    subscriber_name: raw.subscriber_name,
+    timestamp: raw.timestamp || raw.created_at || '',
+    http_status: raw.http_status ?? raw.status_code ?? null,
+    attempts: raw.attempts ?? raw.attempt ?? 0,
+    success: Boolean(raw.success),
+    is_test: Boolean(raw.is_test),
+    event_type: raw.event_type || '',
+    error_message: raw.error_message || null,
+    payload_hash: raw.payload_hash || '',
+  };
 }
 
 export async function fetchAlerts(limit = 100): Promise<Alert[]> {
@@ -325,6 +438,40 @@ export async function submitRunbookEntry(entry: {
   }
 }
 
+export async function searchRunbookEntries(search: string, limit = 20): Promise<RunbookEntry[]> {
+  try {
+    const params = new URLSearchParams();
+    params.set('page', '1');
+    params.set('limit', String(limit));
+    if (search.trim()) params.set('search', search.trim());
+    const res = await fetch(`${RUNBOOK_BASE}/entries?${params.toString()}`, { credentials: 'include' });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data) ? data : (data.items || []);
+  } catch {
+    return [];
+  }
+}
+
+export async function attachRunbookEntry(entryId: number, data: {
+  alert_name: string;
+  hostname?: string;
+  service?: string;
+}): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/entries/${entryId}/attach`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const body = await readResponseBody(res);
+    return { ok: res.ok, error: res.ok ? undefined : extractResponseError(body, 'Failed to attach runbook') };
+  } catch {
+    return { ok: false, error: 'Network error' };
+  }
+}
+
 export async function deleteRunbookEntry(id: number): Promise<boolean> {
   try {
     const res = await fetch(`${RUNBOOK_BASE}/entries/${id}`, { method: 'DELETE' });
@@ -432,14 +579,15 @@ export async function createJiraIncident(details: {
   try {
     const res = await fetch(`${RUNBOOK_BASE}/jira/incident`, {
       method: 'POST',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(details),
     });
-    const data = await res.json();
+    const data = await readResponseBody(res);
     if (res.ok) {
       return { ok: true, issueKey: data.issue_key, issueUrl: data.issue_url };
     }
-    return { ok: false, error: data.error || 'Failed to create incident' };
+    return { ok: false, error: extractResponseError(data, 'Failed to create incident') };
   } catch {
     return { ok: false, error: 'Network error' };
   }
@@ -584,6 +732,69 @@ export async function fetchAlertStates(): Promise<AlertState[]> {
   }
 }
 
+export async function syncCustomAlertGroups(activeFingerprints: string[]): Promise<CustomAlertGroup[]> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/custom-groups/sync`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active_fingerprints: activeFingerprints }),
+    });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function createCustomAlertGroup(name: string, fingerprints: string[]): Promise<{ ok: boolean; group?: CustomAlertGroup; error?: string }> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/custom-groups`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, fingerprints }),
+    });
+    const body = await readResponseBody(res);
+    if (!res.ok) return { ok: false, error: extractResponseError(body, 'Failed to create custom group') };
+    return { ok: true, group: body };
+  } catch (e: any) {
+    return { ok: false, error: e.message || 'Network error' };
+  }
+}
+
+export async function renameCustomAlertGroup(groupId: number, name: string): Promise<{ ok: boolean; group?: CustomAlertGroup; error?: string }> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/custom-groups/${groupId}`, {
+      method: 'PUT',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const body = await readResponseBody(res);
+    if (!res.ok) return { ok: false, error: extractResponseError(body, 'Failed to rename custom group') };
+    return { ok: true, group: body };
+  } catch (e: any) {
+    return { ok: false, error: e.message || 'Network error' };
+  }
+}
+
+export async function addAlertsToCustomAlertGroup(groupId: number, fingerprints: string[]): Promise<{ ok: boolean; group?: CustomAlertGroup; error?: string }> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/custom-groups/${groupId}`, {
+      method: 'PUT',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fingerprints }),
+    });
+    const body = await readResponseBody(res);
+    if (!res.ok) return { ok: false, error: extractResponseError(body, 'Failed to update custom group') };
+    return { ok: true, group: body };
+  } catch (e: any) {
+    return { ok: false, error: e.message || 'Network error' };
+  }
+}
+
 export async function toggleInvestigating(
   fingerprint: string,
   alertName: string,
@@ -701,13 +912,37 @@ export async function storeIncidentState(
   fingerprint: string,
   jiraKey: string,
   jiraUrl: string,
+  firingStart?: string,
 ): Promise<void> {
   await fetch('/api/alert-states/incident', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
-    body: JSON.stringify({ fingerprint, jira_key: jiraKey, jira_url: jiraUrl }),
+    body: JSON.stringify({ fingerprint, jira_key: jiraKey, jira_url: jiraUrl, firing_start: firingStart || '' }),
   });
+}
+
+export async function storeIncidentStateBulk(
+  fingerprints: string[],
+  jiraKey: string,
+  jiraUrl: string,
+  firingStarts?: Record<string, string>,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch('/api/alert-states/incident/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ fingerprints, jira_key: jiraKey, jira_url: jiraUrl, firing_starts: firingStarts || {} }),
+    });
+    const body = await readResponseBody(res);
+    return {
+      ok: res.ok,
+      error: res.ok ? undefined : extractResponseError(body, 'Failed to store incident state'),
+    };
+  } catch (e: any) {
+    return { ok: false, error: e.message || 'Network error' };
+  }
 }
 
 export async function storeEscalationState(
@@ -1126,6 +1361,94 @@ export type { SuggestedMerge };
 
 const MAINT_BASE = '/api/maintenance';
 
+export function hasMaintenanceAuthToken(): boolean {
+  return Boolean(getMaintenanceAuthToken());
+}
+
+export function clearMaintenanceAuthToken() {
+  setMaintenanceAuthToken(null);
+}
+
+export async function loginMaintenanceAuth(username: string, password: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${MAINT_BASE}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const body = await readResponseBody(res);
+    if (!res.ok) return { ok: false, error: extractResponseError(body, `HTTP ${res.status}`) };
+    if (!body?.token || typeof body.token !== 'string') {
+      return { ok: false, error: 'Maintenance login succeeded but no token was returned.' };
+    }
+    setMaintenanceAuthToken(body.token);
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'Network error' };
+  }
+}
+
+export async function fetchSharedMaintenanceAuth(): Promise<SharedMaintenanceAuthConfig> {
+  const res = await fetch('/api/auth/shared-integrations/maintenance', { credentials: 'include' });
+  const body = await readResponseBody(res);
+  if (!res.ok) throw new Error(extractResponseError(body, 'Failed to load shared maintenance auth'));
+  return body as SharedMaintenanceAuthConfig;
+}
+
+export async function saveSharedMaintenanceAuth(username: string, password: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch('/api/auth/shared-integrations/maintenance', {
+    method: 'PUT',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  const body = await readResponseBody(res);
+  return { ok: res.ok, error: res.ok ? undefined : extractResponseError(body, 'Failed to save shared maintenance auth') };
+}
+
+export async function testSharedMaintenanceAuth(): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch('/api/auth/shared-integrations/maintenance/test', {
+    method: 'POST',
+    credentials: 'include',
+  });
+  const body = await readResponseBody(res);
+  return { ok: res.ok, error: res.ok ? undefined : extractResponseError(body, 'Failed to test shared maintenance auth') };
+}
+
+export async function clearSharedMaintenanceAuth(): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch('/api/auth/shared-integrations/maintenance', {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+  const body = await readResponseBody(res);
+  return { ok: res.ok, error: res.ok ? undefined : extractResponseError(body, 'Failed to clear shared maintenance auth') };
+}
+
+export async function bootstrapSharedMaintenanceAuth(): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch('/api/auth/maintenance/bootstrap', {
+    method: 'POST',
+    credentials: 'include',
+  });
+  const body = await readResponseBody(res);
+  if (!res.ok) return { ok: false, error: extractResponseError(body, 'Failed to bootstrap maintenance auth') };
+  if (!body?.token || typeof body.token !== 'string') {
+    return { ok: false, error: 'Maintenance bootstrap succeeded but no token was returned.' };
+  }
+  setMaintenanceAuthToken(body.token);
+  return { ok: true };
+}
+
+export async function persistWebhookSubscriberSecret(id: number, name: string, url: string, secret: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`/api/auth/webhook-subscriber-secrets/${id}`, {
+    method: 'PUT',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, url, secret }),
+  });
+  const body = await readResponseBody(res);
+  return { ok: res.ok, error: res.ok ? undefined : extractResponseError(body, 'Failed to store webhook signing secret') };
+}
+
 export async function assessIncidentDescription(title: string, description: string): Promise<IncidentAssessment> {
   try {
     const res = await fetch(`${RUNBOOK_BASE}/incident/assess`, {
@@ -1165,15 +1488,23 @@ export async function fetchStatuspageComponents(): Promise<StatuspageComponent[]
 export async function createStatuspageIncident(data: {
   name: string;
   body: string;
-  component_ids: string[];
   status: string;
   impact_override: string;
+  components?: StatuspageComponentUpdate[];
+  component_ids?: string[];
 }): Promise<{ result?: StatuspageIncident; error?: string }> {
   try {
+    const payload = {
+      ...data,
+      components: data.components ?? (data.component_ids || []).map(component_id => ({
+        component_id,
+        status: 'degraded_performance' as const,
+      })),
+    };
     const res = await fetch(`${RUNBOOK_BASE}/statuspage/incident`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
+      body: JSON.stringify(payload),
     });
     const json = await res.json();
     if (!res.ok) return { error: json.error || `HTTP ${res.status}` };
@@ -1184,6 +1515,37 @@ export async function createStatuspageIncident(data: {
 }
 
 // ── Webhook Management APIs ──────────────────────────
+
+export async function fetchStatuspageIncidents(): Promise<StatuspageIncident[]> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/statuspage/incidents`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function updateStatuspageIncident(id: string, data: {
+  name: string;
+  body: string;
+  status: string;
+  impact_override: string;
+  components: StatuspageComponentUpdate[];
+}): Promise<{ result?: StatuspageIncident; error?: string }> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/statuspage/incidents/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const json = await res.json();
+    if (!res.ok) return { error: json.error || `HTTP ${res.status}` };
+    return { result: json };
+  } catch {
+    return { error: 'Network error' };
+  }
+}
 
 export async function fetchWebhookSubscribers(): Promise<WebhookSubscriber[]> {
   try {
@@ -1197,13 +1559,17 @@ export async function fetchWebhookSubscribers(): Promise<WebhookSubscriber[]> {
 
 export async function createWebhookSubscriber(name: string, url: string): Promise<{ subscriber?: WebhookSubscriber; error?: string }> {
   try {
+    const authHeaders = getMaintenanceWriteHeaders();
+    if (!authHeaders) {
+      return { error: 'Maintenance API auth required. Sign in to Maintenance Auth on this page and retry.' };
+    }
     const res = await fetch(`${MAINT_BASE}/webhooks/subscribers`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders },
       body: JSON.stringify({ name, url }),
     });
-    const json = await res.json();
-    if (!res.ok) return { error: json.error || json.detail || `HTTP ${res.status}` };
+    const json = await readResponseBody(res);
+    if (!res.ok) return { error: extractMaintenanceWriteError(json, `HTTP ${res.status}`) };
     return { subscriber: json };
   } catch {
     return { error: 'Network error' };
@@ -1212,12 +1578,17 @@ export async function createWebhookSubscriber(name: string, url: string): Promis
 
 export async function updateWebhookSubscriber(id: number, data: Partial<{ name: string; url: string; is_active: boolean }>): Promise<{ ok: boolean; error?: string }> {
   try {
+    const authHeaders = getMaintenanceWriteHeaders();
+    if (!authHeaders) {
+      return { ok: false, error: 'Maintenance API auth required. Sign in to Maintenance Auth on this page and retry.' };
+    }
     const res = await fetch(`${MAINT_BASE}/webhooks/subscribers/${id}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders },
       body: JSON.stringify(data),
     });
-    return { ok: res.ok, error: res.ok ? undefined : `HTTP ${res.status}` };
+    const body = await readResponseBody(res);
+    return { ok: res.ok, error: res.ok ? undefined : extractMaintenanceWriteError(body, `HTTP ${res.status}`) };
   } catch {
     return { ok: false, error: 'Network error' };
   }
@@ -1225,8 +1596,13 @@ export async function updateWebhookSubscriber(id: number, data: Partial<{ name: 
 
 export async function deleteWebhookSubscriber(id: number): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await fetch(`${MAINT_BASE}/webhooks/subscribers/${id}`, { method: 'DELETE' });
-    return { ok: res.ok };
+    const authHeaders = getMaintenanceWriteHeaders();
+    if (!authHeaders) {
+      return { ok: false, error: 'Maintenance API auth required. Sign in to Maintenance Auth on this page and retry.' };
+    }
+    const res = await fetch(`${MAINT_BASE}/webhooks/subscribers/${id}`, { method: 'DELETE', headers: authHeaders });
+    const body = await readResponseBody(res);
+    return { ok: res.ok, error: res.ok ? undefined : extractMaintenanceWriteError(body, `HTTP ${res.status}`) };
   } catch {
     return { ok: false, error: 'Network error' };
   }
@@ -1234,9 +1610,13 @@ export async function deleteWebhookSubscriber(id: number): Promise<{ ok: boolean
 
 export async function rotateWebhookSecret(id: number): Promise<{ secret?: string; error?: string }> {
   try {
-    const res = await fetch(`${MAINT_BASE}/webhooks/subscribers/${id}/rotate-secret`, { method: 'POST' });
-    const json = await res.json();
-    if (!res.ok) return { error: json.error || `HTTP ${res.status}` };
+    const authHeaders = getMaintenanceWriteHeaders();
+    if (!authHeaders) {
+      return { error: 'Maintenance API auth required. Sign in to Maintenance Auth on this page and retry.' };
+    }
+    const res = await fetch(`${MAINT_BASE}/webhooks/subscribers/${id}/rotate-secret`, { method: 'POST', headers: authHeaders });
+    const json = await readResponseBody(res);
+    if (!res.ok) return { error: extractMaintenanceWriteError(json, `HTTP ${res.status}`) };
     return { secret: json.secret };
   } catch {
     return { error: 'Network error' };
@@ -1246,7 +1626,28 @@ export async function rotateWebhookSecret(id: number): Promise<{ secret?: string
 export async function testWebhookDelivery(id: number): Promise<{ ok: boolean; error?: string }> {
   try {
     const res = await fetch(`${MAINT_BASE}/webhooks/test/${id}`, { method: 'POST' });
-    return { ok: res.ok };
+    const body = await readResponseBody(res);
+    return { ok: res.ok, error: res.ok ? undefined : extractResponseError(body, `HTTP ${res.status}`) };
+  } catch {
+    return { ok: false, error: 'Network error' };
+  }
+}
+
+export async function sendIncidentWebhookPreview(details?: Partial<{ title: string; description: string; started_at: string }>): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch('/api/runbook/incident/webhook', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: details?.title || 'Test Incident: Customer-facing outage',
+        description: details?.description || 'This is a preview incident generated from UIP so you can review the customer webhook payload.',
+        started_at: details?.started_at || new Date().toISOString(),
+        preview_only: true,
+      }),
+    });
+    const body = await readResponseBody(res);
+    return { ok: res.ok, error: res.ok ? undefined : extractResponseError(body, `HTTP ${res.status}`) };
   } catch {
     return { ok: false, error: 'Network error' };
   }
@@ -1260,8 +1661,359 @@ export async function fetchWebhookDeliveries(subscriberId?: number, success?: bo
     const qs = params.toString();
     const res = await fetch(`${MAINT_BASE}/webhooks/deliveries${qs ? '?' + qs : ''}`);
     if (!res.ok) return [];
+    const data = await readResponseBody(res);
+    return Array.isArray(data) ? data.map(normalizeWebhookDelivery) : [];
+  } catch {
+    return [];
+  }
+}
+
+// ── Admin: User Management ────────────────────────────
+
+export async function fetchUsers(): Promise<UserProfile[]> {
+  const res = await fetch('/api/auth/users', { credentials: 'include' });
+  const body = await readResponseBody(res);
+  if (!res.ok) throw new Error(extractResponseError(body, 'Failed to load users'));
+  return Array.isArray(body) ? body : [];
+}
+
+export async function createUser(username: string, display_name: string, password: string, role_id: number): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch('/api/auth/users', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, display_name, password, role_id }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, error: data.error || 'Failed' };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function updateUser(id: number, data: Partial<{ display_name: string; role_id: number; password: string }>): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/auth/users/${id}`, {
+      method: 'PUT', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const result = await res.json();
+    if (!res.ok) return { ok: false, error: result.error || 'Failed' };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function deleteUser(id: number): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/auth/users/${id}`, { method: 'DELETE', credentials: 'include' });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, error: data.error || 'Failed' };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// ── Admin: Role Management ────────────────────────────
+
+export async function fetchRoles(): Promise<Role[]> {
+  const res = await fetch('/api/auth/roles', { credentials: 'include' });
+  const body = await readResponseBody(res);
+  if (!res.ok) throw new Error(extractResponseError(body, 'Failed to load roles'));
+  return Array.isArray(body) ? body : [];
+}
+
+export async function createRole(name: string, description: string, permissions: string[]): Promise<{ ok: boolean; id?: number; error?: string }> {
+  try {
+    const res = await fetch('/api/auth/roles', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, description, permissions }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, error: data.error || 'Failed' };
+    return { ok: true, id: data.id };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function updateRole(id: number, data: Partial<{ name: string; description: string }>): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/auth/roles/${id}`, {
+      method: 'PUT', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const result = await res.json();
+    if (!res.ok) return { ok: false, error: result.error || 'Failed' };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function deleteRole(id: number): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/auth/roles/${id}`, { method: 'DELETE', credentials: 'include' });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, error: data.error || 'Failed' };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function updateRolePermissions(id: number, permissions: string[]): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/auth/roles/${id}/permissions`, {
+      method: 'PUT', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ permissions }),
+    });
+    const result = await res.json();
+    if (!res.ok) return { ok: false, error: result.error || 'Failed' };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// ── Alert Rules ───────────────────────────────────────
+
+export interface AlertRule {
+  id: number;
+  name: string;
+  rule_type: 'routing' | 'highlight';
+  conditions_json: any;
+  expression_text: string;
+  action?: string;
+  action_params?: any;
+  color?: string;
+  label?: string;
+  priority: number;
+  enabled: boolean;
+  created_by: string;
+  created_at: string;
+}
+
+export async function fetchAlertRules(type?: 'routing' | 'highlight'): Promise<AlertRule[]> {
+  try {
+    const qs = type ? `?type=${type}` : '';
+    const res = await fetch(`/api/alert-states/rules${qs}`, { credentials: 'include' });
+    if (!res.ok) return [];
     return await res.json();
   } catch {
     return [];
   }
+}
+
+export async function createAlertRule(rule: Partial<AlertRule>): Promise<{ ok: boolean; id?: number; error?: string }> {
+  try {
+    const res = await fetch('/api/alert-states/rules', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(rule),
+    });
+    const data = await readResponseBody(res);
+    if (!res.ok) return { ok: false, error: extractResponseError(data, 'Failed to create rule') };
+    return { ok: true, id: data.id };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function updateAlertRule(id: number, updates: Partial<AlertRule>): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/alert-states/rules/${id}`, {
+      method: 'PUT', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    });
+    const data = await readResponseBody(res);
+    if (!res.ok) return { ok: false, error: extractResponseError(data, 'Failed to update rule') };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function deleteAlertRule(id: number): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/alert-states/rules/${id}`, { method: 'DELETE', credentials: 'include' });
+    const data = await readResponseBody(res);
+    if (!res.ok) return { ok: false, error: extractResponseError(data, 'Failed to delete rule') };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// ── Webhook Test Receiver ────────────────────────────
+
+export interface WebhookTestDelivery {
+  id: number;
+  timestamp: string;
+  headers: Record<string, string>;
+  body: any;
+  signature_header: string;
+  signature_result: string;
+  content_length: number;
+}
+
+export async function fetchWebhookTestDeliveries(): Promise<WebhookTestDelivery[]> {
+  try {
+    const res = await fetch('/api/runbook/webhook-test/deliveries', { credentials: 'include' });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function clearWebhookTestDeliveries(): Promise<{ ok: boolean }> {
+  try {
+    const res = await fetch('/api/runbook/webhook-test/deliveries', { method: 'DELETE', credentials: 'include' });
+    return { ok: res.ok };
+  } catch {
+    return { ok: false };
+  }
+}
+
+export const CONDITION_FIELDS = [
+  { value: 'hostname', label: 'Hostname' },
+  { value: 'name', label: 'Alert Name' },
+  { value: 'severity', label: 'Severity' },
+  { value: 'source', label: 'Source' },
+  { value: 'description', label: 'Description' },
+  { value: 'status', label: 'Status' },
+  { value: 'zabbixInstance', label: 'Zabbix Instance' },
+  { value: 'payload', label: 'Entire Payload' },
+];
+
+export const CONDITION_OPERATORS = [
+  { value: 'equals', label: '=' },
+  { value: 'not_equals', label: '!=' },
+  { value: 'contains', label: 'contains' },
+  { value: 'not_contains', label: 'not contains' },
+  { value: 'starts_with', label: 'starts with' },
+  { value: 'ends_with', label: 'ends with' },
+  { value: 'regex', label: 'regex' },
+  { value: '>=', label: '>=' },
+  { value: '<=', label: '<=' },
+  { value: '>', label: '>' },
+  { value: '<', label: '<' },
+];
+
+export const ALL_PERMISSIONS = [
+  { key: 'view_dashboard', label: 'View Dashboard', group: 'Views' },
+  { key: 'view_alerts', label: 'View Alerts', group: 'Views' },
+  { key: 'view_knowledge_base', label: 'View Knowledge Base', group: 'Views' },
+  { key: 'view_settings', label: 'View Settings', group: 'Views' },
+  { key: 'view_webhooks', label: 'View Webhooks', group: 'Views' },
+  { key: 'view_admin', label: 'View Admin', group: 'Views' },
+  { key: 'ack_alerts', label: 'Acknowledge Alerts', group: 'Alert Actions' },
+  { key: 'resolve_alerts', label: 'Resolve Alerts', group: 'Alert Actions' },
+  { key: 'silence_alerts', label: 'Silence Alerts', group: 'Alert Actions' },
+  { key: 'investigate_alerts', label: 'Investigate Alerts', group: 'Alert Actions' },
+  { key: 'escalate_alerts', label: 'Escalate Alerts', group: 'Alert Actions' },
+  { key: 'override_severity', label: 'Override Severity', group: 'Alert Actions' },
+  { key: 'create_tickets', label: 'Create Jira Tickets', group: 'Incidents' },
+  { key: 'create_incidents', label: 'Create Incidents', group: 'Incidents' },
+  { key: 'manage_routing_rules', label: 'Manage Routing Rules', group: 'Management' },
+  { key: 'manage_highlight_rules', label: 'Manage Highlight Rules', group: 'Management' },
+  { key: 'manage_webhooks', label: 'Manage Webhooks', group: 'Management' },
+  { key: 'manage_users', label: 'Manage Users', group: 'Admin' },
+  { key: 'manage_roles', label: 'Manage Roles', group: 'Admin' },
+];
+
+/* ── Client-side highlight rule evaluator ── */
+
+const SEVERITY_ORDINAL: Record<string, number> = {
+  critical: 5, high: 4, warning: 3, low: 2, info: 1, unknown: 0,
+};
+
+function getAlertField(alert: Alert, field: string): string {
+  if (field === 'payload') {
+    return Object.values(alert).filter(v => typeof v === 'string').join(' ');
+  }
+  if (field === 'hostname') return alert.hostName || (alert as any).hostname || '';
+  return (alert as any)[field] ?? '';
+}
+
+function evaluateLeaf(alert: Alert, cond: { field: string; op: string; value: string }): boolean {
+  const raw = getAlertField(alert, cond.field);
+  const val = cond.value || '';
+
+  // Severity ordinal comparison
+  if (cond.field === 'severity' && ['>=', '<=', '>', '<'].includes(cond.op)) {
+    const a = SEVERITY_ORDINAL[raw.toLowerCase()] ?? 0;
+    const b = SEVERITY_ORDINAL[val.toLowerCase()] ?? 0;
+    switch (cond.op) {
+      case '>=': return a >= b;
+      case '<=': return a <= b;
+      case '>': return a > b;
+      case '<': return a < b;
+    }
+  }
+
+  const fieldLower = raw.toLowerCase();
+  const valLower = val.toLowerCase();
+
+  switch (cond.op) {
+    case 'equals': return fieldLower === valLower;
+    case 'not_equals': return fieldLower !== valLower;
+    case 'contains': return fieldLower.includes(valLower);
+    case 'not_contains': return !fieldLower.includes(valLower);
+    case 'starts_with': return fieldLower.startsWith(valLower);
+    case 'ends_with': return fieldLower.endsWith(valLower);
+    case 'regex':
+      try { return new RegExp(val, 'i').test(raw); } catch { return false; }
+    case '>=': return parseFloat(raw) >= parseFloat(val);
+    case '<=': return parseFloat(raw) <= parseFloat(val);
+    case '>': return parseFloat(raw) > parseFloat(val);
+    case '<': return parseFloat(raw) < parseFloat(val);
+    default: return false;
+  }
+}
+
+export function evaluateCondition(alert: Alert, condition: any): boolean {
+  if (!condition) return false;
+  if (condition.AND) {
+    return (condition.AND as any[]).every(c => evaluateCondition(alert, c));
+  }
+  if (condition.OR) {
+    return (condition.OR as any[]).some(c => evaluateCondition(alert, c));
+  }
+  if (condition.field && condition.op) {
+    return evaluateLeaf(alert, condition);
+  }
+  return false;
+}
+
+export interface HighlightMatch {
+  color: string;
+  label: string;
+  style: 'side' | 'box';
+}
+
+export function matchHighlightRules(alert: Alert, rules: AlertRule[]): HighlightMatch | null {
+  for (const rule of rules) {
+    if (!rule.enabled) continue;
+    const cond = typeof rule.conditions_json === 'string'
+      ? JSON.parse(rule.conditions_json)
+      : rule.conditions_json;
+    if (evaluateCondition(alert, cond)) {
+      return {
+        color: normalizeHighlightColor(rule.color),
+        label: rule.label || '',
+        style: rule.action_params?.highlight_style === 'box' ? 'box' : 'side',
+      };
+    }
+  }
+  return null;
 }

@@ -3,6 +3,7 @@
 import json
 import os
 import logging
+import re
 import sqlite3
 import base64
 import hashlib
@@ -183,6 +184,43 @@ def _init_db():
     if "suggested_merges_json" not in existing_ss:
         db.execute("ALTER TABLE situation_summary ADD COLUMN suggested_merges_json TEXT DEFAULT NULL")
         log.info("Migrated: added 'suggested_merges_json' to situation_summary")
+    # ── Alert Rules table ──
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS alert_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            rule_type TEXT NOT NULL CHECK(rule_type IN ('routing', 'highlight')),
+            conditions_json TEXT NOT NULL,
+            expression_text TEXT DEFAULT '',
+            action TEXT DEFAULT NULL,
+            action_params TEXT DEFAULT NULL,
+            color TEXT DEFAULT NULL,
+            label TEXT DEFAULT NULL,
+            priority INTEGER DEFAULT 100,
+            enabled INTEGER DEFAULT 1,
+            created_by TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_alert_rules_type ON alert_rules(rule_type, enabled, priority)")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS custom_alert_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS custom_alert_group_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL REFERENCES custom_alert_groups(id) ON DELETE CASCADE,
+            alert_fingerprint TEXT NOT NULL UNIQUE,
+            added_at TEXT NOT NULL
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_custom_group_members_group ON custom_alert_group_members(group_id)")
     db.commit()
     log.info(f"Database initialized at {DB_PATH}")
     return db
@@ -191,6 +229,8 @@ def _init_db():
 # ── Authentication ─────────────────────────────────────
 
 def _verify_auth_token(token):
+    """Verify token and return full payload dict or None.
+    Payload contains: u (username), e (expiry), p (permissions list), r (role_id)."""
     try:
         parts = token.split(".")
         if len(parts) != 2:
@@ -203,12 +243,13 @@ def _verify_auth_token(token):
         payload = json.loads(base64.urlsafe_b64decode(padded))
         if payload.get("e", 0) < time.time():
             return None
-        return payload.get("u")
+        return payload
     except Exception:
         return None
 
 
-def _get_username_from_request(handler):
+def _get_token_from_request(handler):
+    """Extract and verify auth token from cookies. Returns full payload dict or None."""
     cookie_header = handler.headers.get("Cookie", "")
     for pair in cookie_header.split(";"):
         pair = pair.strip()
@@ -217,6 +258,201 @@ def _get_username_from_request(handler):
             if k.strip() == "uip_auth":
                 return _verify_auth_token(v.strip())
     return None
+
+
+def _get_username_from_request(handler):
+    """Extract username from auth token. Backward-compatible wrapper."""
+    payload = _get_token_from_request(handler)
+    if payload:
+        return payload.get("u")
+    return None
+
+
+def _serialize_custom_groups():
+    rows = db.execute("""
+        SELECT g.id, g.name, g.created_by, g.created_at, g.updated_at, m.alert_fingerprint
+        FROM custom_alert_groups g
+        LEFT JOIN custom_alert_group_members m ON m.group_id = g.id
+        ORDER BY g.created_at ASC, m.added_at ASC
+    """).fetchall()
+    groups = {}
+    for row in rows:
+        group_id = row["id"]
+        if group_id not in groups:
+            groups[group_id] = {
+                "id": group_id,
+                "name": row["name"],
+                "created_by": row["created_by"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "fingerprints": [],
+            }
+        if row["alert_fingerprint"]:
+            groups[group_id]["fingerprints"].append(row["alert_fingerprint"])
+    for group in groups.values():
+        group["active_count"] = len(group["fingerprints"])
+    return list(groups.values())
+
+
+def _prune_custom_groups(active_fingerprints):
+    active = sorted({(fp or "").strip() for fp in active_fingerprints if (fp or "").strip()})
+    before = db.total_changes
+    if active:
+        placeholders = ",".join("?" * len(active))
+        db.execute(
+            f"DELETE FROM custom_alert_group_members WHERE alert_fingerprint NOT IN ({placeholders})",
+            active,
+        )
+    else:
+        db.execute("DELETE FROM custom_alert_group_members")
+    db.execute("""
+        DELETE FROM custom_alert_groups
+        WHERE id NOT IN (SELECT DISTINCT group_id FROM custom_alert_group_members)
+    """)
+    db.commit()
+    return db.total_changes - before
+
+
+def _normalize_custom_group_fingerprints(fingerprints):
+    seen = set()
+    normalized = []
+    for fingerprint in fingerprints or []:
+        value = str(fingerprint).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
+def _serialize_custom_group(group_id):
+    rows = db.execute("""
+        SELECT g.id, g.name, g.created_by, g.created_at, g.updated_at, m.alert_fingerprint
+        FROM custom_alert_groups g
+        LEFT JOIN custom_alert_group_members m ON m.group_id = g.id
+        WHERE g.id = ?
+        ORDER BY m.added_at ASC
+    """, (group_id,)).fetchall()
+    if not rows:
+        return None
+    return {
+        "id": group_id,
+        "name": rows[0]["name"],
+        "created_by": rows[0]["created_by"],
+        "created_at": rows[0]["created_at"],
+        "updated_at": rows[0]["updated_at"],
+        "fingerprints": [row["alert_fingerprint"] for row in rows if row["alert_fingerprint"]],
+        "active_count": len([row["alert_fingerprint"] for row in rows if row["alert_fingerprint"]]),
+    }
+
+
+def _ensure_custom_group_name_available(name, exclude_group_id=None):
+    row = db.execute(
+        "SELECT id FROM custom_alert_groups WHERE lower(name) = lower(?)",
+        (name,),
+    ).fetchone()
+    if row and row["id"] != exclude_group_id:
+        raise ValueError("A custom group with that name already exists")
+
+
+def _find_custom_group_conflict(fingerprints, target_group_id=None):
+    normalized = _normalize_custom_group_fingerprints(fingerprints)
+    if not normalized:
+        return None
+    placeholders = ",".join("?" * len(normalized))
+    rows = db.execute(f"""
+        SELECT m.alert_fingerprint, m.group_id, g.name
+        FROM custom_alert_group_members m
+        JOIN custom_alert_groups g ON g.id = m.group_id
+        WHERE m.alert_fingerprint IN ({placeholders})
+    """, normalized).fetchall()
+    for row in rows:
+        if target_group_id is None or row["group_id"] != target_group_id:
+            return row
+    return None
+
+
+def _create_custom_group(name, fingerprints, username):
+    normalized_name = (name or "").strip()
+    normalized_fingerprints = _normalize_custom_group_fingerprints(fingerprints)
+    if not normalized_name:
+        raise ValueError("name is required")
+    if not normalized_fingerprints:
+        raise ValueError("fingerprints are required")
+    _ensure_custom_group_name_available(normalized_name)
+    conflict = _find_custom_group_conflict(normalized_fingerprints)
+    if conflict:
+        raise ValueError(f"Alert already belongs to custom group '{conflict['name']}'")
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = db.execute("""
+        INSERT INTO custom_alert_groups (name, created_by, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+    """, (normalized_name, username, now, now))
+    group_id = cursor.lastrowid
+    for fingerprint in normalized_fingerprints:
+        db.execute("""
+            INSERT INTO custom_alert_group_members (group_id, alert_fingerprint, added_at)
+            VALUES (?, ?, ?)
+        """, (group_id, fingerprint, now))
+    db.commit()
+    return _serialize_custom_group(group_id)
+
+
+def _rename_custom_group(group_id, name, username):
+    normalized_name = (name or "").strip()
+    if not normalized_name:
+        raise ValueError("name is required")
+    existing = db.execute("SELECT id FROM custom_alert_groups WHERE id = ?", (group_id,)).fetchone()
+    if not existing:
+        raise LookupError("custom group not found")
+    _ensure_custom_group_name_available(normalized_name, exclude_group_id=group_id)
+    now = datetime.now(timezone.utc).isoformat()
+    db.execute("""
+        UPDATE custom_alert_groups
+        SET name = ?, updated_at = ?
+        WHERE id = ?
+    """, (normalized_name, now, group_id))
+    db.commit()
+    return _serialize_custom_group(group_id)
+
+
+def _add_alerts_to_custom_group(group_id, fingerprints, username):
+    normalized_fingerprints = _normalize_custom_group_fingerprints(fingerprints)
+    if not normalized_fingerprints:
+        raise ValueError("fingerprints are required")
+    existing = db.execute("SELECT id FROM custom_alert_groups WHERE id = ?", (group_id,)).fetchone()
+    if not existing:
+        raise LookupError("custom group not found")
+    conflict = _find_custom_group_conflict(normalized_fingerprints, target_group_id=group_id)
+    if conflict:
+        raise ValueError(f"Alert already belongs to custom group '{conflict['name']}'")
+    now = datetime.now(timezone.utc).isoformat()
+    for fingerprint in normalized_fingerprints:
+        db.execute("""
+            INSERT OR IGNORE INTO custom_alert_group_members (group_id, alert_fingerprint, added_at)
+            VALUES (?, ?, ?)
+        """, (group_id, fingerprint, now))
+    db.execute("""
+        UPDATE custom_alert_groups
+        SET updated_at = ?
+        WHERE id = ?
+    """, (now, group_id))
+    db.commit()
+    return _serialize_custom_group(group_id)
+
+
+def _require_permission(handler, permission):
+    """Check if the authenticated user has a specific permission.
+    Returns username if authorized, None if not (and sends 401/403)."""
+    payload = _get_token_from_request(handler)
+    if not payload:
+        handler._send_json(401, {"error": "Not authenticated"})
+        return None
+    perms = payload.get("p", [])
+    if permission not in perms:
+        handler._send_json(403, {"error": f"Permission denied: {permission} required"})
+        return None
+    return payload.get("u")
 
 
 # ── HTTP Handler ───────────────────────────────────────
@@ -253,9 +489,9 @@ class AlertStateHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
+        qs = parse_qs(parsed.query)
 
         if path == "/api/alert-states":
-            qs = parse_qs(parsed.query)
             with _db_lock:
                 if qs.get("force_enrich", [""])[0].lower() == "true":
                     cursor = db.execute("""
@@ -277,7 +513,6 @@ class AlertStateHandler(BaseHTTPRequestHandler):
             self._send_json(200, rows)
 
         elif path == "/api/alert-states/runbook-feedback/aggregate":
-            qs = parse_qs(parsed.query)
             entry_ids_str = qs.get("entry_ids", [""])[0]
             if not entry_ids_str:
                 self._send_json(400, {"error": "entry_ids query param required"})
@@ -536,6 +771,39 @@ class AlertStateHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json(200, {"one_liner": None})
 
+        # ── Alert Rules: List ──
+        elif path == "/api/alert-states/rules":
+            rule_type = (qs.get("type") or [None])[0]
+            with _db_lock:
+                if rule_type:
+                    rows = db.execute(
+                        "SELECT * FROM alert_rules WHERE rule_type = ? ORDER BY priority, id",
+                        (rule_type,)
+                    ).fetchall()
+                else:
+                    rows = db.execute("SELECT * FROM alert_rules ORDER BY priority, id").fetchall()
+            rules = []
+            for r in rows:
+                rules.append({
+                    "id": r["id"], "name": r["name"], "rule_type": r["rule_type"],
+                    "conditions_json": json.loads(r["conditions_json"] or "{}"),
+                    "expression_text": r["expression_text"],
+                    "action": r["action"], "action_params": json.loads(r["action_params"] or "null"),
+                    "color": r["color"], "label": r["label"],
+                    "priority": r["priority"], "enabled": bool(r["enabled"]),
+                    "created_by": r["created_by"], "created_at": r["created_at"],
+                })
+            self._send_json(200, rules)
+
+        elif path == "/api/alert-states/custom-groups":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            with _db_lock:
+                groups = _serialize_custom_groups()
+            self._send_json(200, groups)
+
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -733,6 +1001,7 @@ class AlertStateHandler(BaseHTTPRequestHandler):
             fingerprint = (data.get("fingerprint") or "").strip()
             jira_key = (data.get("jira_key") or "").strip()
             jira_url = (data.get("jira_url") or "").strip()
+            firing_start = (data.get("firing_start") or "").strip()
             if not fingerprint or not jira_key:
                 self._send_json(400, {"error": "fingerprint and jira_key are required"})
                 return
@@ -740,15 +1009,16 @@ class AlertStateHandler(BaseHTTPRequestHandler):
             with _db_lock:
                 db.execute("""
                     INSERT INTO alert_states (alert_fingerprint, incident_jira_key, incident_jira_url,
-                        incident_created_by, incident_created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, datetime('now'))
+                        incident_created_by, incident_created_at, ack_firing_start, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
                     ON CONFLICT(alert_fingerprint) DO UPDATE SET
                         incident_jira_key = excluded.incident_jira_key,
                         incident_jira_url = excluded.incident_jira_url,
                         incident_created_by = excluded.incident_created_by,
                         incident_created_at = excluded.incident_created_at,
+                        ack_firing_start = excluded.ack_firing_start,
                         updated_at = datetime('now')
-                """, (fingerprint, jira_key, jira_url, username, now))
+                """, (fingerprint, jira_key, jira_url, username, now, firing_start))
                 db.commit()
             _sse_broadcast("incident_created", {
                 "fingerprint": fingerprint, "user": username,
@@ -756,6 +1026,49 @@ class AlertStateHandler(BaseHTTPRequestHandler):
             })
             log.info(f"{username} created incident {jira_key} for {fingerprint[:16]}")
             self._send_json(200, {"status": "stored", "jira_key": jira_key})
+
+        elif path == "/api/alert-states/incident/bulk":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            fingerprints = [str(fp).strip() for fp in (data.get("fingerprints") or []) if str(fp).strip()]
+            jira_key = (data.get("jira_key") or "").strip()
+            jira_url = (data.get("jira_url") or "").strip()
+            firing_starts = data.get("firing_starts") or {}
+            if not fingerprints or not jira_key:
+                self._send_json(400, {"error": "fingerprints and jira_key are required"})
+                return
+            now = datetime.now(timezone.utc).isoformat()
+            with _db_lock:
+                for fingerprint in fingerprints:
+                    firing_start = str(firing_starts.get(fingerprint) or "").strip()
+                    db.execute("""
+                        INSERT INTO alert_states (alert_fingerprint, incident_jira_key, incident_jira_url,
+                            incident_created_by, incident_created_at, ack_firing_start, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                        ON CONFLICT(alert_fingerprint) DO UPDATE SET
+                            incident_jira_key = excluded.incident_jira_key,
+                            incident_jira_url = excluded.incident_jira_url,
+                            incident_created_by = excluded.incident_created_by,
+                            incident_created_at = excluded.incident_created_at,
+                            ack_firing_start = excluded.ack_firing_start,
+                            updated_at = datetime('now')
+                    """, (fingerprint, jira_key, jira_url, username, now, firing_start))
+                db.commit()
+            _sse_broadcast("incident_created", {
+                "fingerprints": fingerprints,
+                "user": username,
+                "jira_key": jira_key,
+                "jira_url": jira_url,
+            })
+            log.info(f"{username} stored incident {jira_key} for {len(fingerprints)} alert(s)")
+            self._send_json(200, {"status": "stored", "jira_key": jira_key, "count": len(fingerprints)})
 
         elif path == "/api/alert-states/escalation":
             username = _get_username_from_request(self)
@@ -1185,6 +1498,218 @@ class AlertStateHandler(BaseHTTPRequestHandler):
             _sse_broadcast("situation_update", {"generated_at": now})
             self._send_json(200, {"status": "stored"})
 
+        elif path == "/api/alert-states/custom-groups/sync":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            active_fingerprints = data.get("active_fingerprints") or []
+            with _db_lock:
+                changes = _prune_custom_groups(active_fingerprints)
+                groups = _serialize_custom_groups()
+            if changes:
+                _sse_broadcast("custom_groups_changed", {"user": username, "change_count": changes})
+            self._send_json(200, groups)
+
+        elif path == "/api/alert-states/custom-groups":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            name = (data.get("name") or "").strip()
+            fingerprints = [str(fp).strip() for fp in (data.get("fingerprints") or []) if str(fp).strip()]
+            with _db_lock:
+                try:
+                    response = _create_custom_group(name, fingerprints, username)
+                except ValueError as exc:
+                    self._send_json(409 if "already exists" in str(exc) or "belongs to custom group" in str(exc) else 400, {
+                        "error": str(exc),
+                    })
+                    return
+            group_id = response["id"]
+            _sse_broadcast("custom_groups_changed", {
+                "user": username,
+                "group_id": group_id,
+                "group_name": response["name"],
+            })
+            log.info(f"{username} created custom group '{response['name']}' with {len(response['fingerprints'])} alert(s)")
+            self._send_json(201, response)
+
+        # ── Alert Rules: Create ──
+        elif path == "/api/alert-states/rules":
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "Not authenticated"})
+                return
+            data = self._read_body()
+            name = (data.get("name") or "").strip()
+            rule_type = data.get("rule_type", "")
+            if rule_type not in ("routing", "highlight"):
+                self._send_json(400, {"error": "rule_type must be 'routing' or 'highlight'"})
+                return
+            if not name:
+                self._send_json(400, {"error": "name required"})
+                return
+            conditions = data.get("conditions_json", {})
+            expression = data.get("expression_text", "")
+            action = data.get("action")
+            action_params = data.get("action_params")
+            color = data.get("color")
+            label = data.get("label")
+            priority = data.get("priority", 100)
+            enabled = 1 if data.get("enabled", True) else 0
+            # Validate regex patterns in conditions
+            def _validate_conditions(cond):
+                if isinstance(cond, dict):
+                    if "op" in cond and cond["op"] == "regex":
+                        try:
+                            re.compile(cond.get("value", ""))
+                        except re.error as e:
+                            return str(e)
+                    for key in ("AND", "OR"):
+                        if key in cond:
+                            for child in cond[key]:
+                                err = _validate_conditions(child)
+                                if err:
+                                    return err
+                return None
+            regex_err = _validate_conditions(conditions)
+            if regex_err:
+                self._send_json(400, {"error": f"Invalid regex: {regex_err}"})
+                return
+            with _db_lock:
+                db.execute(
+                    "INSERT INTO alert_rules (name, rule_type, conditions_json, expression_text, "
+                    "action, action_params, color, label, priority, enabled, created_by) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (name, rule_type, json.dumps(conditions), expression,
+                     action, json.dumps(action_params) if action_params else None,
+                     color, label, priority, enabled, username),
+                )
+                rule_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+                db.commit()
+            log.info(f"Alert rule created: {name} (id={rule_id}, type={rule_type}) by {username}")
+            self._send_json(201, {"ok": True, "id": rule_id})
+
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_PUT(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+
+        custom_group_match = re.match(r"^/api/alert-states/custom-groups/(\d+)$", path)
+        rule_match = re.match(r"^/api/alert-states/rules/(\d+)$", path)
+        if custom_group_match:
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                data = self._read_body()
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+            group_id = int(custom_group_match.group(1))
+            name = data.get("name")
+            fingerprints = data.get("fingerprints")
+            if name is None and fingerprints is None:
+                self._send_json(400, {"error": "name or fingerprints are required"})
+                return
+            with _db_lock:
+                try:
+                    if name is not None:
+                        response = _rename_custom_group(group_id, name, username)
+                        action = "renamed"
+                    else:
+                        response = _add_alerts_to_custom_group(group_id, fingerprints, username)
+                        action = "updated"
+                except LookupError:
+                    self._send_json(404, {"error": "custom group not found"})
+                    return
+                except ValueError as exc:
+                    self._send_json(409 if "already exists" in str(exc) or "belongs to custom group" in str(exc) else 400, {
+                        "error": str(exc),
+                    })
+                    return
+            _sse_broadcast("custom_groups_changed", {
+                "user": username,
+                "group_id": group_id,
+                "group_name": response["name"],
+                "action": action,
+            })
+            self._send_json(200, response)
+
+        elif rule_match:
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "Not authenticated"})
+                return
+            rule_id = int(rule_match.group(1))
+            data = self._read_body()
+            with _db_lock:
+                existing = db.execute("SELECT id FROM alert_rules WHERE id = ?", (rule_id,)).fetchone()
+            if not existing:
+                self._send_json(404, {"error": "Rule not found"})
+                return
+            updates = []
+            params = []
+            for field in ["name", "expression_text", "action", "color", "label", "priority"]:
+                if field in data:
+                    updates.append(f"{field} = ?")
+                    params.append(data[field])
+            if "enabled" in data:
+                updates.append("enabled = ?")
+                params.append(1 if data["enabled"] else 0)
+            if "conditions_json" in data:
+                updates.append("conditions_json = ?")
+                params.append(json.dumps(data["conditions_json"]))
+            if "action_params" in data:
+                updates.append("action_params = ?")
+                params.append(json.dumps(data["action_params"]) if data["action_params"] else None)
+            if not updates:
+                self._send_json(400, {"error": "No fields to update"})
+                return
+            params.append(rule_id)
+            with _db_lock:
+                db.execute(f"UPDATE alert_rules SET {', '.join(updates)} WHERE id = ?", params)
+                db.commit()
+            log.info(f"Alert rule {rule_id} updated by {username}")
+            self._send_json(200, {"ok": True})
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+
+        rule_match = re.match(r"^/api/alert-states/rules/(\d+)$", path)
+        if rule_match:
+            username = _get_username_from_request(self)
+            if not username:
+                self._send_json(401, {"error": "Not authenticated"})
+                return
+            rule_id = int(rule_match.group(1))
+            with _db_lock:
+                existing = db.execute("SELECT id, name FROM alert_rules WHERE id = ?", (rule_id,)).fetchone()
+            if not existing:
+                self._send_json(404, {"error": "Rule not found"})
+                return
+            with _db_lock:
+                db.execute("DELETE FROM alert_rules WHERE id = ?", (rule_id,))
+                db.commit()
+            log.info(f"Alert rule {existing['name']} (id={rule_id}) deleted by {username}")
+            self._send_json(200, {"ok": True})
         else:
             self._send_json(404, {"error": "not found"})
 

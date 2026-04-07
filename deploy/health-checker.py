@@ -41,7 +41,6 @@ HTTP_CHECKS = {
     "runbook-api":  "http://runbook-api:8090/api/runbook/entries?limit=1",
     "auth-api":        "http://auth-api:8093/api/auth/login",
     "alert-state-api": "http://alert-state-api:8092/api/alert-states",
-    "loki-gateway":    "http://loki-gateway:8091/api/loki/registry-health",
     "escalation-api":  "http://escalation-api:8094/api/escalation/health",
 }
 

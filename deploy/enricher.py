@@ -5,18 +5,22 @@ sends to Ollama for deep analysis with service dependency context,
 and writes structured enrichment back to Keep."""
 
 import json
+import re
 import time
 import os
 import logging
+import base64
 import hashlib
+import hmac as hmac_mod
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("alert-enricher")
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://aicompute01.cnco1.tucows.cloud:31434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen-tooling")
+ACTIVE_OLLAMA_MODEL = OLLAMA_MODEL
 KEEP_URL = os.environ.get("KEEP_URL", "http://keep-api:8080")
 KEEP_API_KEY = os.environ.get("KEEP_API_KEY", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "15"))
@@ -26,8 +30,218 @@ NOISE_THRESHOLD = int(os.environ.get("NOISE_THRESHOLD", "8"))
 ALERT_STATE_API_URL = os.environ.get("ALERT_STATE_API_URL", "http://alert-state-api:8092")
 MAINT_API_URL = os.environ.get("MAINT_API_URL", "http://10.177.154.174/api/active-now")
 STALE_RESOLVE_SECONDS = int(os.environ.get("STALE_RESOLVE_SECONDS", "7200"))  # Auto-resolve after 2h with no update
+STALE_RECONCILE_INTERVAL_SECONDS = int(os.environ.get("STALE_RECONCILE_INTERVAL_SECONDS", "60"))
+STALE_RECONCILE_GRACE_SECONDS = int(os.environ.get("STALE_RECONCILE_GRACE_SECONDS", "300"))
+STALE_RECONCILE_MAX_PER_INSTANCE = int(os.environ.get("STALE_RECONCILE_MAX_PER_INSTANCE", "25"))
+STALE_RECONCILE_MISSES_REQUIRED = int(os.environ.get("STALE_RECONCILE_MISSES_REQUIRED", "2"))
+GRAFANA_IRM_URL = os.environ.get("GRAFANA_IRM_URL", "").strip().rstrip("/")
+GRAFANA_IRM_API_TOKEN = os.environ.get("GRAFANA_IRM_API_TOKEN", "").strip()
+GRAFANA_IRM_POLL_INTERVAL_SECONDS = int(os.environ.get("GRAFANA_IRM_POLL_INTERVAL_SECONDS", "300"))
+AUTH_SECRET = os.environ.get("AUTH_SECRET", "")
 
 enriched_cache = {}  # {fingerprint: timestamp} — entries expire after 600s
+stale_reconcile_tracker = {}
+_last_stale_reconcile_run = 0
+_last_grafana_irm_poll_run = 0
+
+# ── Routing Rules Engine ──────────────────────────────
+# Re-evaluation guard: set of (rule_id, fingerprint) tuples already acted on.
+# Cleared when alert resolves or rule is modified.
+_routing_acted_on = set()
+
+SEVERITY_ORDINAL = {"critical": 5, "high": 4, "warning": 3, "low": 2, "info": 1, "unknown": 0}
+
+
+def _alert_payload_text(alert):
+    """Concatenate all alert fields into one searchable string."""
+    parts = []
+    for key in ("name", "description", "hostName", "hostname", "severity", "status", "note", "zabbixInstance"):
+        val = alert.get(key)
+        if val:
+            parts.append(str(val))
+    sources = alert.get("source") or []
+    if isinstance(sources, list):
+        for src in sources:
+            parts.append(str(src))
+    elif sources:
+        parts.append(str(sources))
+    tags = alert.get("tags") or []
+    if isinstance(tags, list):
+        for tag in tags:
+            if isinstance(tag, dict):
+                parts.append(str(tag.get("value", "")))
+                parts.append(str(tag.get("name", "")))
+            else:
+                parts.append(str(tag))
+    elif tags:
+        parts.append(str(tags))
+    return " ".join(parts)
+
+
+def _create_internal_auth_cookie(username, ttl_hours=24):
+    """Create a signed internal auth cookie compatible with auth/alert-state services."""
+    if not AUTH_SECRET:
+        return None
+    payload = {
+        "u": username,
+        "e": int(time.time()) + ttl_hours * 3600,
+    }
+    payload_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    sig = hmac_mod.new(AUTH_SECRET.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
+    return f"uip_auth={payload_b64}.{sig}"
+
+
+def evaluate_condition(alert, condition):
+    """Recursively evaluate a condition tree against an alert.
+    Returns True if the alert matches the condition."""
+    if not isinstance(condition, dict):
+        return False
+    # Logical operators
+    if "AND" in condition:
+        return all(evaluate_condition(alert, c) for c in condition["AND"])
+    if "OR" in condition:
+        return any(evaluate_condition(alert, c) for c in condition["OR"])
+    # Leaf condition: {"field": ..., "op": ..., "value": ...}
+    field = condition.get("field", "")
+    op = condition.get("op", "")
+    value = condition.get("value", "")
+    # Extract field value from alert
+    if field == "payload":
+        actual = _alert_payload_text(alert)
+    elif field == "hostname":
+        actual = alert.get("hostName") or alert.get("hostname") or ""
+    elif field == "source":
+        sources = alert.get("source") or []
+        actual = ",".join(str(s) for s in sources) if isinstance(sources, list) else str(sources)
+    else:
+        actual = alert.get(field, "") or ""
+    actual_str = str(actual).lower()
+    value_str = str(value).lower()
+    # Severity comparison
+    if field == "severity" and op in (">=", "<=", ">", "<"):
+        actual_ord = SEVERITY_ORDINAL.get(actual_str, 0)
+        value_ord = SEVERITY_ORDINAL.get(value_str, 0)
+        if op == ">=": return actual_ord >= value_ord
+        if op == "<=": return actual_ord <= value_ord
+        if op == ">": return actual_ord > value_ord
+        if op == "<": return actual_ord < value_ord
+    # String operators (case-insensitive)
+    if op == "equals": return actual_str == value_str
+    if op == "not_equals": return actual_str != value_str
+    if op == "contains": return value_str in actual_str
+    if op == "not_contains": return value_str not in actual_str
+    if op == "starts_with": return actual_str.startswith(value_str)
+    if op == "ends_with": return actual_str.endswith(value_str)
+    if op == "regex":
+        try:
+            return bool(re.search(value, str(actual), re.IGNORECASE))
+        except re.error:
+            return False
+    return False
+
+
+def fetch_routing_rules():
+    """Fetch active routing rules from alert-state-api."""
+    try:
+        req = Request(f"{ALERT_STATE_API_URL}/api/alert-states/rules?type=routing")
+        resp = urlopen(req, timeout=5)
+        rules = json.loads(resp.read())
+        return [r for r in rules if r.get("enabled")]
+    except Exception as e:
+        log.warning(f"Failed to fetch routing rules: {e}")
+        return []
+
+
+def execute_routing_action(alert, rule):
+    """Execute the action specified by a routing rule."""
+    action = rule.get("action", "")
+    fingerprint = alert.get("fingerprint", "")
+    alert_name = alert.get("name", "")
+    params = rule.get("action_params") or {}
+
+    try:
+        if action == "auto_ack":
+            body = json.dumps({
+                "fingerprints": [fingerprint],
+                "alert_names": {fingerprint: alert_name},
+                "firing_starts": {fingerprint: alert.get("firingStartTime") or alert.get("startedAt") or ""},
+                "username": "routing-engine",
+            }).encode()
+            headers = {"Content-Type": "application/json"}
+            auth_cookie = _create_internal_auth_cookie("routing-engine")
+            if auth_cookie:
+                headers["Cookie"] = auth_cookie
+            req = Request(f"{ALERT_STATE_API_URL}/api/alert-states/acknowledge",
+                          data=body, headers=headers, method="POST")
+            urlopen(req, timeout=5)
+            log.info(f"Auto-acknowledged {alert_name} (fp={fingerprint[:16]}) by rule '{rule['name']}'")
+
+        elif action == "auto_resolve":
+            body = json.dumps({"fingerprint": fingerprint, "enrichments": {"status": "resolved"}}).encode()
+            req = Request(f"{KEEP_URL}/alerts/enrich", data=body,
+                          headers={"Content-Type": "application/json", "x-api-key": KEEP_API_KEY}, method="POST")
+            urlopen(req, timeout=5)
+            log.info(f"Auto-resolved {alert_name} (fp={fingerprint[:16]}) by rule '{rule['name']}'")
+
+        elif action == "auto_silence":
+            duration = params.get("duration", "2h")
+            # Parse duration string to hours
+            hours = 2
+            if duration.endswith("h"):
+                hours = int(duration[:-1])
+            elif duration.endswith("m"):
+                hours = int(duration[:-1]) / 60
+            from datetime import datetime, timezone, timedelta
+            now = datetime.now(timezone.utc)
+            expires = (now + timedelta(hours=hours)).isoformat()
+            body = json.dumps({
+                "alert_name_pattern": alert_name,
+                "hostname_pattern": alert.get("hostName") or alert.get("hostname") or "",
+                "reason": f"Auto-silenced by rule: {rule['name']}",
+                "duration_hours": hours,
+                "username": "routing-engine",
+            }).encode()
+            req = Request(f"{ALERT_STATE_API_URL}/api/alert-states/silence-rules",
+                          data=body, headers={"Content-Type": "application/json"}, method="POST")
+            urlopen(req, timeout=5)
+            log.info(f"Auto-silenced {alert_name} by rule '{rule['name']}'")
+
+        elif action == "auto_escalate":
+            team = params.get("team", "")
+            if team:
+                log.info(f"Auto-escalate {alert_name} to team '{team}' by rule '{rule['name']}' (escalation API call skipped — requires team resolution)")
+
+    except Exception as e:
+        log.error(f"Failed to execute routing action '{action}' for {alert_name}: {e}")
+
+
+def apply_routing_rules(alerts):
+    """Evaluate routing rules against all firing alerts and execute actions."""
+    global _routing_acted_on
+    rules = fetch_routing_rules()
+    if not rules:
+        return
+
+    # Clean up acted_on entries for alerts that have resolved
+    active_fps = {a.get("fingerprint") for a in alerts if a.get("status") == "firing"}
+    _routing_acted_on = {(rid, fp) for rid, fp in _routing_acted_on if fp in active_fps}
+
+    firing = [a for a in alerts if a.get("status") == "firing"]
+    acted = 0
+    for alert in firing:
+        fp = alert.get("fingerprint", "")
+        for rule in rules:
+            rid = rule.get("id")
+            if (rid, fp) in _routing_acted_on:
+                continue
+            conditions = rule.get("conditions_json", {})
+            if evaluate_condition(alert, conditions):
+                execute_routing_action(alert, rule)
+                _routing_acted_on.add((rid, fp))
+                acted += 1
+                break  # First match wins
+    if acted:
+        log.info(f"Routing engine: acted on {acted} alerts")
 
 # In-memory tracking for noise suppression
 recent_enrichments = {}  # fingerprint -> {alert_name, host, enrichment_text, noise_score, enriched_at, resolve_count, last_resolved_at}
@@ -497,7 +711,12 @@ def keep_request(path, method="GET", data=None):
     try:
         resp = urlopen(req, timeout=30)
         raw = resp.read()
-        return json.loads(raw) if raw else {}
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {"raw": raw.decode("utf-8", errors="replace")}
     except HTTPError as e:
         if e.code == 404:
             return None
@@ -513,29 +732,218 @@ def keep_request(path, method="GET", data=None):
         return None
 
 
-def ollama_generate(prompt, timeout=45):
-    body = json.dumps({
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "user", "content": prompt},
-        ],
-        "stream": False,
-        "think": False,
-        "options": {
-            "num_predict": 1024,
-        },
-    }).encode()
-    req = Request(
-        f"{OLLAMA_URL}/api/chat",
-        data=body,
-        headers={"Content-Type": "application/json"},
+def _grafana_irm_keep_timestamp(value):
+    raw = str(value or "").strip()
+    if raw:
+        try:
+            parsed = time.strptime(raw.replace("T", " ").replace("Z", "")[:19], "%Y-%m-%d %H:%M:%S")
+            return time.strftime("%Y.%m.%d %H:%M:%S", parsed)
+        except ValueError:
+            pass
+    return time.strftime("%Y.%m.%d %H:%M:%S", time.gmtime())
+
+
+def _grafana_irm_collect_labels(group):
+    labels = group.get("labels") or {}
+    if isinstance(labels, dict):
+        return {str(key): str(value) for key, value in labels.items() if value not in (None, "")}
+    return {}
+
+
+def _grafana_irm_extract_host(labels):
+    for key in ("host", "hostname", "instance", "node", "pod", "resource"):
+        value = str(labels.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _grafana_irm_normalize_severity(value):
+    raw = str(value or "").strip().lower()
+    if raw in {"critical", "high", "warning", "low", "info"}:
+        return raw
+    if raw in {"major", "urgent", "disaster"}:
+        return "critical"
+    if raw in {"minor", "medium"}:
+        return "warning"
+    if raw in {"ok", "resolved", "normal"}:
+        return "info"
+    return "warning"
+
+
+def _grafana_irm_status_for_group(group, status_override=None):
+    if status_override:
+        return status_override
+    if str(group.get("state") or "").strip().lower() == "resolved":
+        return "ok"
+    return "firing"
+
+
+def _grafana_irm_tags_json(labels, integration_name):
+    tags = [{"tag": "uip_source", "value": "grafana-irm"}]
+    if integration_name:
+        tags.append({"tag": "grafana_irm_integration", "value": integration_name})
+    for key in sorted(labels.keys()):
+        tags.append({"tag": key, "value": labels[key]})
+    return json.dumps(tags)
+
+
+def _grafana_irm_group_keep_event(group, status_override=None):
+    labels = _grafana_irm_collect_labels(group)
+    integration = group.get("integration") or {}
+    integration_name = str(integration.get("name") or integration.get("id") or group.get("service") or "").strip()
+    name = str(group.get("title") or group.get("name") or "Grafana IRM alert group")
+    description = str(group.get("summary") or group.get("description") or name)
+    return {
+        "id": str(group["id"]),
+        "name": name,
+        "status": _grafana_irm_status_for_group(group, status_override=status_override),
+        "severity": _grafana_irm_normalize_severity(labels.get("severity") or group.get("severity")),
+        "service": integration_name or "Grafana IRM",
+        "hostName": _grafana_irm_extract_host(labels),
+        "hostIp": "",
+        "lastReceived": _grafana_irm_keep_timestamp(
+            group.get("resolved_at") or group.get("updated_at") or group.get("created_at") or ""
+        ),
+        "description": f"{description}\nuip_source: grafana-irm",
+        "tags": _grafana_irm_tags_json(labels, integration_name),
+    }
+
+
+def _send_grafana_irm_group_to_keep(group, status_override=None):
+    return keep_request(
+        "/alerts/event/grafana-irm",
+        method="POST",
+        data=_grafana_irm_group_keep_event(group, status_override=status_override),
     )
+
+
+def _fetch_grafana_irm_active_alert_groups():
+    if not GRAFANA_IRM_URL or not GRAFANA_IRM_API_TOKEN:
+        return None
+    req = Request(
+        f"{GRAFANA_IRM_URL}/api/v1/alert_groups/?state=alerting",
+        headers={
+            "Authorization": f"Bearer {GRAFANA_IRM_API_TOKEN}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        resp = urlopen(req, timeout=10)
+        payload = json.loads(resp.read())
+        if isinstance(payload, dict):
+            return payload.get("results") or payload.get("alert_groups") or []
+        if isinstance(payload, list):
+            return payload
+    except Exception as e:
+        log.warning(f"Grafana IRM fetch failed: {e}")
+    return None
+
+
+def _fetch_existing_grafana_irm_open_alerts():
+    alerts = keep_request("/alerts?limit=500") or []
+    items = alerts.get("items", alerts) if isinstance(alerts, dict) else alerts
+    if not isinstance(items, list):
+        return {}
+    existing = {}
+    for alert in items:
+        status = (alert.get("status") or "").lower()
+        if status in ("resolved", "ok"):
+            continue
+        provider = (alert.get("providerType") or "").lower()
+        sources = _alert_source_values(alert)
+        if provider != "grafana-irm" and "grafana-irm" not in sources:
+            continue
+        alert_id = str(alert.get("id") or "").strip()
+        if alert_id:
+            existing[alert_id] = alert
+    return existing
+
+
+def reconcile_grafana_irm_alert_groups():
+    global _last_grafana_irm_poll_run
+    if not GRAFANA_IRM_URL or not GRAFANA_IRM_API_TOKEN:
+        return
+    now_epoch = time.time()
+    if (
+        GRAFANA_IRM_POLL_INTERVAL_SECONDS > 0
+        and now_epoch - _last_grafana_irm_poll_run < GRAFANA_IRM_POLL_INTERVAL_SECONDS
+    ):
+        return
+    groups = _fetch_grafana_irm_active_alert_groups()
+    _last_grafana_irm_poll_run = now_epoch
+    if groups is None:
+        return
+
+    active_ids = set()
+    for group in groups:
+        group_id = str(group.get("id") or "").strip()
+        if not group_id:
+            continue
+        active_ids.add(group_id)
+        _send_grafana_irm_group_to_keep(group)
+
+    existing_open = _fetch_existing_grafana_irm_open_alerts()
+    for alert_id in sorted(set(existing_open.keys()) - active_ids):
+        _send_grafana_irm_group_to_keep(existing_open[alert_id], status_override="ok")
+
+
+def ollama_generate(prompt, timeout=45):
+    global ACTIVE_OLLAMA_MODEL
+
+    def _build_chat_request(model_name):
+        body = json.dumps({
+            "model": model_name,
+            "messages": [
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "think": False,
+            "options": {
+                "num_predict": 1024,
+            },
+        }).encode()
+        return Request(
+            f"{OLLAMA_URL}/api/chat",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+
+    def _build_generate_request(model_name):
+        body = json.dumps({
+            "model": model_name,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "num_predict": 1024,
+            },
+        }).encode()
+        return Request(
+            f"{OLLAMA_URL}/api/generate",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+
+    model_name = ACTIVE_OLLAMA_MODEL or OLLAMA_MODEL
     for attempt in range(2):
         try:
-            resp = urlopen(req, timeout=timeout)
+            resp = urlopen(_build_chat_request(model_name), timeout=timeout)
             data = json.loads(resp.read())
             msg = data.get("message", {})
             return msg.get("content", "").strip()
+        except HTTPError as e:
+            if e.code == 404:
+                try:
+                    resp = urlopen(_build_generate_request(model_name), timeout=timeout)
+                    data = json.loads(resp.read())
+                    return (data.get("response") or "").strip()
+                except Exception as fallback_error:
+                    e = fallback_error
+            if attempt == 0:
+                log.warning(f"Ollama timeout/error (attempt 1), retrying: {e}")
+                time.sleep(2)
+            else:
+                log.error(f"Ollama failed after 2 attempts: {e}")
         except Exception as e:
             if attempt == 0:
                 log.warning(f"Ollama timeout/error (attempt 1), retrying: {e}")
@@ -546,6 +954,7 @@ def ollama_generate(prompt, timeout=45):
 
 
 def wait_for_ollama():
+    global ACTIVE_OLLAMA_MODEL
     log.info(f"Waiting for Ollama at {OLLAMA_URL}...")
     for attempt in range(60):
         try:
@@ -553,29 +962,19 @@ def wait_for_ollama():
             data = json.loads(resp.read())
             models = [m["name"] for m in data.get("models", [])]
             if any(OLLAMA_MODEL in m for m in models):
-                log.info(f"Model {OLLAMA_MODEL} is ready")
+                ACTIVE_OLLAMA_MODEL = OLLAMA_MODEL
+                log.info(f"Model {ACTIVE_OLLAMA_MODEL} is ready")
                 return True
-            else:
-                log.info(f"Available models: {models}. Pulling {OLLAMA_MODEL}...")
-                pull_model()
-                return True
+            if models and attempt == 0:
+                log.error(
+                    f"Configured Ollama model '{OLLAMA_MODEL}' not available at {OLLAMA_URL}; "
+                    f"available models: {models}"
+                )
         except Exception:
             pass
         time.sleep(10)
     log.error("Ollama not available after 10 minutes")
     return False
-
-
-def pull_model():
-    log.info(f"Pulling model {OLLAMA_MODEL} (this may take a few minutes)...")
-    body = json.dumps({"name": OLLAMA_MODEL, "stream": False}).encode()
-    req = Request(f"{OLLAMA_URL}/api/pull", data=body,
-                  headers={"Content-Type": "application/json"})
-    try:
-        resp = urlopen(req, timeout=600)
-        log.info(f"Model pull complete: {resp.read().decode()[:200]}")
-    except Exception as e:
-        log.error(f"Model pull failed: {e}")
 
 
 def find_service_context(alert):
@@ -1394,7 +1793,7 @@ Rules:
 - suggested_merges: suggest if any remaining clusters appear related but weren't grouped
 """
 
-    response = ollama_generate(prompt, timeout=15)
+    response = ollama_generate(prompt, timeout=45)
     if not response:
         log.warning("Situation summary LLM call failed")
         return None
@@ -1463,8 +1862,281 @@ ZABBIX_INSTANCES = {
 }
 
 _zabbix_auth_cache = {}  # instance -> (auth_token, expiry_epoch)
-_last_stale_check = 0
-_STALE_CHECK_INTERVAL = 600  # Only run stale check every 10 minutes
+
+
+def _slug(text):
+    return re.sub(r"[^a-z0-9]+", "_", (text or "").strip().lower()).strip("_")
+
+
+def _trim_k8s_suffix(name):
+    value = (name or "").strip().lower()
+    if re.search(r"-[0-9a-f]{9,10}-[a-z0-9]{5}$", value):
+        return re.sub(r"-[0-9a-f]{9,10}-[a-z0-9]{5}$", "", value)
+    if re.search(r"-[0-9a-f]{9,10}$", value):
+        return re.sub(r"-[0-9a-f]{9,10}$", "", value)
+    return value
+
+
+def _alert_tags_dict(alert):
+    raw_tags = alert.get("tags") or {}
+    if isinstance(raw_tags, dict):
+        return raw_tags
+    if isinstance(raw_tags, list):
+        tags = {}
+        for item in raw_tags:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("tag") or item.get("name")
+            value = item.get("value")
+            if key:
+                tags[str(key)] = value
+        return tags
+    if isinstance(raw_tags, str):
+        try:
+            parsed = json.loads(raw_tags)
+            if isinstance(parsed, dict):
+                return parsed
+            if isinstance(parsed, list):
+                tags = {}
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    key = item.get("tag") or item.get("name")
+                    value = item.get("value")
+                    if key:
+                        tags[str(key)] = value
+                return tags
+            return {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+    return {}
+
+
+def _parse_runtime_timestamp(value):
+    from datetime import datetime as _dt, timezone as _tz
+
+    if not value:
+        return 0.0
+
+    text = str(value).strip()
+    parsed = None
+    try:
+        parsed = _dt.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        try:
+            parsed = _dt.strptime(text, "%Y.%m.%d %H:%M:%S")
+        except (TypeError, ValueError):
+            return 0.0
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_tz.utc)
+    return parsed.timestamp()
+
+
+def build_stable_zabbix_signature(alert):
+    instance = (alert.get("zabbixInstance") or "").strip()
+    if not instance:
+        return None
+
+    tags = _alert_tags_dict(alert)
+    namespace = (tags.get("namespace") or "").strip().lower()
+    target = (tags.get("target") or "").strip().lower()
+    name = alert.get("name") or ""
+    name_lc = name.lower()
+
+    if "replicaset mismatch" in name_lc:
+        alert_family = "replicaset_mismatch"
+    elif "pod is crash looping" in name_lc:
+        alert_family = "pod_crash_looping"
+    else:
+        return None
+
+    target_family = "kubernetes" if target == "kubernetes" else "nodes" if target == "nodes" else "generic"
+
+    if tags.get("pod"):
+        scope = _trim_k8s_suffix(tags["pod"])
+    elif tags.get("replicaset"):
+        scope = _trim_k8s_suffix(tags["replicaset"])
+    elif tags.get("node"):
+        scope = (tags["node"] or "").strip().lower()
+    else:
+        scope = (alert.get("hostName") or alert.get("hostname") or "").strip().lower()
+
+    if not scope:
+        return None
+    return f"{instance}|{target_family}|{alert_family}|{namespace}|{scope}"
+
+
+def find_superseded_alerts(active_alerts):
+    def _ts(value):
+        return _parse_runtime_timestamp(value)
+
+    def _sort_key(alert):
+        last_received = _ts(alert.get("lastReceived"))
+        started_at = _ts(alert.get("startedAt"))
+        firing_start = _ts(alert.get("firingStartTime"))
+        return (
+            last_received,
+            max(started_at, firing_start),
+            started_at,
+            firing_start,
+            str(alert.get("fingerprint") or ""),
+        )
+
+    newest_by_signature = {}
+    superseded = []
+    for alert in sorted(active_alerts, key=_sort_key):
+        signature = build_stable_zabbix_signature(alert)
+        if not signature:
+            continue
+        previous = newest_by_signature.get(signature)
+        if previous is not None:
+            superseded.append(previous)
+        newest_by_signature[signature] = alert
+    return superseded
+
+
+def _parse_alert_time_epoch(value):
+    return _parse_runtime_timestamp(value)
+
+
+def _missing_from_zabbix_reason(misses_required):
+    if misses_required == 2:
+        return "missing from Zabbix for 2 consecutive reconciliation checks"
+    return f"missing from Zabbix for {misses_required} consecutive reconciliation checks"
+
+
+def _alert_source_values(alert):
+    source = alert.get("source") or []
+    if isinstance(source, list):
+        return [str(item).lower() for item in source]
+    return [str(source).lower()]
+
+
+def _domains_shared_overlap_key(alert):
+    return (
+        (alert.get("name") or "").strip().lower(),
+        (alert.get("hostName") or alert.get("hostname") or "").strip().lower(),
+    )
+
+
+def prefer_grafana_irm_over_domains_shared(alerts):
+    preferred = {}
+    for alert in alerts:
+        key = _domains_shared_overlap_key(alert)
+        if not key[0]:
+            continue
+        current = preferred.get(key)
+        if current is None:
+            preferred[key] = alert
+            continue
+        current_is_irm = (
+            (current.get("providerType") or "").lower() == "grafana-irm"
+            or "grafana-irm" in _alert_source_values(current)
+        )
+        candidate_is_irm = (
+            (alert.get("providerType") or "").lower() == "grafana-irm"
+            or "grafana-irm" in _alert_source_values(alert)
+        )
+        current_is_domains_shared = (
+            (current.get("providerType") or "").lower() == "zabbix"
+            and (current.get("zabbixInstance") or "").strip().lower() == "domains-shared"
+        )
+        candidate_is_domains_shared = (
+            (alert.get("providerType") or "").lower() == "zabbix"
+            and (alert.get("zabbixInstance") or "").strip().lower() == "domains-shared"
+        )
+        if candidate_is_irm and current_is_domains_shared:
+            preferred[key] = alert
+        elif current_is_irm and candidate_is_domains_shared:
+            continue
+
+    seen = set()
+    result = []
+    for alert in alerts:
+        key = _domains_shared_overlap_key(alert)
+        if key[0]:
+            if key in seen:
+                continue
+            chosen = preferred.get(key)
+            if chosen is not None:
+                result.append(chosen)
+                seen.add(key)
+                continue
+        result.append(alert)
+    return result
+
+
+def collect_reconcile_candidates(active_alerts, now_epoch, tracker, grace_seconds, max_per_instance):
+    batches = {}
+    signed_prioritized = []
+
+    for alert in active_alerts:
+        instance = alert.get("zabbixInstance")
+        trigger_id = alert.get("triggerId")
+        if not instance or not trigger_id:
+            continue
+        if instance not in ZABBIX_INSTANCES:
+            continue
+        if (alert.get("status") or "").lower() in ("resolved", "ok"):
+            continue
+        if (alert.get("providerType") or "").lower() != "zabbix" and "zabbix" not in _alert_source_values(alert):
+            continue
+
+        last_received = alert.get("lastReceived") or alert.get("firingStartTime") or alert.get("startedAt") or ""
+        if _parse_alert_time_epoch(last_received) > now_epoch - grace_seconds:
+            continue
+
+        signature = build_stable_zabbix_signature(alert)
+        if not signature:
+            continue
+
+        signed_prioritized.append({
+            "instance": instance,
+            "fingerprint": alert.get("fingerprint", ""),
+            "trigger_id": str(trigger_id),
+            "signature": signature,
+            "tracker_key": signature,
+        })
+
+    for item in signed_prioritized:
+        bucket = batches.setdefault(item["instance"], [])
+        if len(bucket) < max_per_instance:
+            bucket.append(item)
+
+    return batches
+
+
+def update_missing_counters(candidates, still_problem, tracker, misses_required, now_epoch):
+    to_resolve = []
+    grouped = {}
+    order = []
+    for candidate in candidates:
+        key = candidate.get("tracker_key") or candidate.get("signature") or f"{candidate['instance']}|trigger|{candidate['trigger_id']}"
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(candidate)
+
+    for key in order:
+        group = grouped[key]
+        candidate = group[0]
+        state = tracker.setdefault(key, {
+            "fingerprint": candidate["fingerprint"],
+            "trigger_id": candidate["trigger_id"],
+            "consecutive_missing_checks": 0,
+            "last_checked_at": 0,
+        })
+        state["fingerprint"] = candidate["fingerprint"]
+        state["trigger_id"] = candidate["trigger_id"]
+        state["last_checked_at"] = now_epoch
+        if any(item["trigger_id"] in still_problem for item in group):
+            state["consecutive_missing_checks"] = 0
+            continue
+        state["consecutive_missing_checks"] += 1
+        if state["consecutive_missing_checks"] >= misses_required:
+            to_resolve.append(candidate)
+    return to_resolve
 
 
 def _zabbix_api(instance_url, method, params, auth=None):
@@ -1516,102 +2188,153 @@ def _check_triggers_in_zabbix(instance_key, trigger_ids):
         return None
 
 
-def auto_resolve_stale_alerts(active_alerts):
-    """Auto-resolve firing alerts whose triggers no longer exist or have resolved in Zabbix.
+def _resolve_synthetic_keep_ok(alert, reason):
+    """Resolve a stale alert directly in Keep by fingerprint."""
+    fp = alert.get("fingerprint", "")
+    name = alert.get("name", "unknown")
+    if not fp:
+        log.warning(f"  Failed to auto-resolve {name[:40]}: missing fingerprint")
+        return False
+    try:
+        result = keep_request(
+            "/alerts/enrich",
+            method="POST",
+            data={
+                "fingerprint": fp,
+                "enrichments": {"status": "resolved"},
+            },
+        )
+        if result is not None:
+            enriched_cache[fp] = time.time()
+            return True
+        log.warning(f"  Failed to auto-resolve {name[:40]}: Keep enrichment returned no result")
+        return False
+    except Exception as e:
+        log.warning(f"  Failed to auto-resolve {name[:40]}: {e}")
+        return False
 
-    When Zabbix triggers are deleted (not resolved), no recovery webhook is sent,
-    leaving alerts stuck in 'firing' forever. This verifies against the Zabbix API
-    before resolving — only alerts whose triggers are deleted or in OK state get resolved.
-    """
-    global _last_stale_check
-    from datetime import datetime as _dt, timezone as _tz
 
-    now = time.time()
-    # Only run this check every _STALE_CHECK_INTERVAL seconds
-    if now - _last_stale_check < _STALE_CHECK_INTERVAL:
+def reconcile_stale_zabbix_alerts(active_alerts):
+    """Bounded stale reconciliation for Zabbix alerts inside the runtime poll loop."""
+    global _last_stale_reconcile_run
+
+    now_epoch = time.time()
+    if STALE_RECONCILE_INTERVAL_SECONDS > 0 and (
+        now_epoch - _last_stale_reconcile_run < STALE_RECONCILE_INTERVAL_SECONDS
+    ):
+        remaining = STALE_RECONCILE_INTERVAL_SECONDS - (now_epoch - _last_stale_reconcile_run)
+        log.info(f"Stale reconcile skipped due to rate limit; next run in {max(0, int(remaining))}s")
         return
-    _last_stale_check = now
+    _last_stale_reconcile_run = now_epoch
 
-    # Collect candidate alerts: must have a triggerId and zabbixInstance,
-    # and not have received an update recently (pre-filter to avoid unnecessary API calls)
-    candidates = []
+    active_tracker_keys = set()
     for alert in active_alerts:
-        trigger_id = alert.get("triggerId")
         instance = alert.get("zabbixInstance")
-        if not trigger_id or not instance:
+        trigger_id = alert.get("triggerId")
+        if not instance or not trigger_id:
             continue
-        if instance not in ZABBIX_INSTANCES:
-            continue
-        # Pre-filter: only check alerts that haven't been updated in STALE_RESOLVE_SECONDS
-        last_received = alert.get("lastReceived") or alert.get("firingStartTime") or ""
-        if last_received:
-            try:
-                lr = last_received.replace("Z", "+00:00")
-                lr_epoch = _dt.fromisoformat(lr).timestamp()
-                if now - lr_epoch < STALE_RESOLVE_SECONDS:
-                    continue
-            except (ValueError, TypeError):
-                pass
-        candidates.append(alert)
-
-    if not candidates:
-        return
-
-    # Group candidates by Zabbix instance
-    by_instance = {}
-    for alert in candidates:
-        inst = alert["zabbixInstance"]
-        by_instance.setdefault(inst, []).append(alert)
+        signature = build_stable_zabbix_signature(alert)
+        if signature:
+            active_tracker_keys.add(signature)
+    stale_keys = [key for key in stale_reconcile_tracker if key not in active_tracker_keys]
+    for key in stale_keys:
+        log.info("Stale reconcile pruning tracker entry for disappeared alert key=%s", key)
+        stale_reconcile_tracker.pop(key, None)
 
     resolved_count = 0
-    for instance_key, alerts in by_instance.items():
-        trigger_ids = {a["triggerId"] for a in alerts}
-        log.info(f"Checking {len(trigger_ids)} stale trigger(s) against Zabbix ({instance_key})")
+    superseded_alerts = find_superseded_alerts(active_alerts)
+    superseded_fingerprints = {alert.get("fingerprint", "") for alert in superseded_alerts}
+    remaining_alerts = [
+        alert for alert in active_alerts
+        if alert.get("fingerprint", "") not in superseded_fingerprints
+    ]
+    remaining_signatures = {
+        signature
+        for alert in remaining_alerts
+        for signature in [build_stable_zabbix_signature(alert)]
+        if signature
+    }
+    for alert in superseded_alerts:
+        signature = build_stable_zabbix_signature(alert)
+        reason = "superseded by newer Zabbix alert with same stable signature"
+        log.info(
+            "Stale reconcile supersede decision: resolving fingerprint=%s trigger=%s signature=%s reason=%s",
+            alert.get("fingerprint", ""),
+            alert.get("triggerId", ""),
+            signature or "n/a",
+            reason,
+        )
+        if _resolve_synthetic_keep_ok(alert, reason):
+            log.info("Stale reconcile resolved fingerprint=%s reason=%s", alert.get("fingerprint", ""), reason)
+            resolved_count += 1
+            if signature and signature not in remaining_signatures:
+                stale_reconcile_tracker.pop(signature, None)
+    batches = collect_reconcile_candidates(
+        remaining_alerts,
+        now_epoch=now_epoch,
+        tracker=stale_reconcile_tracker,
+        grace_seconds=STALE_RECONCILE_GRACE_SECONDS,
+        max_per_instance=STALE_RECONCILE_MAX_PER_INSTANCE,
+    )
+    if not batches:
+        if resolved_count:
+            log.info(f"Stale reconcile auto-resolved {resolved_count} alert(s)")
+        return
 
-        # Query Zabbix — returns set of trigger IDs still in PROBLEM state
+    for instance_key, candidates in batches.items():
+        trigger_ids = {candidate["trigger_id"] for candidate in candidates}
+        log.info(f"Checking {len(trigger_ids)} stale trigger(s) against Zabbix ({instance_key})")
         still_problem = _check_triggers_in_zabbix(instance_key, trigger_ids)
         if still_problem is None:
-            log.info(f"  Skipping — could not verify against Zabbix ({instance_key})")
+            log.info(f"  Skipping - could not verify against Zabbix ({instance_key})")
             continue
 
-        for alert in alerts:
-            tid = alert["triggerId"]
-            if tid in still_problem:
-                continue  # Trigger is still active in Zabbix — don't resolve
-
-            fp = alert.get("fingerprint", "")
-            name = alert.get("name", "unknown")
-            host = get_host(alert)
-            log.info(f"  Auto-resolving (trigger gone/OK in Zabbix): {name[:60]}")
-
-            resolve_payload = {
-                "id": f"auto-resolve-{fp[:16]}",
-                "triggerId": tid,
-                "name": name,
-                "status": "ok",
-                "severity": alert.get("severity", "warning"),
-                "hostName": host,
-                "lastReceived": _dt.now(_tz.utc).strftime("%Y.%m.%d %H:%M:%S"),
-                "description": f"Auto-resolved: trigger no longer active in Zabbix",
-                "tags": "[]",
-                "zabbixInstance": alert.get("zabbixInstance", ""),
-            }
-            try:
-                body = json.dumps(resolve_payload).encode()
-                req = Request(
-                    f"{KEEP_URL}/alerts/event/zabbix",
-                    data=body,
-                    method="POST",
-                    headers={"X-API-KEY": KEEP_API_KEY, "Content-Type": "application/json"},
+        for candidate in candidates:
+            tracker_state = stale_reconcile_tracker.get(candidate["tracker_key"], {})
+            if candidate["trigger_id"] in still_problem:
+                log.info(
+                    "Stale reconcile verification: fingerprint=%s trigger=%s still present in Zabbix; resetting misses",
+                    candidate["fingerprint"],
+                    candidate["trigger_id"],
                 )
-                urlopen(req, timeout=10)
-                enriched_cache[fp] = time.time()
+            else:
+                next_miss_count = tracker_state.get("consecutive_missing_checks", 0) + 1
+                log.info(
+                    "Stale reconcile verification: fingerprint=%s trigger=%s missing from Zabbix; miss %s/%s",
+                    candidate["fingerprint"],
+                    candidate["trigger_id"],
+                    next_miss_count,
+                    STALE_RECONCILE_MISSES_REQUIRED,
+                )
+
+        for candidate in update_missing_counters(
+            candidates,
+            still_problem,
+            stale_reconcile_tracker,
+            STALE_RECONCILE_MISSES_REQUIRED,
+            now_epoch,
+        ):
+            alert = next(
+                (item for item in remaining_alerts if item.get("fingerprint", "") == candidate["fingerprint"]),
+                None,
+            )
+            if alert is None:
+                continue
+            reason = _missing_from_zabbix_reason(STALE_RECONCILE_MISSES_REQUIRED)
+            log.info(
+                "Stale reconcile resolution decision: fingerprint=%s trigger=%s tracker_key=%s reason=%s",
+                candidate["fingerprint"],
+                candidate["trigger_id"],
+                candidate["tracker_key"],
+                reason,
+            )
+            if _resolve_synthetic_keep_ok(alert, reason):
+                log.info("Stale reconcile resolved fingerprint=%s reason=%s", candidate["fingerprint"], reason)
                 resolved_count += 1
-            except Exception as e:
-                log.warning(f"  Failed to auto-resolve {name[:40]}: {e}")
+                stale_reconcile_tracker.pop(candidate["tracker_key"], None)
 
     if resolved_count:
-        log.info(f"Auto-resolved {resolved_count} alert(s) confirmed gone in Zabbix")
+        log.info(f"Stale reconcile auto-resolved {resolved_count} alert(s)")
 
 
 def poll_and_enrich():
@@ -1622,6 +2345,8 @@ def poll_and_enrich():
         del enriched_cache[fp]
     if expired:
         log.info(f"Pruned {len(expired)} expired entries from enrichment cache")
+
+    reconcile_grafana_irm_alert_groups()
 
     alerts_data = keep_request("/alerts?limit=250")
     if not alerts_data:
@@ -1663,7 +2388,15 @@ def poll_and_enrich():
             continue
         active_alerts.append(alert)
 
+    active_alerts = prefer_grafana_irm_over_domains_shared(active_alerts)
+
     log.info(f"Found {len(active_alerts)} active alerts (skipped {len(items) - len(active_alerts)} resolved)")
+
+    # Apply routing rules before slower enrichment and summary work so actions engage quickly.
+    try:
+        apply_routing_rules(items)
+    except Exception as e:
+        log.error(f"Routing rules evaluation failed: {e}")
 
     # Fetch force-enrich requests from SREs
     force_enrich_fps = fetch_force_enrich_fingerprints()
@@ -1766,11 +2499,8 @@ def poll_and_enrich():
     if silenced_count:
         log.info(f"Skipped {silenced_count} silenced alerts")
 
-    # ── Auto-resolve stale firing alerts ──
-    # Alerts that haven't received an update from Zabbix in STALE_RESOLVE_SECONDS
-    # are likely from deleted triggers — resolve them automatically.
-    if STALE_RESOLVE_SECONDS > 0:
-        auto_resolve_stale_alerts(active_alerts)
+    # ── Bounded stale reconciliation for Zabbix alerts ──
+    reconcile_stale_zabbix_alerts(active_alerts)
 
     # ── Clustering & Situation Summary ──
     # Exclude silenced alerts from clustering and summary

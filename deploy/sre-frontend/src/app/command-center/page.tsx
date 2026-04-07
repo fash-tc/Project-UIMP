@@ -1,7 +1,7 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
-import { Alert, AIEnrichment, RunbookEntry, AlertState, SSEEvent, RunbookFeedback } from '@/lib/types';
+import { useEffect, useState, useCallback, useMemo } from 'react';
+import { Alert, AIEnrichment, RunbookEntry, AlertState, SSEEvent, RunbookFeedback, CustomAlertGroup } from '@/lib/types';
 import { useSSE } from '@/hooks/useSSE';
 import {
   fetchAlerts,
@@ -13,6 +13,8 @@ import {
   timeAgo,
   alertStartTime,
   fetchRunbookMatches,
+  searchRunbookEntries,
+  attachRunbookEntry,
   submitRunbookEntry,
   resolveAlert,
   resolveAlerts,
@@ -21,6 +23,10 @@ import {
   silenceAlert,
   createJiraIncident,
   fetchAlertStates,
+  syncCustomAlertGroups,
+  createCustomAlertGroup,
+  renameCustomAlertGroup,
+  addAlertsToCustomAlertGroup,
   toggleInvestigating,
   acknowledgeAlerts,
   unacknowledgeAlerts,
@@ -31,6 +37,7 @@ import {
   fetchEscalationUsers,
   escalateAlert,
   storeIncidentState,
+  storeIncidentStateBulk,
   storeEscalationState,
   submitRunbookFeedback,
   fetchRunbookFeedback,
@@ -47,6 +54,77 @@ import DashboardView from './DashboardView';
 import AlertsTableView from './AlertsTableView';
 import KnowledgeBasePage from './KnowledgeBasePage';
 import IncidentWizard from './IncidentWizard';
+import BulkIncidentTicketModal from './BulkIncidentTicketModal';
+
+function extractAlertBase(alertName: string, hostname: string): string {
+  if (!alertName) return 'Unknown';
+  if (hostname) {
+    const lower = alertName.toLowerCase();
+    const hostLower = hostname.toLowerCase();
+    for (const sep of [' on ', ' for ', ' at ', ' - ', ': ']) {
+      const idx = lower.indexOf(sep + hostLower);
+      if (idx !== -1) return alertName.substring(0, idx).trim();
+    }
+    if (lower.endsWith(hostLower)) {
+      return alertName.substring(0, alertName.length - hostname.length).replace(/[\s\-:]+$/, '').trim();
+    }
+  }
+  return alertName;
+}
+
+function getParentDomain(hostname: string): string {
+  if (!hostname) return '';
+  const parts = hostname.split('.');
+  if (parts.length <= 2) return hostname;
+  return parts.slice(1).join('.');
+}
+
+function normalizeDomain(domain: string): string {
+  if (!domain) return '';
+  return domain.split('.').map(part => part.replace(/\d+$/, '')).join('.');
+}
+
+function buildInferredGroupMembership(alerts: Alert[]): Map<string, string> {
+  const domainMap = new Map<string, Alert[]>();
+  for (const alert of alerts) {
+    const host = alert.hostName || alert.hostname || '';
+    const base = extractAlertBase(alert.name || '', host);
+    const key = `${base}::${normalizeDomain(getParentDomain(host))}`;
+    if (!domainMap.has(key)) domainMap.set(key, []);
+    domainMap.get(key)!.push(alert);
+  }
+
+  const membership = new Map<string, string>();
+  const singlesByBase = new Map<string, Alert[]>();
+
+  Array.from(domainMap.entries()).forEach(([key, groupedAlerts]) => {
+    if (groupedAlerts.length >= 2) {
+      groupedAlerts.forEach(alert => membership.set(alert.fingerprint, key));
+      return;
+    }
+    const alert = groupedAlerts[0];
+    const host = alert.hostName || alert.hostname || '';
+    const base = extractAlertBase(alert.name || '', host);
+    if (!singlesByBase.has(base)) singlesByBase.set(base, []);
+    singlesByBase.get(base)!.push(alert);
+  });
+
+  Array.from(singlesByBase.entries()).forEach(([base, groupedAlerts]) => {
+    const key = `name::${base}`;
+    groupedAlerts.forEach(alert => membership.set(alert.fingerprint, key));
+  });
+
+  return membership;
+}
+
+function buildSuggestedGroupName(alerts: Alert[]): string {
+  if (alerts.length === 0) return 'Temporary Alert Group';
+  const first = alerts[0];
+  const host = first.hostName || first.hostname || '';
+  const base = extractAlertBase(first.name || '', host);
+  if (alerts.length === 1) return base || 'Temporary Alert Group';
+  return `${base || 'Selected Alerts'} Group`;
+}
 
 export default function CommandCenter() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
@@ -61,6 +139,15 @@ export default function CommandCenter() {
   const [situationTrigger, setSituationTrigger] = useState(0);
   const [silenceRules, setSilenceRules] = useState<SilenceRule[]>([]);
   const [maintenanceEvents, setMaintenanceEvents] = useState<MaintenanceEvent[]>([]);
+  const [customGroups, setCustomGroups] = useState<CustomAlertGroup[]>([]);
+  const [selectedFingerprints, setSelectedFingerprints] = useState<Set<string>>(new Set());
+  const [showBulkTicketModal, setShowBulkTicketModal] = useState(false);
+  const [showCreateGroupModal, setShowCreateGroupModal] = useState(false);
+  const [pendingGroupName, setPendingGroupName] = useState('');
+  const [selectedGroupMode, setSelectedGroupMode] = useState<'create' | 'existing'>('create');
+  const [selectedExistingGroupId, setSelectedExistingGroupId] = useState<number | null>(null);
+  const [bulkError, setBulkError] = useState<string | null>(null);
+  const [bulkNotice, setBulkNotice] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -80,8 +167,8 @@ export default function CommandCenter() {
         if (!hasState) continue;
         const cur = alert.firingStartTime || alert.startedAt || '';
         if (!cur) continue;
-        // Compare against ack_firing_start if acked, or against the state timestamp
-        const stateTime = st.ack_firing_start || st.investigating_since || st.incident_created_at || st.acknowledged_at || '';
+        // Compare against the alert firing baseline, not the ticket creation time.
+        const stateTime = st.ack_firing_start || (st.investigating_user ? st.investigating_since : '') || '';
         if (stateTime && new Date(cur).getTime() > new Date(stateTime).getTime()) {
           refired.push(alert.fingerprint);
         }
@@ -93,10 +180,20 @@ export default function CommandCenter() {
         for (const s of fresh) stateMap.set(s.alert_fingerprint, s);
       }
 
+      const activeFingerprints = data
+        .filter(alert => alert.status !== 'resolved' && alert.status !== 'ok')
+        .map(alert => alert.fingerprint);
+      const groups = await syncCustomAlertGroups(activeFingerprints);
+
       setAlerts(data);
       setAlertStates(stateMap);
       setSilenceRules(rules);
       setMaintenanceEvents(maint);
+      setCustomGroups(groups);
+      setSelectedFingerprints(prev => {
+        const known = new Set(data.map(alert => alert.fingerprint));
+        return new Set(Array.from(prev).filter(fp => known.has(fp)));
+      });
       setLastUpdated(new Date());
       setError(null);
     } catch (e: unknown) {
@@ -120,6 +217,11 @@ export default function CommandCenter() {
     if (event.type === 'silence_created' || event.type === 'silence_cancelled') {
       // Refresh silence rules on any change
       fetchSilenceRules().then(rules => setSilenceRules(rules));
+      return;
+    }
+
+    if (event.type === 'custom_groups_changed') {
+      load();
       return;
     }
 
@@ -191,6 +293,69 @@ export default function CommandCenter() {
     return () => clearInterval(interval);
   }, [load, refreshInterval]);
 
+  const activeAlerts = useMemo(
+    () => alerts.filter(alert => alert.status !== 'resolved' && alert.status !== 'ok'),
+    [alerts],
+  );
+  const selectedAlerts = useMemo(
+    () => alerts.filter(alert => selectedFingerprints.has(alert.fingerprint)),
+    [alerts, selectedFingerprints],
+  );
+  const customGroupByFingerprint = useMemo(() => {
+    const map = new Map<string, CustomAlertGroup>();
+    customGroups.forEach(group => {
+      group.fingerprints.forEach(fp => map.set(fp, group));
+    });
+    return map;
+  }, [customGroups]);
+  const customGroupNameByFingerprint = useMemo(() => {
+    const map = new Map<string, string>();
+    customGroups.forEach(group => {
+      group.fingerprints.forEach(fp => map.set(fp, group.name));
+    });
+    return map;
+  }, [customGroups]);
+  const inferredGroupByFingerprint = useMemo(
+    () => buildInferredGroupMembership(activeAlerts),
+    [activeAlerts],
+  );
+  const shouldOfferGroupingForSelection = useMemo(() => {
+    if (selectedAlerts.length <= 1) return false;
+    const sharedCustomGroup = customGroupByFingerprint.get(selectedAlerts[0].fingerprint);
+    if (sharedCustomGroup && selectedAlerts.every(alert => customGroupByFingerprint.get(alert.fingerprint)?.id === sharedCustomGroup.id)) {
+      return false;
+    }
+    const inferredKey = inferredGroupByFingerprint.get(selectedAlerts[0].fingerprint);
+    if (inferredKey && selectedAlerts.every(alert => inferredGroupByFingerprint.get(alert.fingerprint) === inferredKey)) {
+      return false;
+    }
+    return true;
+  }, [selectedAlerts, customGroupByFingerprint, inferredGroupByFingerprint]);
+
+  function toggleAlertSelection(fingerprint: string) {
+    setSelectedFingerprints(prev => {
+      const next = new Set(prev);
+      if (next.has(fingerprint)) next.delete(fingerprint);
+      else next.add(fingerprint);
+      return next;
+    });
+  }
+
+  function setAlertSelection(fingerprints: string[], checked: boolean) {
+    setSelectedFingerprints(prev => {
+      const next = new Set(prev);
+      fingerprints.forEach(fp => {
+        if (checked) next.add(fp);
+        else next.delete(fp);
+      });
+      return next;
+    });
+  }
+
+  function clearAlertSelection() {
+    setSelectedFingerprints(new Set());
+  }
+
   async function handleInvestigate(alert: Alert) {
     await toggleInvestigating(alert.fingerprint, alert.name || '');
     load();
@@ -221,6 +386,125 @@ export default function CommandCenter() {
   async function handleGroupUnresolve(fingerprints: string[]) {
     await unresolveAlerts(fingerprints);
     load();
+  }
+
+  async function handleBulkAcknowledge() {
+    if (selectedAlerts.length === 0) return;
+    const names: Record<string, string> = {};
+    const starts: Record<string, string> = {};
+    selectedAlerts.forEach(alert => {
+      names[alert.fingerprint] = alert.name || '';
+      starts[alert.fingerprint] = alertStartTime(alert);
+    });
+    await acknowledgeAlerts(selectedAlerts.map(alert => alert.fingerprint), names, starts);
+    setBulkNotice(`Acknowledged ${selectedAlerts.length} alert${selectedAlerts.length === 1 ? '' : 's'}.`);
+    setBulkError(null);
+    load();
+  }
+
+  async function handleBulkResolve() {
+    if (selectedAlerts.length === 0) return;
+    if (!confirm(`Resolve ${selectedAlerts.length} selected alert${selectedAlerts.length === 1 ? '' : 's'}?`)) return;
+    await resolveAlerts(selectedAlerts.map(alert => alert.fingerprint));
+    setBulkNotice(`Resolved ${selectedAlerts.length} alert${selectedAlerts.length === 1 ? '' : 's'}.`);
+    setBulkError(null);
+    load();
+  }
+
+  async function handleCreateSharedGroup(name: string, fingerprints: string[]) {
+    const result = await createCustomAlertGroup(name, fingerprints);
+    if (!result.ok) {
+      const errorMessage = result.error || 'Failed to create custom group';
+      setBulkError(errorMessage);
+      setBulkNotice(null);
+      return { ok: false, error: errorMessage };
+    }
+    setBulkNotice(`Created custom group "${name}".`);
+    setBulkError(null);
+    setPendingGroupName('');
+    setShowCreateGroupModal(false);
+    load();
+    return { ok: true };
+  }
+
+  async function handleRenameSharedGroup(groupId: number, name: string) {
+    const result = await renameCustomAlertGroup(groupId, name);
+    if (!result.ok || !result.group) {
+      const errorMessage = result.error || 'Failed to rename custom group';
+      setBulkError(errorMessage);
+      setBulkNotice(null);
+      return { ok: false, error: errorMessage };
+    }
+    setBulkNotice(`Renamed custom group to "${result.group.name}".`);
+    setBulkError(null);
+    load();
+    return { ok: true };
+  }
+
+  async function handleAddAlertsToSharedGroup(groupId: number, fingerprints: string[]) {
+    const result = await addAlertsToCustomAlertGroup(groupId, fingerprints);
+    if (!result.ok || !result.group) {
+      const errorMessage = result.error || 'Failed to update custom group';
+      setBulkError(errorMessage);
+      setBulkNotice(null);
+      return { ok: false, error: errorMessage };
+    }
+    setBulkNotice(`Added alerts to custom group "${result.group.name}".`);
+    setBulkError(null);
+    load();
+    return { ok: true };
+  }
+
+  async function handleCustomGroupSubmit() {
+    if (selectedGroupMode === 'existing') {
+      if (!selectedExistingGroupId) {
+        return { ok: false, error: 'Select an existing group.' };
+      }
+      return handleAddAlertsToSharedGroup(
+        selectedExistingGroupId,
+        selectedAlerts.map(alert => alert.fingerprint),
+      );
+    }
+    return handleCreateSharedGroup(pendingGroupName, selectedAlerts.map(alert => alert.fingerprint));
+  }
+
+  async function handleBulkTicketSubmit(data: {
+    summary: string;
+    description: string;
+    classId: string;
+    operationalServiceId?: string;
+    createGroup: boolean;
+    groupName: string;
+  }) {
+    const fingerprints = selectedAlerts.map(alert => alert.fingerprint);
+    if (data.createGroup) {
+      const created = await handleCreateSharedGroup(data.groupName, fingerprints);
+      if (!created.ok) return { ok: false, error: created.error || 'Failed to create custom group' };
+    }
+
+    const result = await createJiraIncident({
+      summary: data.summary,
+      description: data.description,
+      classId: data.classId,
+      operationalServiceId: data.operationalServiceId,
+      alertLink: 'http://10.177.154.196/command-center',
+    });
+    if (!result.ok || !result.issueKey) {
+      return { ok: false, error: result.error || 'Failed to create incident ticket' };
+    }
+
+    const firingStarts = Object.fromEntries(
+      selectedAlerts.map(alert => [alert.fingerprint, alert.firingStartTime || alert.startedAt || '']),
+    );
+    const stateResult = await storeIncidentStateBulk(fingerprints, result.issueKey, result.issueUrl || '', firingStarts);
+    if (!stateResult.ok) {
+      return { ok: false, error: stateResult.error || 'Ticket created, but not every alert was updated' };
+    }
+
+    setBulkNotice(`Created ${result.issueKey} for ${fingerprints.length} selected alert${fingerprints.length === 1 ? '' : 's'}.`);
+    setBulkError(null);
+    load();
+    return { ok: true, issueKey: result.issueKey, issueUrl: result.issueUrl };
   }
 
   function handleAlertRefresh() {
@@ -263,6 +547,20 @@ export default function CommandCenter() {
         </div>
       )}
 
+      {bulkError && (
+        <div className="bg-red/10 border border-red/30 rounded-lg px-4 py-3 text-red text-sm flex items-center justify-between gap-3">
+          <span>{bulkError}</span>
+          <button onClick={() => setBulkError(null)} className="text-xs text-red/80 hover:text-red">Dismiss</button>
+        </div>
+      )}
+
+      {bulkNotice && (
+        <div className="bg-green/10 border border-green/30 rounded-lg px-4 py-3 text-green text-sm flex items-center justify-between gap-3">
+          <span>{bulkNotice}</span>
+          <button onClick={() => setBulkNotice(null)} className="text-xs text-green/80 hover:text-green">Dismiss</button>
+        </div>
+      )}
+
       {/* Tab Bar */}
       <div className="flex gap-1 mb-6 bg-zinc-800/50 p-1 rounded-lg w-fit">
         <button
@@ -291,13 +589,58 @@ export default function CommandCenter() {
         </button>
       </div>
 
+      {(activeTab === 'dashboard' || activeTab === 'alerts') && selectedAlerts.length > 0 && (
+        <div className="bg-surface border border-accent/20 rounded-xl px-4 py-3 flex flex-wrap items-center gap-2">
+          <span className="text-sm text-text-bright font-medium">{selectedAlerts.length} alerts selected</span>
+          <button
+            onClick={() => setShowBulkTicketModal(true)}
+            className="px-3 py-1.5 rounded-md bg-accent text-bg text-xs font-medium hover:bg-accent-hover transition-colors"
+          >
+            Create Shared Ticket
+          </button>
+            <button
+              onClick={() => {
+                setPendingGroupName(buildSuggestedGroupName(selectedAlerts));
+                setSelectedGroupMode('create');
+                setSelectedExistingGroupId(customGroups[0]?.id ?? null);
+                setShowCreateGroupModal(true);
+              }}
+            className="px-3 py-1.5 rounded-md border border-border text-xs text-text hover:bg-surface-hover transition-colors"
+          >
+            Create Custom Group
+          </button>
+          <button
+            onClick={handleBulkAcknowledge}
+            className="px-3 py-1.5 rounded-md border border-border text-xs text-green hover:border-green/40 hover:bg-green/10 transition-colors"
+          >
+            Acknowledge
+          </button>
+          <button
+            onClick={handleBulkResolve}
+            className="px-3 py-1.5 rounded-md border border-border text-xs text-orange hover:border-orange/40 hover:bg-orange/10 transition-colors"
+          >
+            Resolve
+          </button>
+          <button
+            onClick={clearAlertSelection}
+            className="ml-auto px-3 py-1.5 rounded-md border border-border text-xs text-muted hover:text-text transition-colors"
+          >
+            Clear Selection
+          </button>
+        </div>
+      )}
+
       {/* Tab Content */}
       {activeTab === 'dashboard' && (
         <DashboardView
           alerts={alerts}
           alertStates={alertStates}
+          customGroups={customGroups}
+          selectedFingerprints={selectedFingerprints}
           loading={false}
           onAlertClick={setSelectedAlert}
+          onToggleSelectAlert={toggleAlertSelection}
+          onSetSelectedAlerts={setAlertSelection}
           onInvestigate={handleInvestigate}
           onAcknowledge={handleAcknowledge}
           onUnacknowledge={handleUnacknowledge}
@@ -316,14 +659,20 @@ export default function CommandCenter() {
             await cancelSilenceRule(ruleId);
             load();
           }}
+          onRenameCustomGroup={handleRenameSharedGroup}
+          onAddSelectedAlertsToCustomGroup={handleAddAlertsToSharedGroup}
         />
       )}
       {activeTab === 'alerts' && (
         <AlertsTableView
           alerts={alerts}
           alertStates={alertStates}
+          customGroupByFingerprint={customGroupNameByFingerprint}
+          selectedFingerprints={selectedFingerprints}
           loading={false}
           onAlertClick={setSelectedAlert}
+          onToggleSelectAlert={toggleAlertSelection}
+          onSetSelectedAlerts={setAlertSelection}
         />
       )}
       {activeTab === 'knowledge-base' && <KnowledgeBasePage />}
@@ -340,6 +689,31 @@ export default function CommandCenter() {
           maintenanceEvents={maintenanceEvents}
         />
       )}
+
+      {showBulkTicketModal && selectedAlerts.length > 0 && (
+        <BulkIncidentTicketModal
+          alerts={selectedAlerts}
+          shouldOfferGrouping={shouldOfferGroupingForSelection}
+          defaultGroupName={buildSuggestedGroupName(selectedAlerts)}
+          onSubmit={handleBulkTicketSubmit}
+          onClose={() => setShowBulkTicketModal(false)}
+        />
+      )}
+
+        {showCreateGroupModal && selectedAlerts.length > 0 && (
+          <CreateCustomGroupModal
+            name={pendingGroupName}
+            alertCount={selectedAlerts.length}
+            existingGroups={customGroups}
+            selectedGroupMode={selectedGroupMode}
+            selectedExistingGroupId={selectedExistingGroupId}
+            onChangeName={setPendingGroupName}
+            onChangeGroupMode={setSelectedGroupMode}
+            onChangeSelectedExistingGroupId={setSelectedExistingGroupId}
+            onClose={() => setShowCreateGroupModal(false)}
+            onCreate={handleCustomGroupSubmit}
+          />
+        )}
     </div>
   );
 }
@@ -377,6 +751,136 @@ function RefreshControl({ refreshInterval, onRefreshIntervalChange, onRefresh, r
         <option value={300}>5m</option>
         <option value={600}>10m</option>
       </select>
+    </div>
+  );
+}
+
+function CreateCustomGroupModal({ name, alertCount, existingGroups, selectedGroupMode, selectedExistingGroupId, onChangeName, onChangeGroupMode, onChangeSelectedExistingGroupId, onClose, onCreate }: {
+  name: string;
+  alertCount: number;
+  existingGroups: CustomAlertGroup[];
+  selectedGroupMode: 'create' | 'existing';
+  selectedExistingGroupId: number | null;
+  onChangeName: (value: string) => void;
+  onChangeGroupMode: (value: 'create' | 'existing') => void;
+  onChangeSelectedExistingGroupId: (value: number | null) => void;
+  onClose: () => void;
+  onCreate: () => Promise<{ ok: boolean; error?: string }>;
+}) {
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  async function handleCreate() {
+    if (selectedGroupMode === 'create' && !name.trim()) {
+      setError('Enter a group name.');
+      return;
+    }
+    if (selectedGroupMode === 'existing' && !selectedExistingGroupId) {
+      setError('Select an existing group.');
+      return;
+    }
+    setSubmitting(true);
+    setError('');
+    const result = await onCreate();
+    setSubmitting(false);
+    if (!result.ok) {
+      setError(result.error || 'Failed to create custom group.');
+      return;
+    }
+    onClose();
+  }
+
+  return (
+    <div className="fixed inset-0 z-[110] flex items-start justify-center">
+      <div className="absolute inset-0 bg-bg/80 backdrop-blur-sm" onClick={onClose} />
+      <div className="relative w-full max-w-lg mt-[10vh] mx-4 bg-surface border border-border rounded-xl shadow-2xl">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-border">
+          <div>
+            <h3 className="text-base font-semibold text-text-bright">Custom Group</h3>
+            <p className="text-xs text-muted mt-1">{alertCount} selected alerts can create a new group or join an existing one.</p>
+          </div>
+          <button onClick={onClose} className="text-muted hover:text-text text-sm">Close</button>
+        </div>
+        <div className="p-5 space-y-4">
+          {error && (
+            <div className="bg-red/10 border border-red/30 rounded px-3 py-2 text-xs text-red">{error}</div>
+          )}
+          <div className="space-y-3">
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input
+                type="radio"
+                name="custom-group-mode"
+                checked={selectedGroupMode === 'create'}
+                onChange={() => onChangeGroupMode('create')}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="block text-sm text-text-bright">Create a new custom group</span>
+                <span className="block text-xs text-muted mt-1">Use a fresh shared name for this temporary alert grouping.</span>
+              </span>
+            </label>
+            <label className={`flex items-start gap-3 ${existingGroups.length > 0 ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed'}`}>
+              <input
+                type="radio"
+                name="custom-group-mode"
+                checked={selectedGroupMode === 'existing'}
+                onChange={() => existingGroups.length > 0 && onChangeGroupMode('existing')}
+                disabled={existingGroups.length === 0}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="block text-sm text-text-bright">Add alerts to an existing custom group</span>
+                <span className="block text-xs text-muted mt-1">Reuse an existing shared group instead of creating another one.</span>
+              </span>
+            </label>
+          </div>
+          {selectedGroupMode === 'create' ? (
+            <div>
+              <label className="text-[10px] text-muted block mb-1">Group Name</label>
+              <input
+                value={name}
+                onChange={(e) => onChangeName(e.target.value)}
+                className="w-full bg-bg border border-border rounded-md px-3 py-2 text-sm text-text focus:border-accent focus:outline-none"
+                placeholder="Enter a shared temporary group name"
+              />
+            </div>
+          ) : (
+            <div>
+              <label className="text-[10px] text-muted block mb-1">Existing Groups</label>
+              <select
+                value={selectedExistingGroupId ?? ''}
+                onChange={(e) => onChangeSelectedExistingGroupId(e.target.value ? Number(e.target.value) : null)}
+                className="w-full bg-bg border border-border rounded-md px-3 py-2 text-sm text-text focus:border-accent focus:outline-none"
+              >
+                <option value="">Select a group</option>
+                {existingGroups.map(group => (
+                  <option key={group.id} value={group.id}>
+                    {group.name} ({group.active_count})
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          <div className="text-xs text-muted">
+            This group will be visible to all users and will be removed automatically once all member alerts clear.
+          </div>
+          <div className="flex items-center justify-end gap-2">
+            <button
+              onClick={onClose}
+              className="px-4 py-2 rounded-md border border-border text-sm text-muted hover:text-text transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleCreate}
+              disabled={submitting || (selectedGroupMode === 'create' ? !name.trim() : !selectedExistingGroupId)}
+              className="px-4 py-2 rounded-md bg-accent text-bg text-sm font-medium hover:bg-accent-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {submitting ? 'Saving...' : selectedGroupMode === 'create' ? 'Create Group' : 'Add To Group'}
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -438,6 +942,9 @@ function AlertDetailModal({ alert, onClose, onRefresh, alertState, onInvestigate
               <span>Source: <span className="text-text">{source}</span></span>
               <span>Status: <span className="text-text">{alert.status}</span></span>
               <span>Started: <span className="text-text">{timeAgo(alertStartTime(alert))}</span></span>
+              {alert.lastReceived && (
+                <span>Received: <span className="text-text">{timeAgo(alert.lastReceived)}</span></span>
+              )}
               {alert.fingerprint && (
                 <span>FP: <span className="text-text font-mono">{alert.fingerprint.substring(0, 16)}...</span></span>
               )}
@@ -1331,7 +1838,12 @@ function IncidentForm({ alert, enrichment, onCreated, onCancel }: {
     setSubmitting(false);
     if (result.ok && result.issueKey) {
       try {
-        await storeIncidentState(alert.fingerprint, result.issueKey, result.issueUrl || '');
+        await storeIncidentState(
+          alert.fingerprint,
+          result.issueKey,
+          result.issueUrl || '',
+          alert.firingStartTime || alert.startedAt || '',
+        );
       } catch {
         // Best-effort — incident was already created in Jira
       }
@@ -1460,27 +1972,54 @@ function RunbookPanel({ alert }: { alert: Alert }) {
   const [submitted, setSubmitted] = useState(false);
   const [submitError, setSubmitError] = useState(false);
   const [votes, setVotes] = useState<Map<string, 'up' | 'down'>>(new Map());
+  const [showAttachPicker, setShowAttachPicker] = useState(false);
+  const [attachQuery, setAttachQuery] = useState(() => alert.name || '');
+  const [attachResults, setAttachResults] = useState<RunbookEntry[]>([]);
+  const [loadingAttachResults, setLoadingAttachResults] = useState(false);
+  const [attachingEntryId, setAttachingEntryId] = useState<number | null>(null);
+  const [attachError, setAttachError] = useState('');
+  const [attachSuccess, setAttachSuccess] = useState('');
 
   const host = alert.hostName || alert.hostname || '';
 
-  useEffect(() => {
+  const loadMatches = useCallback(async () => {
     setLoadingMatches(true);
-    fetchRunbookMatches(alert.name, host || undefined)
-      .then((entries) => {
-        setMatches(entries);
-        const entryIds = entries.map((e: RunbookEntry) => e.id).filter(Boolean) as number[];
-        if (entryIds.length > 0) {
-          fetchRunbookFeedback(entryIds, alert.fingerprint).then((feedback: RunbookFeedback[]) => {
-            const voteMap = new Map<string, 'up' | 'down'>();
-            for (const fb of feedback) {
-              voteMap.set(`${fb.runbook_entry_id}`, fb.vote);
-            }
-            setVotes(voteMap);
-          });
-        }
-      })
-      .finally(() => setLoadingMatches(false));
-  }, [alert.name, host]);
+    const entries = await fetchRunbookMatches(alert.name, host || undefined);
+    setMatches(entries);
+    const entryIds = entries.map((e: RunbookEntry) => e.id).filter(Boolean) as number[];
+    if (entryIds.length > 0) {
+      const feedback = await fetchRunbookFeedback(entryIds, alert.fingerprint);
+      const voteMap = new Map<string, 'up' | 'down'>();
+      for (const fb of feedback) {
+        voteMap.set(`${fb.runbook_entry_id}`, fb.vote);
+      }
+      setVotes(voteMap);
+    } else {
+      setVotes(new Map());
+    }
+    setLoadingMatches(false);
+  }, [alert.fingerprint, alert.name, host]);
+
+  useEffect(() => {
+    loadMatches();
+  }, [loadMatches]);
+
+  const handleSearchAttach = useCallback(async () => {
+    setLoadingAttachResults(true);
+    setAttachError('');
+    const results = await searchRunbookEntries(attachQuery || alert.name, 20);
+    setAttachResults(results);
+    setLoadingAttachResults(false);
+  }, [alert.name, attachQuery]);
+
+  useEffect(() => {
+    if (!showAttachPicker) return;
+    handleSearchAttach();
+  }, [showAttachPicker, handleSearchAttach]);
+
+  useEffect(() => {
+    setAttachQuery(alert.name || '');
+  }, [alert.name]);
 
   const handleVote = async (entryId: number, vote: 'up' | 'down') => {
     const key = `${entryId}`;
@@ -1525,22 +2064,30 @@ function RunbookPanel({ alert }: { alert: Alert }) {
     if (ok) {
       setSubmitted(true);
       setRemediation('');
-      fetchRunbookMatches(alert.name, host || undefined).then((entries) => {
-        setMatches(entries);
-        const entryIds = entries.map((e: RunbookEntry) => e.id).filter(Boolean) as number[];
-        if (entryIds.length > 0) {
-          fetchRunbookFeedback(entryIds, alert.fingerprint).then((feedback: RunbookFeedback[]) => {
-            const voteMap = new Map<string, 'up' | 'down'>();
-            for (const fb of feedback) {
-              voteMap.set(`${fb.runbook_entry_id}`, fb.vote);
-            }
-            setVotes(voteMap);
-          });
-        }
-      });
+      loadMatches();
     } else {
       setSubmitError(true);
     }
+  }
+
+  async function handleAttach(entry: RunbookEntry) {
+    if (!entry.id) return;
+    setAttachingEntryId(entry.id);
+    setAttachError('');
+    setAttachSuccess('');
+    const result = await attachRunbookEntry(entry.id, {
+      alert_name: alert.name,
+      hostname: host || undefined,
+    });
+    if (result.ok) {
+      await submitRunbookFeedback(alert.fingerprint, alert.name, entry.id, 'up');
+      await loadMatches();
+      setAttachSuccess('Runbook attached and saved as a future match for similar alerts.');
+      setShowAttachPicker(false);
+    } else {
+      setAttachError(result.error || 'Failed to attach runbook');
+    }
+    setAttachingEntryId(null);
   }
 
   return (
@@ -1621,6 +2168,90 @@ function RunbookPanel({ alert }: { alert: Alert }) {
           <div className="text-xs text-red">Failed to save. Please try again.</div>
         </div>
       )}
+
+      {attachSuccess && (
+        <div className="bg-green/10 border border-green/30 rounded-lg px-3 py-2 mb-3">
+          <div className="text-xs text-green">{attachSuccess}</div>
+        </div>
+      )}
+
+      {attachError && (
+        <div className="bg-red/10 border border-red/30 rounded-lg px-3 py-2 mb-3">
+          <div className="text-xs text-red">{attachError}</div>
+        </div>
+      )}
+
+      <div className="mb-4 border border-border rounded-md p-3 bg-bg">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-[10px] text-muted uppercase tracking-wider">Missing the right runbook?</div>
+            <div className="text-xs text-text">Search and attach an existing entry. Your choice will improve future matching.</div>
+          </div>
+          <button
+            onClick={() => {
+              setShowAttachPicker(prev => !prev);
+              setAttachError('');
+              setAttachSuccess('');
+            }}
+            className="px-3 py-1.5 rounded-md border border-accent/40 text-xs text-accent hover:bg-accent/10 transition-colors"
+          >
+            {showAttachPicker ? 'Hide Search' : 'Attach Existing'}
+          </button>
+        </div>
+
+        {showAttachPicker && (
+          <div className="mt-3 space-y-3">
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={attachQuery}
+                onChange={(e) => setAttachQuery(e.target.value)}
+                placeholder="Search runbook entries by alert name, hostname, or remediation"
+                className="flex-1 bg-surface border border-border rounded-md px-3 py-1.5 text-xs text-text placeholder-muted/50 focus:border-accent focus:outline-none"
+              />
+              <button
+                onClick={handleSearchAttach}
+                disabled={loadingAttachResults}
+                className="px-3 py-1.5 rounded-md border border-border text-xs text-text hover:border-accent transition-colors disabled:opacity-50"
+              >
+                {loadingAttachResults ? 'Searching...' : 'Search'}
+              </button>
+            </div>
+
+            {loadingAttachResults ? (
+              <div className="text-xs text-muted animate-pulse">Searching runbook entries...</div>
+            ) : attachResults.length > 0 ? (
+              <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                {attachResults.map((entry) => (
+                  <div key={entry.id} className="border border-border rounded-md p-2.5 bg-surface">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-xs text-text-bright">{entry.alert_name}</div>
+                        <div className="text-[10px] text-muted mt-1">
+                          {entry.hostname || 'Any host'}{entry.sre_user ? ` • by ${entry.sre_user}` : ''}
+                        </div>
+                        <div className="text-xs text-text mt-2 whitespace-pre-wrap">
+                          {entry.remediation?.substring(0, 220)}
+                          {(entry.remediation?.length ?? 0) > 220 ? '...' : ''}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => handleAttach(entry)}
+                        disabled={attachingEntryId === entry.id}
+                        className="shrink-0 px-3 py-1.5 rounded-md bg-accent text-bg text-xs font-medium hover:bg-accent-hover transition-colors disabled:opacity-50"
+                      >
+                        {attachingEntryId === entry.id ? 'Attaching...' : 'Attach'}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-xs text-muted">No matching runbook entries found for that search.</div>
+            )}
+          </div>
+        )}
+      </div>
 
       <div className="space-y-2">
         <label className="text-[10px] text-muted block">

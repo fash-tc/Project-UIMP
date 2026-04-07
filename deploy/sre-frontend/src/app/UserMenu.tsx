@@ -1,11 +1,13 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import { useAuth } from '@/lib/auth';
 
 export default function UserMenu() {
   const [username, setUsername] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const { hasPermission } = useAuth();
 
   useEffect(() => {
     const match = document.cookie.match(/(?:^|;\s*)uip_user=([^;]*)/);
@@ -52,6 +54,14 @@ export default function UserMenu() {
           >
             Settings
           </a>
+          {hasPermission('view_admin') && (
+            <a
+              href="/portal/admin"
+              className="block px-4 py-2 text-xs text-muted hover:text-text-bright hover:bg-surface-hover transition-colors"
+            >
+              Admin
+            </a>
+          )}
           <button
             onClick={handleLogout}
             className="block w-full text-left px-4 py-2 text-xs text-muted hover:text-red hover:bg-surface-hover transition-colors"

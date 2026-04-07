@@ -106,6 +106,16 @@ export interface AlertState {
   severity_override_by?: string | null;
 }
 
+export interface CustomAlertGroup {
+  id: number;
+  name: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  fingerprints: string[];
+  active_count: number;
+}
+
 export interface SSEEvent {
   type: string;
   fingerprint?: string;
@@ -122,6 +132,8 @@ export interface SSEEvent {
   alert_name_pattern?: string;
   hostname_pattern?: string;
   expires_at?: string;
+  group_id?: number;
+  group_name?: string;
   timestamp: string;
 }
 
@@ -199,6 +211,41 @@ export interface SituationSummary {
   suggested_merges?: SuggestedMerge[];
 }
 
+// ── RBAC Types ──────────────────────────────────────
+
+export interface Role {
+  id: number;
+  name: string;
+  description: string;
+  is_system: boolean;
+  permissions: string[];
+  user_count?: number;
+  created_by?: string;
+  created_at?: string;
+}
+
+export interface UserProfile {
+  id?: number;
+  username: string;
+  display_name: string;
+  role_id?: number;
+  role_name?: string;
+  role?: { id: number; name: string };
+  permissions?: string[];
+  jira_email?: string;
+  has_jira_token?: boolean;
+  jira_connected?: boolean;
+  jira_oauth_email?: string;
+  created_at?: string;
+}
+
+export interface SharedMaintenanceAuthConfig {
+  configured: boolean;
+  username: string;
+  updated_by?: string;
+  updated_at?: string;
+}
+
 // ── Incident Notification Types ──────────────────────
 
 export interface IncidentAssessment {
@@ -224,17 +271,42 @@ export interface WebhookDelivery {
   attempts: number;
   success: boolean;
   is_test: boolean;
+  event_type?: string;
+  error_message?: string | null;
+  payload_hash?: string;
 }
+
+export type StatuspageComponentStatus =
+  | 'operational'
+  | 'degraded_performance'
+  | 'partial_outage'
+  | 'major_outage';
 
 export interface StatuspageComponent {
   id: string;
   name: string;
-  status: string;
+  status: StatuspageComponentStatus;
   description: string;
+}
+
+export interface StatuspageComponentSummary {
+  id: string;
+  name: string;
+  status: StatuspageComponentStatus;
+  description: string;
+}
+
+export interface StatuspageComponentUpdate {
+  component_id: string;
+  status: StatuspageComponentStatus;
 }
 
 export interface StatuspageIncident {
   id: string;
   shortlink: string;
   status: string;
+  name: string;
+  impact: string;
+  updated_at: string;
+  components: StatuspageComponentSummary[];
 }

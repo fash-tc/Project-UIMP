@@ -58,8 +58,8 @@ INSTANCES = {
     "enom": {
         "zabbix_url": "https://zabbix.enom.net/api_jsonrpc.php",
         "display_name": "Enom Zabbix",
-        "zabbix_user": "fash",
-        "zabbix_pass": "Nbpt6wev8rahsrafham@@",
+        "zabbix_user": None,
+        "zabbix_pass": None,
         "alert_group_ids": [],  # No host group filter — matches all groups (like Grafana action)
         "min_severity": "2",
         "excluded_trigger_ids": [],
@@ -128,10 +128,18 @@ def load_instance(name):
     cfg = INSTANCES[name].copy()
     cfg["instance_key"] = name
 
-    # Allow env var overrides: ZABBIX_USER_ASCIO / ZABBIX_PASS_ASCIO
+    # Allow env var overrides in both setup-script and runtime naming styles.
     env_suffix = name.upper().replace("-", "_")
-    cfg["zabbix_user"] = os.environ.get(f"ZABBIX_USER_{env_suffix}", cfg["zabbix_user"])
-    cfg["zabbix_pass"] = os.environ.get(f"ZABBIX_PASS_{env_suffix}", cfg["zabbix_pass"])
+    cfg["zabbix_user"] = (
+        os.environ.get(f"ZABBIX_USER_{env_suffix}")
+        or os.environ.get(f"ZABBIX_{env_suffix}_USER")
+        or cfg["zabbix_user"]
+    )
+    cfg["zabbix_pass"] = (
+        os.environ.get(f"ZABBIX_PASS_{env_suffix}")
+        or os.environ.get(f"ZABBIX_{env_suffix}_PASS")
+        or cfg["zabbix_pass"]
+    )
     # Also check generic env vars as fallback
     if not cfg["zabbix_user"]:
         cfg["zabbix_user"] = os.environ.get("ZABBIX_USER")
@@ -213,9 +221,26 @@ var tags;
 try { tags = JSON.stringify(JSON.parse(params.eventTagsJson)); }
 catch(e) { tags = '[]'; }
 
-var req = new HttpRequest();
-req.addHeader('Content-Type: application/json');
-req.addHeader('X-API-KEY: ' + params.keepApiKey);
+var RequestCtor = null;
+if (typeof HttpRequest !== 'undefined') {
+    RequestCtor = HttpRequest;
+} else if (typeof CurlHttpRequest !== 'undefined') {
+    RequestCtor = CurlHttpRequest;
+}
+if (!RequestCtor) {
+    throw 'No supported HTTP request object found in Zabbix JavaScript runtime';
+}
+
+var req = new RequestCtor();
+var addHeader = req.addHeader ? function(name, value) { req.addHeader(name, value); }
+    : function(name, value) { req.AddHeader(name, value); };
+var post = req.post ? function(url, data) { return req.post(url, data); }
+    : function(url, data) { return req.Post(url, data); };
+var getStatus = req.getStatus ? function() { return req.getStatus(); }
+    : function() { return req.Status(); };
+
+addHeader('Content-Type', 'application/json');
+addHeader('X-API-KEY', params.keepApiKey);
 
 var payload = JSON.stringify({
     id: params.eventId,
@@ -232,11 +257,11 @@ var payload = JSON.stringify({
     zabbixInstance: params.zabbixInstance
 });
 
-var resp = req.post(params.keepUrl, payload);
-if (req.getStatus() < 200 || req.getStatus() >= 300) {
-    throw 'Keep HTTP ' + req.getStatus() + ': ' + resp;
+var resp = post(params.keepUrl, payload);
+if (getStatus() < 200 || getStatus() >= 300) {
+    throw 'Keep HTTP ' + getStatus() + ': ' + resp;
 }
-return 'OK: event ' + params.eventId + ' status=' + status + ' HTTP ' + req.getStatus();
+return 'OK: event ' + params.eventId + ' status=' + status + ' HTTP ' + getStatus();
 """.strip()
 
 
@@ -425,17 +450,19 @@ def create_or_update_user(auth, cfg, mediatypeid):
         existing_medias = existing.get("medias", [])
         other_medias = []
         for m in existing_medias:
-            if m.get("sendto") == "keep":
+            if str(m.get("mediatypeid")) == str(mediatypeid):
                 continue
             clean = {k: v for k, v in m.items() if k != "mediaid" and k != "userid"}
             other_medias.append(clean)
         all_medias = other_medias + [media_entry]
 
-        zapi("user.update", {
+        update_payload = {
             "userid": existing["userid"],
-            "medias": all_medias,
             "usrgrps": usrgrps,
-        }, auth)
+        }
+        update_payload["user_medias" if _is_legacy_zabbix() else "medias"] = all_medias
+
+        zapi("user.update", update_payload, auth)
         print(f"  Updated user '{username}' (id: {existing['userid']}, {len(all_medias)} media entries)")
         return existing["userid"]
     else:
@@ -550,6 +577,7 @@ def create_or_update_action(auth, cfg, mediatypeid, userid):
 
     if existing:
         action_def["actionid"] = existing["actionid"]
+        action_def.pop("eventsource", None)
         zapi("action.update", action_def, auth)
         print(f"  Updated action '{name}' (id: {existing['actionid']})")
         return existing["actionid"]
@@ -694,8 +722,8 @@ def cmd_status(cfg):
                 op = op_map.get(str(c.get("operator")), f"op_{c.get('operator')}")
                 print(f"    {ct} {op} {c.get('value')}")
             ops = action.get("operations", [])
-            rec_ops = action.get("recovery_operations", [])
-            upd_ops = action.get("update_operations", [])
+            rec_ops = action.get("recovery_operations", action.get("recoveryOperations", []))
+            upd_ops = action.get("update_operations", action.get("updateOperations", []))
             print(f"  Operations: {len(ops)} problem, {len(rec_ops)} recovery, {len(upd_ops)} update")
         else:
             print(f"Action: NOT FOUND ('{cfg['action_name']}')")

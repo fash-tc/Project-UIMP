@@ -121,16 +121,26 @@ services:
     volumes:
       - ./enricher/enricher.py:/app/enricher.py:ro
     environment:
-      OLLAMA_URL: http://ollama:11434
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+      OLLAMA_URL: ${OLLAMA_URL:-http://aicompute01.cnco1.tucows.cloud:31434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen-tooling}
       KEEP_URL: http://keep-api:8080
       KEEP_API_KEY: ${KEEP_API_KEY}
-      POLL_INTERVAL: "60"
+      POLL_INTERVAL: "${POLL_INTERVAL:-15}"
       RUNBOOK_API_URL: http://runbook-api:8090
       FLAP_WINDOW_SECONDS: "${FLAP_WINDOW_SECONDS:-600}"
       DEDUP_WINDOW_SECONDS: "${DEDUP_WINDOW_SECONDS:-1800}"
       NOISE_THRESHOLD: "${NOISE_THRESHOLD:-8}"
+      STALE_RECONCILE_INTERVAL_SECONDS: "${STALE_RECONCILE_INTERVAL_SECONDS:-60}"
+      STALE_RECONCILE_GRACE_SECONDS: "${STALE_RECONCILE_GRACE_SECONDS:-300}"
+      STALE_RECONCILE_MAX_PER_INSTANCE: "${STALE_RECONCILE_MAX_PER_INSTANCE:-25}"
+      STALE_RECONCILE_MISSES_REQUIRED: "${STALE_RECONCILE_MISSES_REQUIRED:-2}"
+      GRAFANA_IRM_URL: "${GRAFANA_IRM_URL:-}"
+      GRAFANA_IRM_API_TOKEN: "${GRAFANA_IRM_API_TOKEN:-}"
+      GRAFANA_IRM_POLL_INTERVAL_SECONDS: "${GRAFANA_IRM_POLL_INTERVAL_SECONDS:-300}"
+      ZABBIX_ENOM_USER: "${ZABBIX_ENOM_USER:-}"
+      ZABBIX_ENOM_PASS: "${ZABBIX_ENOM_PASS:-}"
       ALERT_STATE_API_URL: "http://alert-state-api:8092"
+      AUTH_SECRET: "${AUTH_SECRET}"
     depends_on:
       keep-api:
         condition: service_healthy
@@ -248,12 +258,16 @@ services:
       API_PORT: "8090"
       DB_PATH: "/data/runbook.db"
       AUTH_SECRET: "${AUTH_SECRET}"
+      KEEP_URL: "http://keep-api:8080"
+      KEEP_API_KEY: "${KEEP_API_KEY}"
       JIRA_BASE_URL: "https://wiki-tucows.atlassian.net"
       JIRA_EMAIL: "${JIRA_EMAIL}"
       JIRA_API_TOKEN: "${JIRA_API_TOKEN}"
-      OLLAMA_URL: "http://ollama:11434"
+      OLLAMA_URL: "${OLLAMA_URL:-http://aicompute01.cnco1.tucows.cloud:31434}"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen-tooling}"
       MAINT_DASHBOARD_URL: "http://10.177.154.174"
       GRAFANA_WEBHOOK_SECRET: "${GRAFANA_WEBHOOK_SECRET}"
+      GRAFANA_IRM_WEBHOOK_SECRET: "${GRAFANA_IRM_WEBHOOK_SECRET:-}"
       STATUSPAGE_API_KEY: "${STATUSPAGE_API_KEY}"
       STATUSPAGE_PAGE_ID: "l7mgndhgstnc"
     deploy:
@@ -279,6 +293,11 @@ services:
       API_PORT: "8093"
       DB_PATH: /data/auth.db
       AUTH_SECRET: "${AUTH_SECRET}"
+      FRONTEND_BASE_PATH: "/portal"
+      SHARED_INTEGRATIONS_SECRET: "${SHARED_INTEGRATIONS_SECRET}"
+      JIRA_OAUTH_CLIENT_ID: "${JIRA_OAUTH_CLIENT_ID}"
+      JIRA_OAUTH_CLIENT_SECRET: "${JIRA_OAUTH_CLIENT_SECRET}"
+      JIRA_OAUTH_REDIRECT_URI: "${JIRA_OAUTH_REDIRECT_URI}"
     deploy:
       resources:
         limits:
@@ -367,8 +386,10 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
+      - "443:443"
     volumes:
-      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx-default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
     depends_on:
       - keep-api
       - keep-frontend
