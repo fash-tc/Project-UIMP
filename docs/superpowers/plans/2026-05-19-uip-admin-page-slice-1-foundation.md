@@ -81,7 +81,7 @@ deploy/admin-api/
 ├── requirements.txt                  # cryptography==42.*
 ├── db.py                             # schema bootstrap, WAL connection helper
 ├── auth.py                           # session validation against auth-api
-├── secrets.py                        # Fernet wrapper + HKDF derivation
+├── secretbox.py                      # Fernet wrapper + HKDF derivation (NOT secrets.py — shadows stdlib)
 ├── sse.py                            # SSE broadcaster (ported from alert-state-api)
 ├── docker_ops.py                     # docker.sock client (stub for slice 2)
 ├── cluster.py                        # AI cluster /api/tags + /api/chat client
@@ -145,16 +145,27 @@ deploy/sre-frontend/src/hooks/useSSE.ts    # existing SSE hook — reuse in slic
 - Create: `deploy/admin-api/admin-api.py`
 - Create: `deploy/admin-api/requirements.txt`
 
-- [ ] **Step 1: Create directory and requirements**
+- [ ] **Step 1: Create directories and requirements**
 
+Run from Git Bash / WSL (PowerShell doesn't expand `{a,b,c}`):
 ```bash
-mkdir -p deploy/admin-api/{routes,seeds,tests}
+mkdir -p deploy/admin-api/routes deploy/admin-api/seeds deploy/admin-api/tests
 ```
 
 Write `deploy/admin-api/requirements.txt`:
 ```
 cryptography==42.0.5
 pytest==8.1.1
+```
+
+Install for local development BEFORE running any tests:
+```bash
+pip install -r deploy/admin-api/requirements.txt
+```
+
+If you're not in a venv, the writing-plans skill recommends creating one:
+```bash
+python -m venv .venv && source .venv/bin/activate && pip install -r deploy/admin-api/requirements.txt
 ```
 
 - [ ] **Step 2: Write the failing test (entrypoint health probe)**
@@ -205,14 +216,25 @@ def admin_api_server():
         time.sleep(0.05)
     else:
         proc.terminate()
-        out = proc.stdout.read().decode() if proc.stdout else ""
-        raise RuntimeError(f"admin-api failed to start. Output:\n{out}")
+        try:
+            out, _ = proc.communicate(timeout=2)
+            out_text = out.decode() if out else ""
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out_text = "(timed out reading admin-api stdout)"
+        raise RuntimeError(f"admin-api failed to start. Output:\n{out_text}")
     yield port, proc
     proc.terminate()
     try:
-        proc.wait(timeout=2)
+        # communicate() drains stdout/stderr and reaps the process; safe even
+        # if the child still has pipe data buffered.
+        proc.communicate(timeout=2)
     except subprocess.TimeoutExpired:
         proc.kill()
+        try:
+            proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
     if os.path.exists(db_path):
         os.unlink(db_path)
 ```
@@ -224,7 +246,7 @@ def test_smoke():
     assert True
 ```
 
-Create `deploy/admin-api/tests/test_routes_config.py`:
+Create `deploy/admin-api/tests/test_health.py` (health/smoke probe lives here; route-specific tests go in `test_routes_*.py`):
 ```python
 import urllib.request
 
@@ -240,7 +262,7 @@ def test_health_endpoint_returns_200(admin_api_server):
 - [ ] **Step 3: Run test to verify it fails**
 
 ```bash
-cd deploy/admin-api && python -m pytest tests/test_routes_config.py::test_health_endpoint_returns_200 -v
+cd deploy/admin-api && python -m pytest tests/test_health.py::test_health_endpoint_returns_200 -v
 ```
 
 Expected: FAIL — `admin-api.py` doesn't exist yet, fixture raises `RuntimeError: admin-api failed to start`.
@@ -311,7 +333,7 @@ if __name__ == "__main__":
 - [ ] **Step 5: Run test to verify it passes**
 
 ```bash
-cd deploy/admin-api && python -m pytest tests/test_routes_config.py::test_health_endpoint_returns_200 -v
+cd deploy/admin-api && python -m pytest tests/test_health.py -v
 ```
 
 Expected: PASS.
@@ -555,11 +577,10 @@ Expected: 3 PASS.
 
 - [ ] **Step 5: Wire init_db into admin-api startup**
 
-Edit `deploy/admin-api/admin-api.py` `main()` function — add init_db call before the server loop:
+In `deploy/admin-api/admin-api.py`, add `from db import init_db` to the module-level imports at the top (next to `import json`, `import logging`, etc.) — lazy-imports inside `main()` mask startup ImportErrors.
 
-Before `server = ThreadingHTTPServer(...)`, insert:
+Then in `main()`, before `server = ThreadingHTTPServer(...)`, insert:
 ```python
-    from db import init_db
     init_db(DB_PATH)
     log.info("schema bootstrapped at %s", DB_PATH)
 ```
@@ -581,22 +602,22 @@ git commit -m "feat(admin-api): SQLite schema bootstrap with WAL"
 
 ---
 
-### Task 3: Secrets module (Fernet + HKDF)
+### Task 3: Secret box module (Fernet + HKDF)
 
 **Files:**
-- Create: `deploy/admin-api/secrets.py`
-- Test: `deploy/admin-api/tests/test_secrets.py`
+- Create: `deploy/admin-api/secretbox.py` (NOT `secrets.py` — that name shadows the stdlib `secrets` module which is transitively imported by `cryptography`, `pytest`, and other deps when our package directory is on `sys.path`)
+- Test: `deploy/admin-api/tests/test_secretbox.py`
 
 - [ ] **Step 1: Write the failing test**
 
-Create `deploy/admin-api/tests/test_secrets.py`:
+Create `deploy/admin-api/tests/test_secretbox.py`:
 ```python
 import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from secrets import SecretBox, derive_fernet_key
+from secretbox import SecretBox, derive_fernet_key
 
 
 def test_derive_fernet_key_is_deterministic():
@@ -634,10 +655,10 @@ def test_secretbox_rejects_wrong_key():
 - [ ] **Step 2: Run test to verify it fails**
 
 ```bash
-cd deploy/admin-api && python -m pytest tests/test_secrets.py -v
+cd deploy/admin-api && python -m pytest tests/test_secretbox.py -v
 ```
 
-Expected: FAIL — `secrets.py` doesn't exist. (Note: there's a stdlib `secrets` module; our import gets shadowed by the local one because of `sys.path.insert(0, ...)`. That's intentional. If you see imports from stdlib `secrets`, check that order.)
+Expected: FAIL — `secretbox.py` doesn't exist (ModuleNotFoundError).
 
 - [ ] **Step 3: Install dependency in dev**
 
@@ -645,9 +666,9 @@ Expected: FAIL — `secrets.py` doesn't exist. (Note: there's a stdlib `secrets`
 pip install 'cryptography==42.0.5' pytest
 ```
 
-- [ ] **Step 4: Write `secrets.py`**
+- [ ] **Step 4: Write `secretbox.py`**
 
-Create `deploy/admin-api/secrets.py`:
+Create `deploy/admin-api/secretbox.py`:
 ```python
 """Symmetric encryption for is_secret=1 config values and zabbix poller_pass.
 
@@ -710,7 +731,7 @@ class SecretBox:
 - [ ] **Step 5: Run tests to verify they pass**
 
 ```bash
-cd deploy/admin-api && python -m pytest tests/test_secrets.py -v
+cd deploy/admin-api && python -m pytest tests/test_secretbox.py -v
 ```
 
 Expected: 5 PASS.
@@ -718,8 +739,8 @@ Expected: 5 PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add deploy/admin-api/secrets.py deploy/admin-api/tests/test_secrets.py deploy/admin-api/requirements.txt
-git commit -m "feat(admin-api): Fernet+HKDF secret box for is_secret values"
+git add deploy/admin-api/secretbox.py deploy/admin-api/tests/test_secretbox.py deploy/admin-api/requirements.txt
+git commit -m "feat(admin-api): Fernet+HKDF SecretBox (avoid stdlib secrets shadow)"
 ```
 
 ---
@@ -820,11 +841,12 @@ Create `deploy/admin-api/seeds/config_seed.json`:
 }
 ```
 
-- [ ] **Step 3: Add a unit test that validates seed structure**
+- [ ] **Step 3: Add unit tests that validate seed structure (separate file)**
 
-Append to `deploy/admin-api/tests/test_db.py`:
+Create `deploy/admin-api/tests/test_seeds.py` (keeps seed JSON validation independent from DB schema tests):
 ```python
 import json
+import os
 
 
 def test_config_seed_has_required_fields():
@@ -851,15 +873,15 @@ def test_services_seed_has_uip_admin_api_excluded():
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd deploy/admin-api && python -m pytest tests/test_db.py -v
+cd deploy/admin-api && python -m pytest tests/test_db.py tests/test_seeds.py -v
 ```
 
-Expected: all PASS (5 total).
+Expected: 5 PASS (3 from test_db.py, 2 from test_seeds.py).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add deploy/admin-api/seeds/ deploy/admin-api/tests/test_db.py
+git add deploy/admin-api/seeds/ deploy/admin-api/tests/test_seeds.py
 git commit -m "feat(admin-api): seed v1 with 4 config keys + 12 restartable services"
 ```
 
@@ -947,7 +969,7 @@ def test_load_services_seed_returns_allowlist():
 cd deploy/admin-api && python -m pytest tests/test_db.py -v
 ```
 
-Expected: 4 NEW tests fail with `ImportError: cannot import name 'apply_seed' from 'db'`.
+Expected: 5 NEW tests fail with import errors (`apply_seed` and `load_services_seed` not yet defined in `db`).
 
 - [ ] **Step 3: Implement seed loader**
 
@@ -1045,10 +1067,10 @@ In `deploy/admin-api/admin-api.py` `main()`, after `init_db(DB_PATH)`, add:
 - [ ] **Step 5: Run tests to verify they pass**
 
 ```bash
-cd deploy/admin-api && python -m pytest tests/test_db.py -v
+cd deploy/admin-api && python -m pytest tests/ -v
 ```
 
-Expected: all PASS (9 total).
+Expected: 8 PASS (3 from test_db.py original + 5 new test_db.py seed-loader tests + 2 from test_seeds.py + 1 from test_health.py + Task 3 test_secretbox tests if already run). Count by file rather than total — Step 5 only asserts no failures.
 
 - [ ] **Step 6: Commit**
 
@@ -1126,9 +1148,8 @@ def render() -> str:
 def main() -> int:
     out_dir = OUT.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    init = out_dir / "__init__.py"
-    if not init.exists():
-        init.write_text('"""uip_config_client — shared library for consuming admin-api config."""\nfrom .client import ConfigClient  # noqa: F401\nfrom .schemas import KeySchema, SEED_VERSION, SCHEMAS  # noqa: F401\n')
+    # __init__.py is hand-authored in Task 6 Step 2 and intentionally not
+    # overwritten here; the generator owns ONLY schemas.py.
     OUT.write_text(render())
     print(f"wrote {OUT} ({len(json.loads(SEED.read_text())['keys'])} keys)")
     return 0
@@ -1147,8 +1168,11 @@ Create `deploy/uip_config_client/__init__.py`:
 Imported by every UIP service (alert-enricher, noc-escalation-bot, etc.)
 that needs to read runtime config from admin-api with env fallback.
 """
-# Imports filled in by build_schemas.py output and Task 8 client.py
+from .client import ConfigClient  # noqa: F401
+from .schemas import KeySchema, SEED_VERSION, SCHEMAS  # noqa: F401
 ```
+
+Note: `client.py` doesn't exist yet (created in Task 7) and `schemas.py` is a placeholder until Step 3. Both imports will fail at import time **right now**, which is fine — Task 6 Step 3 generates a valid `schemas.py` and Task 7 Step 3 creates `client.py`. Tests in this task run only the generator script (subprocess) and don't `import uip_config_client`, so they pass without the package being loadable yet.
 
 Create `deploy/uip_config_client/schemas.py` (placeholder; will be overwritten):
 ```python
@@ -1731,9 +1755,12 @@ def resolve_user(cookie: str | None, bypass_header: str | None, remote_ip: str =
       3. Otherwise None (handler returns 401).
     """
     token = (os.environ.get("ADMIN_BYPASS_TOKEN") or "").strip()
-    if token and bypass_header == token:
-        log.warning("audit_bypass=true ip=%s", remote_ip)
-        return BypassUser(username=f"__bypass__:{remote_ip}", permissions=_all_permissions())
+    if bypass_header:
+        # Log every bypass attempt — match goes through, mismatch is noisy security signal.
+        if token and bypass_header == token:
+            log.warning("audit_bypass=true result=match ip=%s", remote_ip)
+            return BypassUser(username=f"__bypass__:{remote_ip}", permissions=_all_permissions())
+        log.warning("audit_bypass=true result=reject ip=%s", remote_ip)
 
     if not cookie:
         return None
@@ -2073,11 +2100,11 @@ def handle(handler, method: str, path: str, query: dict, db_path: str) -> bool:
     user = resolve_user(cookie, bypass, remote_ip=handler.client_address[0])
 
     if path == "/api/admin/config" and method == "GET":
-        if not has_permission(user, "view_admin") and not has_permission(user, "manage_ai"):
-            # Loose for now — Slice 1 ships with view_admin gating; subsequent
-            # slices tighten to per-scope perms in route table.
-            if user is None:
-                unauthorized(handler); return True
+        if user is None:
+            unauthorized(handler); return True
+        if not has_permission(user, "view_admin"):
+            # Slice 1 gates by view_admin only; Slice 2+ tightens to per-scope perms.
+            forbid(handler); return True
         scope = query.get("scope")
         with get_conn(db_path) as conn:
             if scope:
@@ -2109,6 +2136,8 @@ def handle(handler, method: str, path: str, query: dict, db_path: str) -> bool:
 
         if method == "PATCH":
             if user is None: unauthorized(handler); return True
+            if not has_permission(user, "view_admin"):
+                forbid(handler); return True
             body = read_json_body(handler)
             new_value = body.get("value")
             reason = body.get("reason")
@@ -2116,6 +2145,10 @@ def handle(handler, method: str, path: str, query: dict, db_path: str) -> bool:
                 row = conn.execute("SELECT * FROM config WHERE key=?", (key,)).fetchone()
                 if row is None:
                     send_json(handler, 404, {"error": "not found", "key": key}); return True
+                # Secrets must go through POST /rotate-secret (Fernet path); PATCH on is_secret=1
+                # would overwrite ciphertext with raw plaintext.
+                if row["is_secret"]:
+                    send_json(handler, 409, {"error": "use POST /api/admin/config/{key}/rotate-secret for is_secret=1 keys"}); return True
                 rule = json.loads(row["validation"]) if row["validation"] else None
                 err = _validate(new_value, row["value_type"], rule)
                 if err:
@@ -2144,6 +2177,8 @@ def handle(handler, method: str, path: str, query: dict, db_path: str) -> bool:
 
         if method == "DELETE":
             if user is None: unauthorized(handler); return True
+            if not has_permission(user, "view_admin"):
+                forbid(handler); return True
             with get_conn(db_path) as conn:
                 row = conn.execute("SELECT * FROM config WHERE key=?", (key,)).fetchone()
                 if row is None:
@@ -2400,6 +2435,16 @@ git commit -m "feat(admin-api): routes/audit.py with CSV export"
 
 ## Chunk 4: ConfigClient SSE + auth-api extension
 
+**Hard prerequisite check before running any task in this chunk:**
+
+```bash
+wc -l deploy/auth-api/auth-api.py
+grep -c "ALL_PERMISSIONS" deploy/sre-frontend/src/lib/keep-api.ts
+```
+
+If `auth-api.py` is ≤500 lines OR `ALL_PERMISSIONS` count is 0, Slice 0 (server↔local rsync) is incomplete. STOP. Reconcile drift first — Tasks 14 and 15 in this chunk modify infrastructure that exists ONLY on the server until Slice 0 lands locally.
+
+
 ### Task 13: ConfigClient SSE consumer + invalid-payload handler
 
 **Files:**
@@ -2593,7 +2638,10 @@ Append to `deploy/uip_config_client/client.py`:
             try:
                 req = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
                 with urllib.request.urlopen(req, timeout=None) as r:
-                    backoff = 1
+                    # Reset backoff only after we receive the first real frame, not
+                    # just on connection open — a server that accepts then immediately
+                    # drops would otherwise spin in a tight loop.
+                    received_first_frame = False
                     event_type, data_lines = None, []
                     for raw in r:
                         line = raw.decode().rstrip("\n").rstrip("\r")
@@ -2606,6 +2654,9 @@ Append to `deploy/uip_config_client/client.py`:
                                 payload = json.loads("\n".join(data_lines))
                                 if event_type == "config_changed":
                                     self._apply_event(payload)
+                                if not received_first_frame:
+                                    backoff = 1
+                                    received_first_frame = True
                             except Exception as e:
                                 log.warning("SSE parse error: %s", e)
                             event_type, data_lines = None, []
@@ -2679,7 +2730,7 @@ Also add to `ConfigClient.__init__`, at the end (after `_try_initial_snapshot`):
 cd deploy/uip_config_client && python -m pytest tests/ -v
 ```
 
-Expected: 6 PASS.
+Expected: 7 PASS (3 from Task 7 `test_client_env_fallback.py` + 3 from `test_client_sse_apply.py` + 1 from `test_client_invalid_payload.py`).
 
 - [ ] **Step 5: Commit**
 
@@ -2721,9 +2772,23 @@ Edit `deploy/auth-api/auth-api.py` at the `ALL_PERMISSIONS = [` block. After the
     "view_audit",
 ```
 
-- [ ] **Step 3: Add an idempotent seed function for default role assignments**
+- [ ] **Step 3a: Verify role_permissions schema before writing the INSERT**
 
-Find the section in `auth-api.py` that seeds default role permissions (look for `INSERT INTO role_permissions`). Add a new function `seed_admin_tab_permissions` that:
+```bash
+grep -nE "CREATE TABLE.*role_permissions|role_permissions \(" deploy/auth-api/auth-api.py | head -5
+```
+
+Confirm the column layout. The seed below assumes `(role_id INTEGER, permission TEXT)` with the permission stored inline as text (verified live on server: `role_permissions(role_id, permission)`). If the schema uses a separate `permissions` table with FK, this task must be reworked to insert into both tables.
+
+- [ ] **Step 3b: Locate where existing role-permission seeds run**
+
+```bash
+grep -nE "INSERT.*role_permissions|seed.*permission|seed.*role" deploy/auth-api/auth-api.py | head -10
+```
+
+Find the function called on container boot (likely `_seed_users` or `_init_db` or similar). The new function `seed_admin_tab_permissions(conn)` must be invoked from inside that function, *after* the existing role permissions are seeded. Note the exact line number of the call site for Step 3d.
+
+- [ ] **Step 3c: Add an idempotent seed function for default role assignments**
 
 ```python
 NEW_ADMIN_TAB_PERMS = [
@@ -2749,7 +2814,9 @@ def seed_admin_tab_permissions(conn):
     conn.commit()
 ```
 
-Call `seed_admin_tab_permissions(conn)` in auth-api's init/migration path (after the existing role-permission seeds run). Find the spot where the existing perms are seeded and append a call there.
+- [ ] **Step 3d: Call the seed function from the init path**
+
+Add `seed_admin_tab_permissions(conn)` immediately after the existing role-permission seeding loop you found in Step 3b. This must run on every container boot (idempotent). Confirm by tailing the function and ensuring the call lands inside whatever wraps the init transaction.
 
 - [ ] **Step 4: Write a quick verification script (not a pytest test, just a one-shot check)**
 
@@ -2928,20 +2995,13 @@ ls deploy/sre-frontend/src/app/admin/
 
 Expected: at least `page.tsx`. If empty/absent, Slice 0 incomplete.
 
-- [ ] **Step 2: Write layout.tsx**
+- [ ] **Step 2a: Create shared TABS constant**
 
-Create `deploy/sre-frontend/src/app/admin/layout.tsx`:
-```tsx
-'use client';
+Create `deploy/sre-frontend/src/app/admin/_components/tabs.ts`:
+```ts
+export type Tab = { href: string; label: string; perm: string };
 
-import { useAuth } from '@/lib/auth';
-import Link from 'next/link';
-import { usePathname } from 'next/navigation';
-import { ReactNode } from 'react';
-
-type Tab = { href: string; label: string; perm: string };
-
-const TABS: Tab[] = [
+export const ADMIN_TABS: Tab[] = [
   { href: '/portal/admin/users',         label: 'Users',         perm: 'manage_users' },
   { href: '/portal/admin/roles',         label: 'Roles',         perm: 'manage_roles' },
   { href: '/portal/admin/ai',            label: 'AI',            perm: 'manage_ai' },
@@ -2953,6 +3013,19 @@ const TABS: Tab[] = [
   { href: '/portal/admin/runbooks',      label: 'Runbooks',      perm: 'manage_runbooks' },
   { href: '/portal/admin/audit',         label: 'Audit',         perm: 'view_audit' },
 ];
+```
+
+- [ ] **Step 2b: Write layout.tsx**
+
+Create `deploy/sre-frontend/src/app/admin/layout.tsx`:
+```tsx
+'use client';
+
+import { useAuth } from '@/lib/auth';
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
+import { ReactNode } from 'react';
+import { ADMIN_TABS } from './_components/tabs';
 
 export default function AdminLayout({ children }: { children: ReactNode }) {
   const { hasPermission, loading } = useAuth();
@@ -2964,13 +3037,14 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
   if (!hasPermission('view_admin')) {
     return <div className="p-8 text-red-400">Access denied. Admin permission required.</div>;
   }
-  const allowed = TABS.filter((t) => hasPermission(t.perm));
+  const allowed = ADMIN_TABS.filter((t) => hasPermission(t.perm));
   return (
     <div className="space-y-4">
       <nav className="border-b border-border">
         <ul className="flex gap-1 overflow-x-auto">
           {allowed.map((t) => {
-            const active = pathname?.startsWith(t.href);
+            // Exact match OR strict subpath match (avoids /users matching /users-management)
+            const active = pathname === t.href || pathname?.startsWith(t.href + '/');
             return (
               <li key={t.href}>
                 <Link
@@ -3011,24 +3085,19 @@ Then create a new `deploy/sre-frontend/src/app/admin/page.tsx`:
 import { useAuth } from '@/lib/auth';
 import { useRouter } from 'next/navigation';
 import { useEffect } from 'react';
-
-const FIRST_TAB_ORDER = [
-  ['manage_users', '/portal/admin/users'],
-  ['manage_roles', '/portal/admin/roles'],
-  ['manage_ai', '/portal/admin/ai'],
-  ['manage_pipeline', '/portal/admin/pipeline'],
-  ['manage_services', '/portal/admin/services'],
-  ['view_audit', '/portal/admin/audit'],
-] as const;
+import { ADMIN_TABS } from './_components/tabs';
 
 export default function AdminIndex() {
   const { hasPermission, loading } = useAuth();
   const router = useRouter();
   useEffect(() => {
     if (loading) return;
-    for (const [perm, href] of FIRST_TAB_ORDER) {
-      if (hasPermission(perm)) {
-        router.replace(href);
+    // Walk every tab in display order; first one the user can see wins.
+    // Derives from ADMIN_TABS so we never get stuck on the loading screen
+    // when the user only has e.g. manage_zabbix or manage_runbooks.
+    for (const tab of ADMIN_TABS) {
+      if (hasPermission(tab.perm)) {
+        router.replace(tab.href);
         return;
       }
     }
@@ -3128,12 +3197,12 @@ In the nginx service `depends_on:` list, add:
       - admin-api
 ```
 
-- [ ] **Step 4: Add ADMIN_BYPASS_TOKEN to .env.example**
+- [ ] **Step 4: Add ADMIN_BYPASS_TOKEN to .env.example (idempotent)**
 
 ```bash
-echo "" >> deploy/.env.example
-echo "# Optional escape hatch for admin-api RBAC bootstrap. Leave empty in production." >> deploy/.env.example
-echo "ADMIN_BYPASS_TOKEN=" >> deploy/.env.example
+if ! grep -q "^ADMIN_BYPASS_TOKEN=" deploy/.env.example; then
+  printf '\n# Optional escape hatch for admin-api RBAC bootstrap. Leave empty in production.\nADMIN_BYPASS_TOKEN=\n' >> deploy/.env.example
+fi
 ```
 
 - [ ] **Step 5: Validate compose**
@@ -3177,16 +3246,25 @@ scp -i $SSH_KEY -r deploy/sre-frontend/src/app/admin $SERVER:~/uip/sre-frontend/
 scp -i $SSH_KEY deploy/sre-frontend/src/lib/keep-api.ts $SERVER:~/uip/sre-frontend/src/lib/keep-api.ts
 ```
 
-- [ ] **Step 2: Bring up admin-api**
+- [ ] **Step 2: Bring up admin-api (first boot includes pip install — can take 60s)**
 
 ```bash
-ssh -i $SSH_KEY $SERVER "cd ~/uip && docker compose up -d admin-api && sleep 10 && docker logs uip-admin-api --tail 20"
+ssh -i $SSH_KEY $SERVER "cd ~/uip && docker compose up -d admin-api"
+# Poll /health until ready (max ~90s)
+for i in $(seq 1 30); do
+  status=$(ssh -i $SSH_KEY $SERVER "curl -s -o /dev/null -w '%{http_code}' http://localhost:8096/health 2>/dev/null || echo 000")
+  [ "$status" = "200" ] && break
+  sleep 3
+done
+ssh -i $SSH_KEY $SERVER "docker logs uip-admin-api --tail 40"
 ```
 
 Expected log lines (or similar):
 - `admin-api starting on :8096 (DB=/data/admin.db)`
 - `schema bootstrapped at /data/admin.db`
 - `seed applied`
+
+Note: `admin-api` boots in the `uip-net` Docker network, not on localhost. The host-side `curl http://localhost:8096` works only if you exposed the port — adjust to `docker exec uip-admin-api curl -s http://127.0.0.1:8096/health` if needed.
 
 - [ ] **Step 3: Restart nginx to pick up new locations**
 
@@ -3205,40 +3283,62 @@ ssh -i $SSH_KEY $SERVER "cd ~/uip && docker compose up -d --build sre-frontend"
 - [ ] **Step 5: Ship gate — verify endpoints (the §8 Slice 1 ship gate from spec)**
 
 ```bash
-# 5a. Health
-curl -s http://10.177.154.196/api/admin/config/events -m 1 -o /dev/null -w "events: %{http_code}\n"
-# Expected: events: 200 (and the connection times out on the 1-second cap)
+# 5a. admin-api up (use /health not /events — SSE blocks and confuses curl exit codes)
+curl -s -m 3 -o /dev/null -w "health: %{http_code}\n" http://10.177.154.196/api/admin/config -H "X-Admin-Bypass: ignored"
+# Expected: health: 401 (no bypass token set yet, BUT the route is reachable — proves admin-api is up via nginx)
 
 # 5b. Config list (unauthenticated)
 curl -s -o /dev/null -w "config: %{http_code}\n" http://10.177.154.196/api/admin/config
 # Expected: config: 401
 
-# 5c. Config list (bypass for verification)
-ssh -i $SSH_KEY $SERVER 'grep ^ADMIN_BYPASS_TOKEN ~/uip/.env'
-# If empty, set a temporary token:
-ssh -i $SSH_KEY $SERVER 'grep -q ^ADMIN_BYPASS_TOKEN ~/uip/.env || echo "ADMIN_BYPASS_TOKEN=verify-shipgate-$(date +%s)" >> ~/uip/.env'
-ssh -i $SSH_KEY $SERVER 'cd ~/uip && docker compose up -d admin-api && sleep 5'
-TOKEN=$(ssh -i $SSH_KEY $SERVER 'grep ^ADMIN_BYPASS_TOKEN ~/uip/.env | cut -d= -f2')
-curl -s -H "X-Admin-Bypass: $TOKEN" http://10.177.154.196/api/admin/config | jq '.items | length'
-# Expected: 4 (the four seeded keys)
+# 5c. Set up a temporary bypass token for ship-gate checks
+# Robust against pre-existing empty/value ADMIN_BYPASS_TOKEN= lines.
+SHIPGATE_TOKEN="verify-shipgate-$(date +%s)"
+ssh -i $SSH_KEY $SERVER "sed -i -E '/^ADMIN_BYPASS_TOKEN=/d' ~/uip/.env && echo 'ADMIN_BYPASS_TOKEN=$SHIPGATE_TOKEN' >> ~/uip/.env && cd ~/uip && docker compose up -d admin-api"
+# Wait for admin-api to come back up
+for i in $(seq 1 20); do
+  s=$(curl -s -o /dev/null -w '%{http_code}' -H "X-Admin-Bypass: $SHIPGATE_TOKEN" http://10.177.154.196/api/admin/config)
+  [ "$s" = "200" ] && break
+  sleep 2
+done
 
-# 5d. Schemas version
-curl -s -H "X-Admin-Bypass: $TOKEN" http://10.177.154.196/api/admin/config/schemas/version
+# 5d. Verify the 4 seeded keys are visible
+curl -s -H "X-Admin-Bypass: $SHIPGATE_TOKEN" http://10.177.154.196/api/admin/config | jq '.items | length'
+# Expected: 4 (NOTE: spec §8 Slice 1 ship gate says "empty list" but Task 4 seeds 4 keys.
+# The plan supersedes the spec wording here — 4 is correct.)
+
+# 5e. Schemas version
+curl -s -H "X-Admin-Bypass: $SHIPGATE_TOKEN" http://10.177.154.196/api/admin/config/schemas/version
 # Expected: {"seed_version": 1}
 
-# 5e. Audit
-curl -s -H "X-Admin-Bypass: $TOKEN" http://10.177.154.196/api/admin/audit | jq '.items | length'
+# 5f. Audit
+curl -s -H "X-Admin-Bypass: $SHIPGATE_TOKEN" http://10.177.154.196/api/admin/audit | jq '.items | length'
 # Expected: 4 (one seed insert per key)
 
-# 5f. Existing admin pages still work (regression check)
+# 5g. Existing admin pages still work (regression — both per spec §8 Slice 1)
 curl -s -o /dev/null -w "/portal/admin/users: %{http_code}\n" http://10.177.154.196/portal/admin/users
-# Expected: /portal/admin/users: 200
+curl -s -o /dev/null -w "/portal/admin/roles: %{http_code}\n" http://10.177.154.196/portal/admin/roles
+# Expected: both 200
+
+# 5h. Existing alerts page hasn't regressed
+curl -s -o /dev/null -w "/portal/command-center: %{http_code}\n" http://10.177.154.196/portal/command-center
+# Expected: 200
+
+# 5i. SSE works (auth-free probe; SSE endpoint accepts any client to broadcast non-sensitive events)
+timeout 4 curl -s -N -H "X-Admin-Bypass: $SHIPGATE_TOKEN" http://10.177.154.196/api/admin/config/events | head -1
+# Expected: "event: " line or a `: keepalive` line within 4 seconds
 ```
 
-- [ ] **Step 6: Remove the temporary bypass token**
+- [ ] **Step 6: Remove the temporary bypass token (restore to empty placeholder)**
 
 ```bash
-ssh -i $SSH_KEY $SERVER 'sed -i "/^ADMIN_BYPASS_TOKEN=verify-shipgate-/d" ~/uip/.env && cd ~/uip && docker compose up -d admin-api'
+ssh -i $SSH_KEY $SERVER "sed -i -E '/^ADMIN_BYPASS_TOKEN=/d' ~/uip/.env && echo 'ADMIN_BYPASS_TOKEN=' >> ~/uip/.env && cd ~/uip && docker compose up -d admin-api"
+```
+
+Restores the empty placeholder that matches `.env.example`. Verify removal:
+```bash
+ssh -i $SSH_KEY $SERVER 'grep ^ADMIN_BYPASS_TOKEN ~/uip/.env'
+# Expected: ADMIN_BYPASS_TOKEN=    (empty value)
 ```
 
 - [ ] **Step 7: Document in operator guide**
@@ -3289,21 +3389,30 @@ git push -u origin feature/admin-foundation
 gh pr create --title "feat: admin-api foundation (Slice 1)" --body "$(cat <<'EOF'
 ## Summary
 - New service `admin-api` (port 8096) with SQLite/WAL admin.db
-- Shared lib `uip_config_client/` (Python package) with SSE + env fallback + schema validation
-- 8 new permissions in auth-api + role-mapping seed
-- Frontend admin/layout.tsx with permission-gated tab nav + 8 tab placeholders
-- nginx routes for /api/admin/* with SSE/streaming carve-outs
+- Shared Python package `uip_config_client/` with SSE + env fallback + schema validation
+- 8 new permissions in auth-api `ALL_PERMISSIONS` + idempotent role-mapping seed (Admin/SRE get all 8; Viewer gets view_audit)
+- Frontend `src/lib/keep-api.ts` `ALL_PERMISSIONS` constant updated with the same 8
+- New frontend `src/app/admin/layout.tsx` with permission-gated tab nav + shared `_components/tabs.ts`
+- 8 tab placeholder pages (`ai/`, `pipeline/`, `zabbix/`, `integrations/`, `services/`, `features/`, `runbooks/`, `audit/`) — content fills in slices 2-7
+- nginx 4 new location blocks: `/api/admin/config/events` (SSE, 86400s), `/api/admin/ai/test` (chunked, 180s), `/api/admin/zabbix/instances/*/setup` (chunked, 300s), `/api/admin/` (general, 75s)
+- `docker-compose.yml`: new `admin-api` service entry + `admin_data` volume + nginx `depends_on: admin-api`
+- `.env.example`: `ADMIN_BYPASS_TOKEN=` placeholder
+- `docs/operator/admin-api.md`: Slice 1 operator guide stub
 
 ## Test plan
-- [x] pytest in deploy/admin-api and deploy/uip_config_client (all green)
-- [x] Ship gate: 4 seeded keys visible via /api/admin/config
-- [x] Ship gate: audit log has 4 seed insert rows
-- [x] Ship gate: existing /portal/admin/users still loads
-- [x] nginx reload clean
-- [x] no service restart count regressions
+- [x] `pytest deploy/admin-api/tests` green
+- [x] `pytest deploy/uip_config_client/tests` green
+- [x] Ship gate 5d: 4 seeded keys visible via /api/admin/config
+- [x] Ship gate 5e: schemas/version returns seed_version=1
+- [x] Ship gate 5f: audit log has 4 `__seed__` rows
+- [x] Ship gate 5g: existing /portal/admin/users AND /portal/admin/roles both 200
+- [x] Ship gate 5h: /portal/command-center unchanged
+- [x] Ship gate 5i: SSE event stream connects within 4s
+- [x] `docker exec uip-nginx nginx -t` clean
+- [x] No container restart-count regressions
 
 ## Spec
-docs/superpowers/specs/2026-05-19-uip-admin-page-design.md v3
+docs/superpowers/specs/2026-05-19-uip-admin-page-design.md v3 (commit 2daae70)
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
