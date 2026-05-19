@@ -3,6 +3,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
+from cryptography.fernet import InvalidToken
 from secretbox import SecretBox, derive_fernet_key
 
 
@@ -28,11 +29,16 @@ def test_secretbox_rejects_tampered_ciphertext():
     box = SecretBox("master-secret-abc")
     cipher = bytearray(box.encrypt(b"hello"))
     cipher[-1] ^= 0x01  # flip a bit
-    with pytest.raises(Exception):  # cryptography raises InvalidToken
+    with pytest.raises(InvalidToken):
         box.decrypt(bytes(cipher))
 
 
 def test_secretbox_rejects_wrong_key():
     a = SecretBox("master-a").encrypt(b"hello")
-    with pytest.raises(Exception):
+    with pytest.raises(InvalidToken):
         SecretBox("master-b").decrypt(a)
+
+
+def test_hkdf_salt_is_32_bytes():
+    from secretbox import _HKDF_SALT
+    assert len(_HKDF_SALT) == 32

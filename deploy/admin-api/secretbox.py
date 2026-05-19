@@ -38,7 +38,12 @@ class SecretBox:
     """Lightweight wrapper around Fernet so callers don't see crypto primitives."""
 
     def __init__(self, master_secret: str | None = None) -> None:
-        secret = master_secret if master_secret is not None else os.environ["AUTH_SECRET"]
+        if master_secret is not None:
+            secret = master_secret
+        else:
+            secret = os.environ.get("AUTH_SECRET")
+            if not secret:
+                raise RuntimeError("AUTH_SECRET env var is required for SecretBox")
         self._fernet = Fernet(derive_fernet_key(secret))
 
     def encrypt(self, plaintext: bytes) -> bytes:
