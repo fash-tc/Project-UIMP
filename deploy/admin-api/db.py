@@ -5,10 +5,15 @@ CREATE TABLE IF NOT EXISTS for the initial schema, plus a
 schema_migrations table that future versions consult before applying
 incremental migrations.
 """
+import json
+import logging
 import os
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Iterator
+
+log = logging.getLogger("admin-api.db")
 
 # Path is supplied by caller (init_db) or env. Connection helper reads env.
 
@@ -148,3 +153,77 @@ def get_conn(path: str | None = None) -> Iterator[sqlite3.Connection]:
         yield conn
     finally:
         conn.close()
+
+
+_SEEDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seeds")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def apply_seed(db_path: str) -> None:
+    """Apply config_seed.json. Idempotent. Honours env_legacy on first insert only."""
+    seed_path = os.path.join(_SEEDS_DIR, "config_seed.json")
+    with open(seed_path) as f:
+        seed = json.load(f)
+    seed_version = int(seed.get("version", 1))
+
+    with get_conn(db_path) as conn:
+        existing = {r["key"] for r in conn.execute("SELECT key FROM config")}
+        now = _utc_now_iso()
+        for key, entry in seed["keys"].items():
+            if key in existing:
+                continue
+            # Use env_legacy if set on first insert, otherwise default
+            env_legacy = entry.get("env_legacy")
+            raw_value = os.environ.get(env_legacy) if env_legacy else None
+            value = _parse_env_value(raw_value, entry["value_type"]) if raw_value is not None else entry["default"]
+            conn.execute(
+                """
+                INSERT INTO config
+                (key, scope, value, value_type, reload_kind, restart_target,
+                 default_value, description, validation, is_secret,
+                 updated_at, updated_by, seed_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    key,
+                    entry["scope"],
+                    json.dumps(value),
+                    entry["value_type"],
+                    entry["reload_kind"],
+                    entry.get("restart_target"),
+                    json.dumps(entry["default"]),
+                    entry.get("description"),
+                    json.dumps(entry.get("validation")) if entry.get("validation") is not None else None,
+                    1 if entry.get("is_secret") else 0,
+                    now,
+                    "__seed__",
+                    seed_version,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO config_history (key, old_value, new_value, changed_by, changed_at, reason, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (key, None, json.dumps(value), "__seed__", now, f"seed v{seed_version}", "seed"),
+            )
+            log.info("seed: inserted key=%s value_source=%s", key, "env_legacy" if raw_value else "default")
+
+
+def _parse_env_value(raw: str, value_type: str):
+    if value_type == "int":
+        return int(raw)
+    if value_type == "float":
+        return float(raw)
+    if value_type == "bool":
+        return raw.lower() in {"1", "true", "yes", "on"}
+    if value_type == "json":
+        return json.loads(raw)
+    # string, secret
+    return raw
+
+
+def load_services_seed() -> list[str]:
+    path = os.path.join(_SEEDS_DIR, "services_seed.json")
+    with open(path) as f:
+        return json.load(f)["restartable_containers"]

@@ -63,3 +63,66 @@ def test_get_conn_yields_row_factory_and_closes(tmp_db):
     # connection is closed after context exit
     with pytest.raises(sqlite3.ProgrammingError):
         conn.execute("SELECT 1")
+
+
+def test_apply_seed_inserts_missing_keys(tmp_db, monkeypatch):
+    from db import init_db, apply_seed, get_conn
+    init_db(tmp_db)
+    apply_seed(tmp_db)
+    with get_conn(tmp_db) as conn:
+        rows = list(conn.execute("SELECT key, scope, value, value_type FROM config ORDER BY key"))
+    keys = [r["key"] for r in rows]
+    assert "ai.cluster.endpoint" in keys
+    assert "ai.enricher.model" in keys
+    assert "pipeline.enricher.poll_interval_sec" in keys
+    assert "features.admin.ai_sandbox" in keys
+
+
+def test_apply_seed_is_idempotent(tmp_db):
+    from db import init_db, apply_seed, get_conn
+    init_db(tmp_db)
+    apply_seed(tmp_db)
+    apply_seed(tmp_db)  # second run should not duplicate or error
+    with get_conn(tmp_db) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM config").fetchone()[0]
+    assert n == 4
+
+
+def test_apply_seed_honors_env_legacy_on_first_boot(tmp_db, monkeypatch):
+    """If a key has env_legacy set and that env is present, seed uses env value not default."""
+    from db import init_db, apply_seed, get_conn
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen3-235b-thinking")  # override default
+    init_db(tmp_db)
+    apply_seed(tmp_db)
+    with get_conn(tmp_db) as conn:
+        row = conn.execute("SELECT value FROM config WHERE key=?", ("ai.enricher.model",)).fetchone()
+    import json
+    assert json.loads(row["value"]) == "qwen3-235b-thinking"
+
+
+def test_apply_seed_skips_env_legacy_on_subsequent_boots(tmp_db, monkeypatch):
+    """Env override only takes effect when the row doesn't exist yet."""
+    from db import init_db, apply_seed, get_conn
+    init_db(tmp_db)
+    # First boot — no env, uses default
+    apply_seed(tmp_db)
+    # User changes value via UI (simulated)
+    with get_conn(tmp_db) as conn:
+        conn.execute(
+            "UPDATE config SET value=?, updated_at=? WHERE key=?",
+            ('"user-edited-value"', "2026-05-19T22:00:00Z", "ai.enricher.model"),
+        )
+    # Second boot with env set — must NOT clobber user value
+    monkeypatch.setenv("OLLAMA_MODEL", "would-clobber")
+    apply_seed(tmp_db)
+    with get_conn(tmp_db) as conn:
+        row = conn.execute("SELECT value FROM config WHERE key=?", ("ai.enricher.model",)).fetchone()
+    import json
+    assert json.loads(row["value"]) == "user-edited-value"
+
+
+def test_load_services_seed_returns_allowlist():
+    from db import load_services_seed
+    services = load_services_seed()
+    assert "uip-alert-enricher" in services
+    assert "uip-admin-api" not in services
