@@ -210,31 +210,30 @@ class EscalationHandler(BaseHTTPRequestHandler):
             user_ids = data.get("user_ids", [])
             alert_name = data.get("alert_name", "Unknown Alert")
             severity = data.get("severity", "unknown")
-            summary = data.get("summary", "")
+            hostname = data.get("hostname", "")
             message = data.get("message", "")
-            uip_link = data.get("uip_link", "")
 
             if not team_id and not user_ids:
                 self._send_json(400, {"error": "team_id or user_ids is required"})
                 return
 
             title = f"[{severity.upper()}] {alert_name}"
-            full_message = summary
+
+            parts = []
+            if hostname:
+                parts.append(f"Host: {hostname}")
             if message:
-                full_message += f"\n\nAdditional context from {username}:\n{message}"
-            if uip_link:
-                full_message += f"\n\nUIP: {uip_link}"
+                parts.append(f"Details from Domains SRE:\n{message}")
+            full_message = "\n\n".join(parts)
 
             payload = {
                 "title": title,
                 "message": full_message,
             }
-            if uip_link:
-                payload["source_url"] = uip_link
-
             if team_id:
                 payload["team"] = team_id
             elif user_ids:
+                payload["team"] = None
                 payload["users"] = [{"id": uid, "important": True} for uid in user_ids]
 
             log.info(f"Escalation by {username}: {title} -> {'team=' + team_id if team_id else 'users=' + str(user_ids)}")

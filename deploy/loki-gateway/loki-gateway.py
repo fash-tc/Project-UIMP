@@ -349,34 +349,60 @@ def _get_agents_for_operator(operator_id):
     return [agent for agent, op in AGENT_OPERATOR_MAP.items() if op == operator_id]
 
 
-def query_registry_trends(operator_id, range_hours):
-    """Query Loki for hourly bucketed metrics for a given operator."""
+def query_registry_trends(operator_id, range_seconds):
+    """Query Loki for bucketed metrics for a given operator.
+
+    Adapts bucket size and query limit based on range to avoid overloading Loki:
+      <=  5m  →  30s buckets, limit  200
+      <= 15m  →  60s buckets, limit  500
+      <=  1h  → 120s buckets, limit 1000
+      <=  6h  →  15m buckets, limit 2000
+      <= 24h  →  1h  buckets, limit 3000
+      <=  7d  →  6h  buckets, limit 5000
+    """
     agents = _get_agents_for_operator(operator_id)
     if not agents:
         return None
 
-    # Build a regex alternation for the operator's agents
-    agent_regex = "|".join(re.escape(a) for a in agents)
-    range_seconds = range_hours * 3600
+    # Pick one specific agent (first alphabetically) instead of regex OR for short ranges
+    # to keep Loki queries narrow
+    if range_seconds <= 3600 and len(agents) > 3:
+        agents_for_query = sorted(agents)[:3]
+    else:
+        agents_for_query = agents
+
+    agent_regex = "|".join(re.escape(a) for a in agents_for_query)
+
+    # Adaptive bucket size and limit based on range
+    if range_seconds <= 300:       # <= 5m
+        bucket_secs, limit = 30, 200
+    elif range_seconds <= 900:     # <= 15m
+        bucket_secs, limit = 60, 500
+    elif range_seconds <= 3600:    # <= 1h
+        bucket_secs, limit = 120, 1000
+    elif range_seconds <= 21600:   # <= 6h
+        bucket_secs, limit = 900, 2000
+    elif range_seconds <= 86400:   # <= 24h
+        bucket_secs, limit = 3600, 3000
+    else:                          # <= 7d
+        bucket_secs, limit = 21600, 5000
 
     try:
         timing_data = query_loki(
             f'{{app="ra", registry_agent=~"{agent_regex}"}} |~ "total="',
-            limit=5000,
+            limit=limit,
             range_seconds=range_seconds,
         )
     except Exception as e:
         raise RuntimeError(f"Loki query failed: {e}") from e
 
-    # Group log lines into hourly buckets
-    # bucket key = truncated-to-hour epoch seconds
-    buckets = {}  # ts_hour -> {total_times, error_count, total_count}
+    # Group log lines into adaptive buckets
+    buckets = {}  # bucket_ts -> {total_times, error_count, total_count}
 
     for stream in (timing_data.get("data") or {}).get("result") or []:
         for ts_ns, line in stream.get("values") or []:
             ts_sec = int(ts_ns) / 1e9
-            # Truncate to start of hour
-            hour_ts = int(ts_sec // 3600) * 3600
+            bucket_ts = int(ts_sec // bucket_secs) * bucket_secs
 
             try:
                 msg = json.loads(line).get("message", "")
@@ -390,22 +416,22 @@ def query_registry_trends(operator_id, range_hours):
             total_ms = int(m.group(2))
             resp = int(m.group(4))
 
-            if hour_ts not in buckets:
-                buckets[hour_ts] = {"total_times": [], "error_count": 0, "total_count": 0}
+            if bucket_ts not in buckets:
+                buckets[bucket_ts] = {"total_times": [], "error_count": 0, "total_count": 0}
 
-            buckets[hour_ts]["total_times"].append(total_ms)
-            buckets[hour_ts]["total_count"] += 1
+            buckets[bucket_ts]["total_times"].append(total_ms)
+            buckets[bucket_ts]["total_count"] += 1
             if resp >= 400:
-                buckets[hour_ts]["error_count"] += 1
+                buckets[bucket_ts]["error_count"] += 1
 
     # Build sorted list of bucket objects
     result_buckets = []
-    for hour_ts in sorted(buckets.keys()):
-        b = buckets[hour_ts]
+    for bkt_ts in sorted(buckets.keys()):
+        b = buckets[bkt_ts]
         n = len(b["total_times"])
         avg_ms = round(sum(b["total_times"]) / n, 1) if n > 0 else 0
         error_rate = round(b["error_count"] / b["total_count"], 4) if b["total_count"] > 0 else 0
-        dt = datetime.fromtimestamp(hour_ts, tz=timezone.utc)
+        dt = datetime.fromtimestamp(bkt_ts, tz=timezone.utc)
         result_buckets.append({
             "timestamp": dt.isoformat(),
             "avg_response_ms": avg_ms,
@@ -415,7 +441,8 @@ def query_registry_trends(operator_id, range_hours):
 
     return {
         "operator": operator_id,
-        "range_hours": range_hours,
+        "range_seconds": range_seconds,
+        "bucket_size_seconds": bucket_secs,
         "buckets": result_buckets,
     }
 
@@ -514,13 +541,13 @@ class LokiHandler(BaseHTTPRequestHandler):
                 return
 
             try:
-                range_hours = int(params.get("range", ["24"])[0])
+                range_seconds = int(params.get("range_seconds", ["86400"])[0])
             except (ValueError, TypeError):
-                self._send_json(400, {"error": "range must be an integer"})
+                self._send_json(400, {"error": "range_seconds must be an integer"})
                 return
 
-            if range_hours not in (6, 24, 168):
-                self._send_json(400, {"error": "range must be one of: 6, 24, 168"})
+            if range_seconds < 60 or range_seconds > 604800:
+                self._send_json(400, {"error": "range_seconds must be between 60 and 604800 (7 days)"})
                 return
 
             agents = _get_agents_for_operator(operator)
@@ -529,7 +556,7 @@ class LokiHandler(BaseHTTPRequestHandler):
                 return
 
             try:
-                trends = query_registry_trends(operator, range_hours)
+                trends = query_registry_trends(operator, range_seconds)
                 self._send_json(200, trends)
             except RuntimeError as e:
                 self._send_json(502, {"error": str(e)})

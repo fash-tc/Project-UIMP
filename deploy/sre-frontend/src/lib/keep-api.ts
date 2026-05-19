@@ -1,9 +1,11 @@
-import { Alert, AIEnrichment, AlertStats, SREFeedback, RunbookEntry, AIInstruction, AIFeedbackSummary, AlertState, RunbookFeedback, SituationSummary, SuggestedMerge } from './types';
+import { Alert, AIEnrichment, AlertStats, SREFeedback, RunbookEntry, AIInstruction, AIFeedbackSummary, AlertState, RunbookFeedback, SituationSummary, SuggestedMerge, SREFeedbackEntry, RunbookExclusion, PaginatedResponse, IncidentAssessment, StatuspageComponent, StatuspageComponentUpdate, StatuspageIncident, Role, UserProfile, CustomAlertGroup, SharedMaintenanceAuthConfig, OpenSRSHealthReport, OpenSRSHealthReportSummary, OpenSRSLogAnalysisResult } from './types';
 
 const API_BASE = '/api/keep';
+const OPENSRS_HEALTH_BASE = '/api/opensrs-health';
 
 const SOURCE_LABELS: Record<string, string> = {
   zabbix: 'Zabbix',
+  'grafana-irm': 'Grafana IRM',
   'domains-shared': 'Domains Shared Zabbix',
   'ascio': 'Ascio Zabbix',
   'hostedemail': 'HostedEmail Zabbix',
@@ -32,6 +34,103 @@ async function keepFetch(path: string) {
   if (!res.ok) throw new Error(`Keep API ${res.status}: ${path}`);
   return res.json();
 }
+
+async function readResponseBody(res: Response): Promise<any> {
+  const contentType = res.headers.get('content-type') || '';
+  try {
+    if (contentType.includes('application/json')) {
+      return await res.json();
+    }
+    return await res.text();
+  } catch {
+    return null;
+  }
+}
+
+function extractResponseError(body: any, fallback: string): string {
+  if (typeof body === 'string') {
+    const normalized = body.replace(/\s+/g, ' ').trim();
+    if (!normalized || normalized.startsWith('<')) {
+      return fallback;
+    }
+    return normalized.slice(0, 200);
+  }
+  if (body && typeof body === 'object') {
+    return body.error || body.detail || body.message || fallback;
+  }
+  return fallback;
+}
+
+const MAINT_AUTH_STORAGE_KEY = 'ump-auth-token';
+
+function getMaintenanceAuthToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return window.sessionStorage.getItem(MAINT_AUTH_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function setMaintenanceAuthToken(token: string | null) {
+  if (typeof window === 'undefined') return;
+  try {
+    if (token) {
+      window.sessionStorage.setItem(MAINT_AUTH_STORAGE_KEY, token);
+    } else {
+      window.sessionStorage.removeItem(MAINT_AUTH_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage failures in private browsing or restricted contexts.
+  }
+}
+
+function getMaintenanceWriteHeaders(): Record<string, string> | null {
+  const token = getMaintenanceAuthToken();
+  if (!token) return null;
+  return { Authorization: `Bearer ${token}` };
+}
+
+function extractMaintenanceWriteError(body: any, fallback: string): string {
+  const message = extractResponseError(body, fallback);
+  if (/missing bearer token/i.test(message)) {
+    return 'Maintenance API auth required. Sign in to Maintenance Auth on this page and retry.';
+  }
+  if (/invalid token/i.test(message)) {
+    return 'Maintenance API token expired or invalid. Sign in to Maintenance Auth again.';
+  }
+  if (/validation error/i.test(message) || /field required/i.test(message)) {
+    return 'Maintenance API auth required. Sign in to Maintenance Auth on this page and retry.';
+  }
+  return message;
+}
+
+const HIGHLIGHT_COLOR_ALIASES: Record<string, string> = {
+  red: '#ef4444',
+  orange: '#f97316',
+  yellow: '#eab308',
+  green: '#22c55e',
+  blue: '#3b82f6',
+  purple: '#a855f7',
+  gray: '#6b7280',
+};
+
+export function normalizeHighlightColor(color?: string | null): string {
+  if (!color) return '#ef4444';
+  const normalized = color.trim().toLowerCase();
+  return HIGHLIGHT_COLOR_ALIASES[normalized] || color;
+}
+
+export function colorWithAlpha(color: string | undefined | null, alpha: number): string {
+  const normalized = normalizeHighlightColor(color);
+  if (/^#[0-9a-f]{6}$/i.test(normalized)) {
+    const clamped = Math.max(0, Math.min(1, alpha));
+    const alphaHex = Math.round(clamped * 255).toString(16).padStart(2, '0');
+    return `${normalized}${alphaHex}`;
+  }
+  return normalized;
+}
+
 
 export async function fetchAlerts(limit = 100): Promise<Alert[]> {
   const data = await keepFetch(`/alerts?limit=${limit}`);
@@ -325,6 +424,40 @@ export async function submitRunbookEntry(entry: {
   }
 }
 
+export async function searchRunbookEntries(search: string, limit = 20): Promise<RunbookEntry[]> {
+  try {
+    const params = new URLSearchParams();
+    params.set('page', '1');
+    params.set('limit', String(limit));
+    if (search.trim()) params.set('search', search.trim());
+    const res = await fetch(`${RUNBOOK_BASE}/entries?${params.toString()}`, { credentials: 'include' });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data) ? data : (data.items || []);
+  } catch {
+    return [];
+  }
+}
+
+export async function attachRunbookEntry(entryId: number, data: {
+  alert_name: string;
+  hostname?: string;
+  service?: string;
+}): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/entries/${entryId}/attach`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const body = await readResponseBody(res);
+    return { ok: res.ok, error: res.ok ? undefined : extractResponseError(body, 'Failed to attach runbook') };
+  } catch {
+    return { ok: false, error: 'Network error' };
+  }
+}
+
 export async function deleteRunbookEntry(id: number): Promise<boolean> {
   try {
     const res = await fetch(`${RUNBOOK_BASE}/entries/${id}`, { method: 'DELETE' });
@@ -356,6 +489,33 @@ export async function resolveAlerts(fingerprints: string[]): Promise<boolean> {
   try {
     const results = await Promise.all(
       fingerprints.map(fp => resolveAlert(fp))
+    );
+    return results.every(ok => ok);
+  } catch {
+    return false;
+  }
+}
+
+export async function unresolveAlert(fingerprint: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/alerts/enrich`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fingerprint,
+        enrichments: { status: 'firing' },
+      }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function unresolveAlerts(fingerprints: string[]): Promise<boolean> {
+  try {
+    const results = await Promise.all(
+      fingerprints.map(fp => unresolveAlert(fp))
     );
     return results.every(ok => ok);
   } catch {
@@ -401,18 +561,23 @@ export async function createJiraIncident(details: {
   operationalServiceId?: string;
   alertLink?: string;
   attachments?: { data: string; filename: string }[];
+  occirWorkType?: 'incident' | 'ticket';
 }): Promise<{ ok: boolean; issueKey?: string; issueUrl?: string; error?: string }> {
   try {
     const res = await fetch(`${RUNBOOK_BASE}/jira/incident`, {
       method: 'POST',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(details),
+      body: JSON.stringify({
+        ...details,
+        occir_work_type: details.occirWorkType,
+      }),
     });
-    const data = await res.json();
+    const data = await readResponseBody(res);
     if (res.ok) {
       return { ok: true, issueKey: data.issue_key, issueUrl: data.issue_url };
     }
-    return { ok: false, error: data.error || 'Failed to create incident' };
+    return { ok: false, error: extractResponseError(data, 'Failed to create incident') };
   } catch {
     return { ok: false, error: 'Network error' };
   }
@@ -488,6 +653,63 @@ export async function queryLokiLogs(
   return data;
 }
 
+export async function fetchOpenSRSHealthRuns(): Promise<{ runs: OpenSRSHealthReportSummary[] }> {
+  const res = await fetch(`${OPENSRS_HEALTH_BASE}/runs`, { credentials: 'include' });
+  const body = await readResponseBody(res);
+  if (!res.ok) throw new Error(extractResponseError(body, 'OpenSRS health runs failed'));
+  return body as { runs: OpenSRSHealthReportSummary[] };
+}
+
+export async function fetchOpenSRSHealthReports(): Promise<OpenSRSHealthReportSummary[]> {
+  const body = await fetchOpenSRSHealthRuns();
+  return Array.isArray(body.runs) ? body.runs : [];
+}
+
+export async function fetchOpenSRSHealthRun(runId: string): Promise<OpenSRSHealthReport> {
+  const res = await fetch(`${OPENSRS_HEALTH_BASE}/runs/${encodeURIComponent(runId)}`, { credentials: 'include' });
+  const body = await readResponseBody(res);
+  if (!res.ok) throw new Error(extractResponseError(body, 'OpenSRS health run failed'));
+  return body as OpenSRSHealthReport;
+}
+
+export const fetchOpenSRSHealthReport = fetchOpenSRSHealthRun;
+
+export async function createOpenSRSHealthRun(windowSeconds: number): Promise<OpenSRSHealthReport> {
+  const res = await fetch(`${OPENSRS_HEALTH_BASE}/runs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ window_seconds: windowSeconds }),
+  });
+  const body = await readResponseBody(res);
+  if (!res.ok) throw new Error(extractResponseError(body, 'OpenSRS health report failed'));
+  return body as OpenSRSHealthReport;
+}
+
+export const runOpenSRSHealthReport = createOpenSRSHealthRun;
+
+export async function analyzeOpenSRSLogs(params: {
+  query: string;
+  rangeSeconds: number;
+  limit: number;
+  question: string;
+}): Promise<OpenSRSLogAnalysisResult> {
+  const res = await fetch(`${OPENSRS_HEALTH_BASE}/analyze-logs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({
+      query: params.query,
+      range_seconds: params.rangeSeconds,
+      limit: params.limit,
+      question: params.question,
+    }),
+  });
+  const body = await readResponseBody(res);
+  if (!res.ok) throw new Error(extractResponseError(body, 'OpenSRS log analysis failed'));
+  return body as OpenSRSLogAnalysisResult;
+}
+
 // ── AI Instructions ──────────────────────────────────
 
 export async function fetchAIInstructions(): Promise<AIInstruction[]> {
@@ -554,6 +776,69 @@ export async function fetchAlertStates(): Promise<AlertState[]> {
     return await res.json();
   } catch {
     return [];
+  }
+}
+
+export async function syncCustomAlertGroups(activeFingerprints: string[]): Promise<CustomAlertGroup[]> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/custom-groups/sync`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active_fingerprints: activeFingerprints }),
+    });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function createCustomAlertGroup(name: string, fingerprints: string[]): Promise<{ ok: boolean; group?: CustomAlertGroup; error?: string }> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/custom-groups`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, fingerprints }),
+    });
+    const body = await readResponseBody(res);
+    if (!res.ok) return { ok: false, error: extractResponseError(body, 'Failed to create custom group') };
+    return { ok: true, group: body };
+  } catch (e: any) {
+    return { ok: false, error: e.message || 'Network error' };
+  }
+}
+
+export async function renameCustomAlertGroup(groupId: number, name: string): Promise<{ ok: boolean; group?: CustomAlertGroup; error?: string }> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/custom-groups/${groupId}`, {
+      method: 'PUT',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const body = await readResponseBody(res);
+    if (!res.ok) return { ok: false, error: extractResponseError(body, 'Failed to rename custom group') };
+    return { ok: true, group: body };
+  } catch (e: any) {
+    return { ok: false, error: e.message || 'Network error' };
+  }
+}
+
+export async function addAlertsToCustomAlertGroup(groupId: number, fingerprints: string[]): Promise<{ ok: boolean; group?: CustomAlertGroup; error?: string }> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/custom-groups/${groupId}`, {
+      method: 'PUT',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fingerprints }),
+    });
+    const body = await readResponseBody(res);
+    if (!res.ok) return { ok: false, error: extractResponseError(body, 'Failed to update custom group') };
+    return { ok: true, group: body };
+  } catch (e: any) {
+    return { ok: false, error: e.message || 'Network error' };
   }
 }
 
@@ -642,9 +927,10 @@ export async function escalateAlert(data: {
   user_ids?: string[];
   alert_name: string;
   severity: string;
-  summary: string;
+  hostname?: string;
+  summary?: string;
   message: string;
-  uip_link: string;
+  uip_link?: string;
 }): Promise<{success: boolean; error?: string}> {
   try {
     const res = await fetch(`${ESCALATION_BASE}/escalate`, {
@@ -675,13 +961,37 @@ export async function storeIncidentState(
   fingerprint: string,
   jiraKey: string,
   jiraUrl: string,
+  firingStart?: string,
 ): Promise<void> {
   await fetch('/api/alert-states/incident', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
-    body: JSON.stringify({ fingerprint, jira_key: jiraKey, jira_url: jiraUrl }),
+    body: JSON.stringify({ fingerprint, jira_key: jiraKey, jira_url: jiraUrl, firing_start: firingStart || '' }),
   });
+}
+
+export async function storeIncidentStateBulk(
+  fingerprints: string[],
+  jiraKey: string,
+  jiraUrl: string,
+  firingStarts?: Record<string, string>,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch('/api/alert-states/incident/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ fingerprints, jira_key: jiraKey, jira_url: jiraUrl, firing_starts: firingStarts || {} }),
+    });
+    const body = await readResponseBody(res);
+    return {
+      ok: res.ok,
+      error: res.ok ? undefined : extractResponseError(body, 'Failed to store incident state'),
+    };
+  } catch (e: any) {
+    return { ok: false, error: e.message || 'Network error' };
+  }
 }
 
 export async function storeEscalationState(
@@ -712,9 +1022,10 @@ export async function submitRunbookFeedback(
 
 export async function fetchRunbookFeedback(
   entryIds: number[],
+  fingerprint: string,
 ): Promise<RunbookFeedback[]> {
   if (entryIds.length === 0) return [];
-  const res = await fetch(`/api/alert-states/runbook-feedback?entry_ids=${entryIds.join(',')}`, {
+  const res = await fetch(`/api/alert-states/runbook-feedback?entry_ids=${entryIds.join(',')}&fingerprint=${encodeURIComponent(fingerprint)}`, {
     credentials: 'include',
   });
   if (!res.ok) return [];
@@ -746,11 +1057,1019 @@ export async function overrideSeverity(fingerprint: string, severity: string): P
   }
 }
 
+export async function overrideSeverityBulk(fingerprints: string[], severity: string): Promise<boolean> {
+  try {
+    const results = await Promise.all(
+      fingerprints.map(fp => overrideSeverity(fp, severity))
+    );
+    return results.every(r => r);
+  } catch {
+    return false;
+  }
+}
+
 export async function invalidateSummary(): Promise<void> {
   try {
     await fetch(`${ALERT_STATE_BASE}/invalidate-summary`, { method: 'POST' });
   } catch {}
 }
 
+// ── Silence Rules ──────────────────────────────────
+
+export interface SilenceRule {
+  id: number;
+  alert_name_pattern: string;
+  hostname_pattern: string | null;
+  created_by: string;
+  created_at: string;
+  expires_at: string;
+  reason: string;
+  active: number;
+}
+
+export async function fetchSilenceRules(): Promise<SilenceRule[]> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/silence-rules`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function createSilenceRule(
+  alertNamePattern: string,
+  durationSeconds: number,
+  hostnamePattern?: string,
+  reason?: string,
+): Promise<{ id: number; expires_at: string } | null> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/silence-rules`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        alert_name_pattern: alertNamePattern,
+        hostname_pattern: hostnamePattern || null,
+        duration_seconds: durationSeconds,
+        reason: reason || '',
+      }),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function cancelSilenceRule(ruleId: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/silence-rules/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: ruleId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Check if an alert name matches a pattern (supports wildcards * and comma-separated patterns) */
+function matchesNamePattern(alertName: string, pattern: string): boolean {
+  const name = alertName.toLowerCase();
+  // Support comma-separated patterns: "High Memory Utilization, High CPU Utilization"
+  const patterns = pattern.includes(',') ? pattern.split(',').map(p => p.trim()) : [pattern.trim()];
+  for (const p of patterns) {
+    const pat = p.toLowerCase();
+    if (pat.includes('*')) {
+      // Wildcard matching: "High * Utilization" matches "High CPU Utilization on host"
+      const regexStr = pat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*');
+      if (new RegExp(regexStr, 'i').test(name)) return true;
+    } else {
+      // Substring match
+      if (name.includes(pat)) return true;
+    }
+  }
+  return false;
+}
+
+/** Check if a hostname matches a pattern (supports wildcards * and comma-separated) */
+function matchesHostPattern(hostname: string, pattern: string): boolean {
+  const patterns = pattern.includes(',') ? pattern.split(',').map(p => p.trim()) : [pattern.trim()];
+  for (const p of patterns) {
+    const hostPattern = p.toLowerCase();
+    if (hostPattern.includes('*')) {
+      const regexStr = hostPattern.replace(/\./g, '\\.').replace(/\*/g, '.*');
+      const regex = new RegExp('(^|\\.)' + regexStr + '$', 'i');
+      if (regex.test(hostname)) return true;
+    } else {
+      if (hostname.toLowerCase().includes(hostPattern)) return true;
+    }
+  }
+  return false;
+}
+
+/** Check if an alert matches any active silence rule */
+export function isAlertSilenced(
+  alertName: string,
+  hostname: string,
+  rules: SilenceRule[],
+): SilenceRule | null {
+  const now = new Date().toISOString();
+  for (const rule of rules) {
+    if (!rule.active || rule.expires_at < now) continue;
+    // Check alert name pattern
+    if (!matchesNamePattern(alertName, rule.alert_name_pattern)) continue;
+    // Check hostname pattern if specified
+    if (rule.hostname_pattern) {
+      if (!matchesHostPattern(hostname, rule.hostname_pattern)) continue;
+    }
+    return rule;
+  }
+  return null;
+}
+
+// ── SRE Feedback (New Multi-Entry System) ─────────────────
+
+export async function fetchSREFeedback(fingerprint: string): Promise<SREFeedbackEntry[]> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/sre-feedback?fingerprint=${encodeURIComponent(fingerprint)}`, {
+      credentials: 'include',
+    });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchAllSREFeedback(params: {
+  page?: number;
+  limit?: number;
+  search?: string;
+  rating?: string;
+  user?: string;
+  sort?: string;
+} = {}): Promise<PaginatedResponse<SREFeedbackEntry>> {
+  try {
+    const qs = new URLSearchParams();
+    if (params.page) qs.set('page', String(params.page));
+    if (params.limit) qs.set('limit', String(params.limit));
+    if (params.search) qs.set('search', params.search);
+    if (params.rating) qs.set('rating', params.rating);
+    if (params.user) qs.set('user', params.user);
+    if (params.sort) qs.set('sort', params.sort);
+    const res = await fetch(`${ALERT_STATE_BASE}/sre-feedback/all?${qs.toString()}`, {
+      credentials: 'include',
+    });
+    if (!res.ok) return { items: [], total: 0, page: 1, limit: 50 };
+    return await res.json();
+  } catch {
+    return { items: [], total: 0, page: 1, limit: 50 };
+  }
+}
+
+export async function submitSREFeedback(data: {
+  fingerprint: string;
+  alert_name: string;
+  rating?: string;
+  corrected_severity?: string;
+  corrected_noise?: number;
+  comment?: string;
+}): Promise<{ id: number } | null> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/sre-feedback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function updateSREFeedback(id: number, data: {
+  rating?: string;
+  corrected_severity?: string;
+  corrected_noise?: number;
+  comment?: string;
+}): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/sre-feedback/update`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ id, ...data }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function deleteSREFeedback(id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/sre-feedback/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ id }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function bulkDeleteSREFeedback(ids: number[]): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/sre-feedback/bulk-delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ ids }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function voteSREFeedback(id: number, vote: 'up' | 'down' | 'none'): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/sre-feedback/vote`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ id, vote }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ── Runbook Exclusions ─────────────────────────────────
+
+export async function fetchRunbookExclusions(alertName: string): Promise<RunbookExclusion[]> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/runbook-exclusions?alert_name=${encodeURIComponent(alertName)}`, {
+      credentials: 'include',
+    });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchAllRunbookExclusions(params: {
+  page?: number;
+  limit?: number;
+  search?: string;
+} = {}): Promise<PaginatedResponse<RunbookExclusion>> {
+  try {
+    const qs = new URLSearchParams();
+    if (params.page) qs.set('page', String(params.page));
+    if (params.limit) qs.set('limit', String(params.limit));
+    if (params.search) qs.set('search', params.search);
+    const res = await fetch(`${ALERT_STATE_BASE}/runbook-exclusions/all?${qs.toString()}`, {
+      credentials: 'include',
+    });
+    if (!res.ok) return { items: [], total: 0, page: 1, limit: 50 };
+    return await res.json();
+  } catch {
+    return { items: [], total: 0, page: 1, limit: 50 };
+  }
+}
+
+export async function createRunbookExclusion(alertName: string, runbookEntryId: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/runbook-exclusions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ alert_name: alertName, runbook_entry_id: runbookEntryId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function deleteRunbookExclusion(id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${ALERT_STATE_BASE}/runbook-exclusions/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ id }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ── Maintenance Events ─────────────────────────────────
+
+export interface MaintenanceEvent {
+  id: number;
+  source_type: string;
+  title: string;
+  summary: string | null;
+  vendor: string;
+  severity: string | null;
+  start_time: string;
+  end_time: string | null;
+  impact: string | null;
+  status: string | null;
+  permalink: string;
+  ingested_at: string;
+  event_type: string;
+}
+
+export async function fetchMaintenanceEvents(): Promise<MaintenanceEvent[]> {
+  try {
+    const res = await fetch('/api/maintenance/active-now');
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.results || [];
+  } catch {
+    return [];
+  }
+}
+
 // Re-export SuggestedMerge so consumers can import from keep-api if needed
 export type { SuggestedMerge };
+
+// ── Incident Notification APIs ───────────────────────
+
+const MAINT_BASE = '/api/maintenance';
+
+export function hasMaintenanceAuthToken(): boolean {
+  return Boolean(getMaintenanceAuthToken());
+}
+
+export function clearMaintenanceAuthToken() {
+  setMaintenanceAuthToken(null);
+}
+
+export async function loginMaintenanceAuth(username: string, password: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${MAINT_BASE}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const body = await readResponseBody(res);
+    if (!res.ok) return { ok: false, error: extractResponseError(body, `HTTP ${res.status}`) };
+    if (!body?.token || typeof body.token !== 'string') {
+      return { ok: false, error: 'Maintenance login succeeded but no token was returned.' };
+    }
+    setMaintenanceAuthToken(body.token);
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'Network error' };
+  }
+}
+
+export async function fetchSharedMaintenanceAuth(): Promise<SharedMaintenanceAuthConfig> {
+  const res = await fetch('/api/auth/shared-integrations/maintenance', { credentials: 'include' });
+  const body = await readResponseBody(res);
+  if (!res.ok) throw new Error(extractResponseError(body, 'Failed to load shared maintenance auth'));
+  return body as SharedMaintenanceAuthConfig;
+}
+
+export async function saveSharedMaintenanceAuth(username: string, password: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch('/api/auth/shared-integrations/maintenance', {
+    method: 'PUT',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  const body = await readResponseBody(res);
+  return { ok: res.ok, error: res.ok ? undefined : extractResponseError(body, 'Failed to save shared maintenance auth') };
+}
+
+export async function testSharedMaintenanceAuth(): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch('/api/auth/shared-integrations/maintenance/test', {
+    method: 'POST',
+    credentials: 'include',
+  });
+  const body = await readResponseBody(res);
+  return { ok: res.ok, error: res.ok ? undefined : extractResponseError(body, 'Failed to test shared maintenance auth') };
+}
+
+export async function clearSharedMaintenanceAuth(): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch('/api/auth/shared-integrations/maintenance', {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+  const body = await readResponseBody(res);
+  return { ok: res.ok, error: res.ok ? undefined : extractResponseError(body, 'Failed to clear shared maintenance auth') };
+}
+
+export async function bootstrapSharedMaintenanceAuth(): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch('/api/auth/maintenance/bootstrap', {
+    method: 'POST',
+    credentials: 'include',
+  });
+  const body = await readResponseBody(res);
+  if (!res.ok) return { ok: false, error: extractResponseError(body, 'Failed to bootstrap maintenance auth') };
+  if (!body?.token || typeof body.token !== 'string') {
+    return { ok: false, error: 'Maintenance bootstrap succeeded but no token was returned.' };
+  }
+  setMaintenanceAuthToken(body.token);
+  return { ok: true };
+}
+
+
+export async function assessIncidentDescription(title: string, description: string): Promise<IncidentAssessment> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/incident/assess`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, description }),
+    });
+    return await res.json();
+  } catch {
+    return { grade: '?', feedback: 'Failed to connect to assessment service.' };
+  }
+}
+
+
+export async function fetchStatuspageComponents(): Promise<StatuspageComponent[]> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/statuspage/components`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function createStatuspageIncident(data: {
+  name: string;
+  body: string;
+  status: string;
+  impact_override: string;
+  components?: StatuspageComponentUpdate[];
+  component_ids?: string[];
+}): Promise<{ result?: StatuspageIncident; error?: string }> {
+  try {
+    const payload = {
+      ...data,
+      components: data.components ?? (data.component_ids || []).map(component_id => ({
+        component_id,
+        status: 'degraded_performance' as const,
+      })),
+    };
+    const res = await fetch(`${RUNBOOK_BASE}/statuspage/incident`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const json = await res.json();
+    if (!res.ok) return { error: json.error || `HTTP ${res.status}` };
+    return { result: json };
+  } catch {
+    return { error: 'Network error' };
+  }
+}
+
+export async function fetchStatuspageIncidents(): Promise<StatuspageIncident[]> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/statuspage/incidents`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function updateStatuspageIncident(id: string, data: {
+  name: string;
+  body: string;
+  status: string;
+  impact_override: string;
+  components: StatuspageComponentUpdate[];
+}): Promise<{ result?: StatuspageIncident; error?: string }> {
+  try {
+    const res = await fetch(`${RUNBOOK_BASE}/statuspage/incidents/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const json = await res.json();
+    if (!res.ok) return { error: json.error || `HTTP ${res.status}` };
+    return { result: json };
+  } catch {
+    return { error: 'Network error' };
+  }
+}
+
+// ── Admin: User Management ────────────────────────────
+
+export async function fetchUsers(): Promise<UserProfile[]> {
+  const res = await fetch('/api/auth/users', { credentials: 'include' });
+  const body = await readResponseBody(res);
+  if (!res.ok) throw new Error(extractResponseError(body, 'Failed to load users'));
+  return Array.isArray(body) ? body : [];
+}
+
+export async function createUser(username: string, display_name: string, password: string, role_id: number): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch('/api/auth/users', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, display_name, password, role_id }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, error: data.error || 'Failed' };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function updateUser(id: number, data: Partial<{ display_name: string; role_id: number; password: string }>): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/auth/users/${id}`, {
+      method: 'PUT', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const result = await res.json();
+    if (!res.ok) return { ok: false, error: result.error || 'Failed' };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function deleteUser(id: number): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/auth/users/${id}`, { method: 'DELETE', credentials: 'include' });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, error: data.error || 'Failed' };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// ── Admin: Role Management ────────────────────────────
+
+export async function fetchRoles(): Promise<Role[]> {
+  const res = await fetch('/api/auth/roles', { credentials: 'include' });
+  const body = await readResponseBody(res);
+  if (!res.ok) throw new Error(extractResponseError(body, 'Failed to load roles'));
+  return Array.isArray(body) ? body : [];
+}
+
+export async function createRole(name: string, description: string, permissions: string[]): Promise<{ ok: boolean; id?: number; error?: string }> {
+  try {
+    const res = await fetch('/api/auth/roles', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, description, permissions }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, error: data.error || 'Failed' };
+    return { ok: true, id: data.id };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function updateRole(id: number, data: Partial<{ name: string; description: string }>): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/auth/roles/${id}`, {
+      method: 'PUT', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const result = await res.json();
+    if (!res.ok) return { ok: false, error: result.error || 'Failed' };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function deleteRole(id: number): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/auth/roles/${id}`, { method: 'DELETE', credentials: 'include' });
+    const data = await res.json();
+    if (!res.ok) return { ok: false, error: data.error || 'Failed' };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function updateRolePermissions(id: number, permissions: string[]): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/auth/roles/${id}/permissions`, {
+      method: 'PUT', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ permissions }),
+    });
+    const result = await res.json();
+    if (!res.ok) return { ok: false, error: result.error || 'Failed' };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// ── Alert Rules ───────────────────────────────────────
+
+export interface AlertRule {
+  id: number;
+  name: string;
+  rule_type: 'routing' | 'highlight';
+  conditions_json: any;
+  expression_text: string;
+  action?: string;
+  action_params?: any;
+  color?: string;
+  label?: string;
+  priority: number;
+  enabled: boolean;
+  created_by: string;
+  created_at: string;
+}
+
+export async function fetchAlertRules(type?: 'routing' | 'highlight'): Promise<AlertRule[]> {
+  try {
+    const qs = type ? `?type=${type}` : '';
+    const res = await fetch(`/api/alert-states/rules${qs}`, { credentials: 'include' });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function createAlertRule(rule: Partial<AlertRule>): Promise<{ ok: boolean; id?: number; error?: string }> {
+  try {
+    const res = await fetch('/api/alert-states/rules', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(rule),
+    });
+    const data = await readResponseBody(res);
+    if (!res.ok) return { ok: false, error: extractResponseError(data, 'Failed to create rule') };
+    return { ok: true, id: data.id };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function updateAlertRule(id: number, updates: Partial<AlertRule>): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/alert-states/rules/${id}`, {
+      method: 'PUT', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    });
+    const data = await readResponseBody(res);
+    if (!res.ok) return { ok: false, error: extractResponseError(data, 'Failed to update rule') };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function deleteAlertRule(id: number): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/alert-states/rules/${id}`, { method: 'DELETE', credentials: 'include' });
+    const data = await readResponseBody(res);
+    if (!res.ok) return { ok: false, error: extractResponseError(data, 'Failed to delete rule') };
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+
+export const CONDITION_FIELDS = [
+  { value: 'hostname', label: 'Hostname' },
+  { value: 'name', label: 'Alert Name' },
+  { value: 'severity', label: 'Severity' },
+  { value: 'source', label: 'Source' },
+  { value: 'description', label: 'Description' },
+  { value: 'status', label: 'Status' },
+  { value: 'zabbixInstance', label: 'Zabbix Instance' },
+  { value: 'payload', label: 'Entire Payload' },
+];
+
+export const CONDITION_OPERATORS = [
+  { value: 'equals', label: '=' },
+  { value: 'not_equals', label: '!=' },
+  { value: 'contains', label: 'contains' },
+  { value: 'not_contains', label: 'not contains' },
+  { value: 'starts_with', label: 'starts with' },
+  { value: 'ends_with', label: 'ends with' },
+  { value: 'regex', label: 'regex' },
+  { value: '>=', label: '>=' },
+  { value: '<=', label: '<=' },
+  { value: '>', label: '>' },
+  { value: '<', label: '<' },
+];
+
+export const ALL_PERMISSIONS = [
+  { key: 'view_dashboard', label: 'View Dashboard', group: 'Views' },
+  { key: 'view_alerts', label: 'View Alerts', group: 'Views' },
+  { key: 'view_knowledge_base', label: 'View Knowledge Base', group: 'Views' },
+  { key: 'view_settings', label: 'View Settings', group: 'Views' },
+  { key: 'view_admin', label: 'View Admin', group: 'Views' },
+  { key: 'ack_alerts', label: 'Acknowledge Alerts', group: 'Alert Actions' },
+  { key: 'resolve_alerts', label: 'Resolve Alerts', group: 'Alert Actions' },
+  { key: 'silence_alerts', label: 'Silence Alerts', group: 'Alert Actions' },
+  { key: 'investigate_alerts', label: 'Investigate Alerts', group: 'Alert Actions' },
+  { key: 'escalate_alerts', label: 'Escalate Alerts', group: 'Alert Actions' },
+  { key: 'override_severity', label: 'Override Severity', group: 'Alert Actions' },
+  { key: 'create_tickets', label: 'Create Jira Tickets', group: 'Incidents' },
+  { key: 'create_incidents', label: 'Create Incidents', group: 'Incidents' },
+  { key: 'manage_routing_rules', label: 'Manage Routing Rules', group: 'Management' },
+  { key: 'manage_highlight_rules', label: 'Manage Highlight Rules', group: 'Management' },
+  { key: 'manage_users', label: 'Manage Users', group: 'Admin' },
+  { key: 'manage_roles', label: 'Manage Roles', group: 'Admin' },
+];
+
+/* ── Client-side highlight rule evaluator ── */
+
+const SEVERITY_ORDINAL: Record<string, number> = {
+  critical: 5, high: 4, warning: 3, low: 2, info: 1, unknown: 0,
+};
+
+function getAlertField(alert: Alert, field: string): string {
+  if (field === 'payload') {
+    return Object.values(alert).filter(v => typeof v === 'string').join(' ');
+  }
+  if (field === 'hostname') return alert.hostName || (alert as any).hostname || '';
+  return (alert as any)[field] ?? '';
+}
+
+function evaluateLeaf(alert: Alert, cond: { field: string; op: string; value: string }): boolean {
+  const raw = getAlertField(alert, cond.field);
+  const val = cond.value || '';
+
+  // Severity ordinal comparison
+  if (cond.field === 'severity' && ['>=', '<=', '>', '<'].includes(cond.op)) {
+    const a = SEVERITY_ORDINAL[raw.toLowerCase()] ?? 0;
+    const b = SEVERITY_ORDINAL[val.toLowerCase()] ?? 0;
+    switch (cond.op) {
+      case '>=': return a >= b;
+      case '<=': return a <= b;
+      case '>': return a > b;
+      case '<': return a < b;
+    }
+  }
+
+  const fieldLower = raw.toLowerCase();
+  const valLower = val.toLowerCase();
+
+  switch (cond.op) {
+    case 'equals': return fieldLower === valLower;
+    case 'not_equals': return fieldLower !== valLower;
+    case 'contains': return fieldLower.includes(valLower);
+    case 'not_contains': return !fieldLower.includes(valLower);
+    case 'starts_with': return fieldLower.startsWith(valLower);
+    case 'ends_with': return fieldLower.endsWith(valLower);
+    case 'regex':
+      try { return new RegExp(val, 'i').test(raw); } catch { return false; }
+    case '>=': return parseFloat(raw) >= parseFloat(val);
+    case '<=': return parseFloat(raw) <= parseFloat(val);
+    case '>': return parseFloat(raw) > parseFloat(val);
+    case '<': return parseFloat(raw) < parseFloat(val);
+    default: return false;
+  }
+}
+
+export function evaluateCondition(alert: Alert, condition: any): boolean {
+  if (!condition) return false;
+  if (condition.AND) {
+    return (condition.AND as any[]).every(c => evaluateCondition(alert, c));
+  }
+  if (condition.OR) {
+    return (condition.OR as any[]).some(c => evaluateCondition(alert, c));
+  }
+  if (condition.field && condition.op) {
+    return evaluateLeaf(alert, condition);
+  }
+  return false;
+}
+
+export interface HighlightMatch {
+  color: string;
+  label: string;
+  style: 'side' | 'box';
+}
+
+export function matchHighlightRules(alert: Alert, rules: AlertRule[]): HighlightMatch | null {
+  for (const rule of rules) {
+    if (!rule.enabled) continue;
+    const cond = typeof rule.conditions_json === 'string'
+      ? JSON.parse(rule.conditions_json)
+      : rule.conditions_json;
+    if (evaluateCondition(alert, cond)) {
+      return {
+        color: normalizeHighlightColor(rule.color),
+        label: rule.label || '',
+        style: rule.action_params?.highlight_style === 'box' ? 'box' : 'side',
+      };
+    }
+  }
+  return null;
+}
+
+async function internalStatuspageRequest(path: string, init?: RequestInit): Promise<any> {
+  const res = await fetch(`${RUNBOOK_BASE}/internal-statuspage${path}`, {
+    credentials: 'include',
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(init?.headers || {}),
+    },
+  });
+  const body = await readResponseBody(res);
+  if (!res.ok) {
+    throw new Error(extractResponseError(body, `Statuspage API ${res.status}`));
+  }
+  return body;
+}
+
+async function statuspageMutation(path: string, init?: RequestInit): Promise<{ ok: boolean; error?: string; result?: any }> {
+  try {
+    const result = await internalStatuspageRequest(path, init);
+    return { ok: true, result };
+  } catch (error: any) {
+    return { ok: false, error: error?.message || 'Network error' };
+  }
+}
+
+export async function fetchInternalStatuspageSummary(): Promise<any | null> {
+  try {
+    return await internalStatuspageRequest('/summary');
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchStatuspageSubscribers(): Promise<any[]> {
+  try {
+    const result = await internalStatuspageRequest('/subscribers');
+    return Array.isArray(result) ? result : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchStatuspageEmailDeliveries(): Promise<any[]> {
+  try {
+    const result = await internalStatuspageRequest('/email-deliveries');
+    return Array.isArray(result) ? result : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchStatuspageSmtpSettings(): Promise<any | null> {
+  try {
+    return await internalStatuspageRequest('/smtp');
+  } catch {
+    return null;
+  }
+}
+
+export async function addInternalStatuspageComponentGroup(data: {
+  name: string;
+  description?: string;
+  display_order?: number;
+}): Promise<{ ok: boolean; error?: string; result?: any }> {
+  return statuspageMutation('/component-groups', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function updateInternalStatuspageComponentGroup(
+  id: number,
+  data: any,
+): Promise<{ ok: boolean; error?: string; result?: any }> {
+  return statuspageMutation(`/component-groups/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function removeInternalStatuspageComponentGroup(id: number): Promise<{ ok: boolean; error?: string; result?: any }> {
+  return statuspageMutation(`/component-groups/${id}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function addInternalStatuspageComponent(data: {
+  name: string;
+  description?: string;
+  group_id?: number | null;
+  display_order?: number;
+  status?: string;
+}): Promise<{ ok: boolean; error?: string; result?: any }> {
+  return statuspageMutation('/components', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function updateInternalStatuspageComponent(
+  id: number,
+  data: any,
+): Promise<{ ok: boolean; error?: string; result?: any }> {
+  return statuspageMutation(`/components/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function removeInternalStatuspageComponent(id: number): Promise<{ ok: boolean; error?: string; result?: any }> {
+  return statuspageMutation(`/components/${id}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function addStatuspageSubscriber(
+  email: string,
+  label?: string,
+): Promise<{ ok: boolean; error?: string; result?: any }> {
+  return statuspageMutation('/subscribers', {
+    method: 'POST',
+    body: JSON.stringify({ email, label }),
+  });
+}
+
+export async function updateStatuspageSubscriber(
+  id: number,
+  data: any,
+): Promise<{ ok: boolean; error?: string; result?: any }> {
+  return statuspageMutation(`/subscribers/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function retryStatuspageEmailDelivery(id: number): Promise<{ ok: boolean; error?: string; result?: any }> {
+  return statuspageMutation(`/email-deliveries/${id}/retry`, {
+    method: 'POST',
+  });
+}
+
+export async function updateStatuspageSmtpSettings(data: {
+  host: string;
+  port: number;
+  tls: boolean;
+  username?: string;
+  password?: string;
+  email_from: string;
+}): Promise<{ ok: boolean; error?: string; result?: any }> {
+  return statuspageMutation('/smtp', {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function createInternalStatuspageIncident(data: {
+  title: string;
+  body: string;
+  status: string;
+  impact: string;
+  notify?: boolean;
+  components?: Array<{ component_id: number; status: string }>;
+}): Promise<{ ok: boolean; error?: string; result?: any }> {
+  return statuspageMutation('/incidents', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function updateInternalStatuspageIncident(
+  id: number,
+  data: {
+    status: string;
+    body: string;
+    notify?: boolean;
+    components?: Array<{ component_id: number; status: string }>;
+  },
+): Promise<{ ok: boolean; error?: string; result?: any }> {
+  return statuspageMutation(`/incidents/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  });
+}

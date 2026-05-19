@@ -1,0 +1,20 @@
+services:
+  uptime-watchdog:
+    build: ./uptime_watchdog
+    container_name: uip-uptime-watchdog
+    restart: unless-stopped
+    environment:
+      - TZ=America/New_York
+      - STATUS_URL=http://noc-escalation-bot:8095/status
+      - INTERVAL_SEC=60
+      - FAILURE_THRESHOLD=3
+      - ALERT_COOLDOWN_SEC=1800
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+      # Slack user ID for fash@tucowsinc.com — set in .env
+      - ALERT_USER_ID=${WATCHDOG_ALERT_USER_ID}
+    networks:
+      - uip_uip-net
+
+networks:
+  uip_uip-net:
+    external: true

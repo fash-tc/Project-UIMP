@@ -1,0 +1,66 @@
+services:
+  noc-escalation-bot:
+    build: ./noc_escalation_bot
+    restart: unless-stopped
+    environment:
+      # Log timestamps in America/New_York so operators don't have to mentally
+      # shift UTC. logging.Formatter's %(asctime)s uses time.localtime which
+      # honors $TZ. DST-aware via tzdata.
+      - TZ=America/New_York
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
+      - GRAFANA_IRM_URL=${GRAFANA_IRM_URL:-https://domains.grafana.net}
+      - GRAFANA_IRM_API_KEY=${GRAFANA_IRM_API_KEY}
+      - GRAFANA_IRM_INTEGRATION_ID=${GRAFANA_IRM_INTEGRATION_ID:-CUTX1LWEUGUVT}
+      - GRAFANA_IRM_ESCALATION_CHAIN_ID=${GRAFANA_IRM_ESCALATION_CHAIN_ID:-FJRRCKEYQ3U64}
+      - GRAFANA_IRM_ESCALATION_CHAIN_MANAGER_ID=${GRAFANA_IRM_ESCALATION_CHAIN_MANAGER_ID}
+      - GRAFANA_IRM_ONCALL_SCHEDULE_ID=${GRAFANA_IRM_ONCALL_SCHEDULE_ID:-SKZ9V6B14NTRQ}
+      # Grafana OnCall REST API (different host than direct_paging webhook,
+      # different token). Used only by the "On-Call" thread button.
+      - GRAFANA_ONCALL_API_URL=${GRAFANA_ONCALL_API_URL:-https://oncall-prod-us-central-0.grafana.net/oncall}
+      - GRAFANA_ONCALL_API_TOKEN=${GRAFANA_ONCALL_API_TOKEN}
+      - RE_ESCALATE_COOLDOWN_SEC=${RE_ESCALATE_COOLDOWN_SEC:-300}
+      - OPS_NOC_CHANNEL_ID=${OPS_NOC_CHANNEL_ID:-C3X2V0EJF}
+      - OPS_NOC_CHANNEL_NAME=${OPS_NOC_CHANNEL_NAME:-ops-noc}
+      - NOC_INFO_CHANNEL_ID=${NOC_INFO_CHANNEL_ID:-G6DHM1BSA}
+      - NOC_ALERTS_CHANNEL_ID=${NOC_ALERTS_CHANNEL_ID:-C05QF2QSY5T}
+      - TICKET_ALLOWED_CHANNEL_IDS=${TICKET_ALLOWED_CHANNEL_IDS:-C3X2V0EJF,G6DHM1BSA,C05QF2QSY5T}
+      - JIRA_BASE_URL=https://wiki-tucows.atlassian.net
+      - JIRA_EMAIL=${JIRA_EMAIL}
+      - JIRA_API_TOKEN=${JIRA_API_TOKEN}
+      - OCCIR_INCIDENT_ISSUETYPE_ID=${OCCIR_INCIDENT_ISSUETYPE_ID:-10333}
+      - OCCIR_TICKET_ISSUETYPE_ID=${OCCIR_TICKET_ISSUETYPE_ID}
+      - OLLAMA_URL=http://aicompute01.cnco1.tucows.cloud:31434
+      - OLLAMA_MODEL=${NOC_BOT_OLLAMA_MODEL:-qwen3-32b-thinking}
+      - CHANGE_TRACKER_OLLAMA_MODEL=${CHANGE_TRACKER_OLLAMA_MODEL:-qwen3-32b-thinking}
+      - CHANGE_TRACKER_OLLAMA_TIMEOUT_SEC=${CHANGE_TRACKER_OLLAMA_TIMEOUT_SEC:-5}
+      - ALERT_QA_ENABLED=${ALERT_QA_ENABLED:-false}
+      - ALERT_QA_ALLOWED_CHANNEL_ID=${ALERT_QA_ALLOWED_CHANNEL_ID:-}
+      - ALERT_QA_ALLOWED_CHANNEL_IDS=${ALERT_QA_ALLOWED_CHANNEL_IDS:-}
+      - ALERT_QA_TESTER_CHANNEL_ID=${ALERT_QA_TESTER_CHANNEL_ID:-C0ATG4P87QA}
+      - ALERT_QA_OLLAMA_MODEL=${ALERT_QA_OLLAMA_MODEL:-qwen3-32b-thinking}
+      - ALERT_QA_OLLAMA_TIMEOUT_SEC=${ALERT_QA_OLLAMA_TIMEOUT_SEC:-6}
+      - ALERT_QA_SOURCE_TIMEOUT_SEC=${ALERT_QA_SOURCE_TIMEOUT_SEC:-12}
+      - ALERT_QA_MAX_EVIDENCE=${ALERT_QA_MAX_EVIDENCE:-6}
+      - RUNBOOK_API_URL=${RUNBOOK_API_URL:-http://runbook-api:8090}
+      - CONFLUENCE_BASE_URL=${CONFLUENCE_BASE_URL:-https://wiki-tucows.atlassian.net}
+      - CONFLUENCE_EMAIL=${CONFLUENCE_EMAIL:-${JIRA_EMAIL}}
+      - CONFLUENCE_API_TOKEN=${CONFLUENCE_API_TOKEN:-${JIRA_API_TOKEN}}
+      - TURNOVER_OLLAMA_MODEL=${TURNOVER_OLLAMA_MODEL:-qwen3-32b-thinking}
+      - NOC_BOT_CONFIG_PATH=/data/config.json
+      - CHANGE_TRACKER_CHANNEL_ID=${CHANGE_TRACKER_CHANNEL_ID:-C0AT76PKANB}
+      - CHANGE_TRACKER_STATE_PATH=/data/change_tracker_state.json
+      - NOC_TURNOVER_CHANNEL_ID=${NOC_TURNOVER_CHANNEL_ID:-C0477H3BFHD}
+      - NOC_TURNOVER_DB_PATH=/data/noc_turnover.db
+      - UIP_DASHBOARD_URL=${UIP_DASHBOARD_URL:-https://uip.example.com/noc-bot#ongoing}
+    volumes:
+      - noc_bot_data:/data
+    networks:
+      - uip_uip-net
+
+volumes:
+  noc_bot_data:
+
+networks:
+  uip_uip-net:
+    external: true

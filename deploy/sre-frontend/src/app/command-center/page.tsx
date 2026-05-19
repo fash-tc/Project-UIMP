@@ -933,7 +933,7 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
           )}
         </div>
 
-        {/* Create Incident */}
+        {/* Create Ticket */}
         {incidentResult ? (
           <a
             href={incidentResult.url}
@@ -952,7 +952,7 @@ function AlertActions({ alert, enrichment, onAlertChanged, alertState, onInvesti
                 : 'border-border text-muted hover:border-accent/50 hover:text-accent hover:bg-accent/5'
             }`}
           >
-            Create Incident
+            Create Ticket
           </button>
         )}
 
@@ -1221,6 +1221,7 @@ function IncidentForm({ alert, enrichment, onCreated, onCancel }: {
       operationalServiceId: serviceId || undefined,
       alertLink: `http://10.177.154.196/portal/alerts/${alert.fingerprint}`,
       attachments: pastedImages.map(({ data, filename }) => ({ data, filename })),
+      occirWorkType: 'ticket',
     });
 
     setSubmitting(false);
@@ -1239,14 +1240,14 @@ function IncidentForm({ alert, enrichment, onCreated, onCancel }: {
       } catch {}
       onCreated(result.issueKey, result.issueUrl || '');
     } else {
-      setError(result.error || 'Failed to create incident');
+      setError(result.error || 'Failed to create ticket');
     }
   }
 
   return (
     <div className="bg-bg/60 border border-accent/20 rounded-lg p-4 space-y-3">
       <div className="flex items-center justify-between">
-        <h4 className="text-sm font-semibold text-accent">Create Jira Incident (OCCIR)</h4>
+        <h4 className="text-sm font-semibold text-accent">Create Jira Ticket (OCCIR)</h4>
         <button onClick={onCancel} className="text-muted hover:text-text text-xs transition-colors">Cancel</button>
       </div>
 
@@ -1339,7 +1340,7 @@ function IncidentForm({ alert, enrichment, onCreated, onCancel }: {
           disabled={submitting || !summary.trim()}
           className="px-4 py-1.5 rounded-md bg-accent text-bg font-medium text-xs hover:bg-accent-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          {submitting ? (pastedImages.length > 0 ? 'Creating & uploading...' : 'Creating...') : 'Create Incident'}
+          {submitting ? (pastedImages.length > 0 ? 'Creating & uploading...' : 'Creating...') : 'Create Ticket'}
         </button>
       </div>
     </div>
@@ -1365,7 +1366,7 @@ function RunbookPanel({ alert }: { alert: Alert }) {
         setMatches(entries);
         const entryIds = entries.map((e: RunbookEntry) => e.id).filter(Boolean) as number[];
         if (entryIds.length > 0) {
-          fetchRunbookFeedback(entryIds).then((feedback: RunbookFeedback[]) => {
+          fetchRunbookFeedback(entryIds, alert.fingerprint).then((feedback: RunbookFeedback[]) => {
             const voteMap = new Map<string, 'up' | 'down'>();
             for (const fb of feedback) {
               voteMap.set(`${fb.runbook_entry_id}`, fb.vote);
@@ -1424,7 +1425,7 @@ function RunbookPanel({ alert }: { alert: Alert }) {
         setMatches(entries);
         const entryIds = entries.map((e: RunbookEntry) => e.id).filter(Boolean) as number[];
         if (entryIds.length > 0) {
-          fetchRunbookFeedback(entryIds).then((feedback: RunbookFeedback[]) => {
+          fetchRunbookFeedback(entryIds, alert.fingerprint).then((feedback: RunbookFeedback[]) => {
             const voteMap = new Map<string, 'up' | 'down'>();
             for (const fb of feedback) {
               voteMap.set(`${fb.runbook_entry_id}`, fb.vote);

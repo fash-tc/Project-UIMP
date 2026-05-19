@@ -46,6 +46,8 @@ export async function middleware(request: NextRequest) {
   if (
     pathname === '/login' ||
     pathname === '/login/' ||
+    pathname === '/status' ||
+    pathname === '/status/' ||
     pathname.startsWith('/_next/') ||
     pathname.startsWith('/favicon')
   ) {

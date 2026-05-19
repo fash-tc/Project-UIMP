@@ -61,7 +61,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1536M
+          memory: 2048M
           cpus: "2.0"
     networks:
       - uip-net
@@ -93,22 +93,6 @@ services:
     networks:
       - uip-net
 
-  # ============================================
-  # Ollama - Local LLM Inference
-  # ============================================
-  ollama:
-    image: ollama/ollama:latest
-    container_name: uip-ollama
-    restart: unless-stopped
-    volumes:
-      - ollama_data:/root/.ollama
-    deploy:
-      resources:
-        limits:
-          memory: 4096M
-          cpus: "4.0"
-    networks:
-      - uip-net
 
   # ============================================
   # Alert Enricher - Enhanced AI Analysis
@@ -121,7 +105,7 @@ services:
     volumes:
       - ./enricher/enricher.py:/app/enricher.py:ro
     environment:
-      OLLAMA_URL: http://ollama:11434
+      OLLAMA_URL: ${OLLAMA_URL:-http://aicompute01.cnco1.tucows.cloud:31434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
       KEEP_URL: http://keep-api:8080
       KEEP_API_KEY: ${KEEP_API_KEY}
@@ -243,6 +227,7 @@ services:
     command: python3 -u /app/runbook-api.py
     volumes:
       - ./runbook-api/runbook-api.py:/app/runbook-api.py:ro
+      - ./runbook-api/backfill_rag.py:/app/backfill_rag.py:ro
       - runbook_data:/data
     environment:
       API_PORT: "8090"
@@ -251,6 +236,10 @@ services:
       JIRA_BASE_URL: "https://wiki-tucows.atlassian.net"
       JIRA_EMAIL: "${JIRA_EMAIL}"
       JIRA_API_TOKEN: "${JIRA_API_TOKEN}"
+      OCCIR_INCIDENT_ISSUETYPE_ID: "${OCCIR_INCIDENT_ISSUETYPE_ID:-10333}"
+      OCCIR_TICKET_ISSUETYPE_ID: "${OCCIR_TICKET_ISSUETYPE_ID}"
+      RAG_SEARCH_URL: "${RAG_SEARCH_URL:-http://aicompute01.cnco1.tucows.cloud:31445}"
+      RAG_COLLECTION: "${RAG_COLLECTION:-sre_runbooks}"
     deploy:
       resources:
         limits:
@@ -331,6 +320,41 @@ services:
       - uip-net
 
   # ============================================
+  # OpenSRS Health API - Log-derived health reports
+  # ============================================
+  opensrs-health-api:
+    image: python:3.12-slim
+    container_name: uip-opensrs-health-api
+    restart: unless-stopped
+    command: python3 -u /app/opensrs-health-api.py
+    volumes:
+      - ./opensrs-health-api/opensrs-health-api.py:/app/opensrs-health-api.py:ro
+      - opensrs_health_data:/data
+    environment:
+      API_PORT: "8095"
+      DB_PATH: /data/opensrs-health.db
+      AUTH_SECRET: "${AUTH_SECRET}"
+      GRAFANA_URL: "https://grafana.prod-domains-shared.bra2.tucows.systems"
+      GRAFANA_USER: "${GRAFANA_USER}"
+      GRAFANA_PASS: "${GRAFANA_PASS}"
+      LOKI_DATASOURCE_ID: "17"
+      AI_API_BASE: "${OPENAI_API_BASE:-http://aicompute01.cnco1.tucows.cloud:31434/v1}"
+      AI_MODEL: "${OPENAI_MODEL:-qwen-assistant:latest}"
+      AI_API_KEY: "${OPENAI_API_KEY:-}"
+      AI_MAX_TOKENS: "4096"
+      MAX_ENTRIES_PER_QUERY: "500"
+      MAX_SAMPLES_PER_LANE: "20"
+      COOLDOWN_SECONDS: "60"
+      REPORT_RETENTION: "100"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+    networks:
+      - uip-net
+
+  # ============================================
   # Escalation API — Grafana IRM Integration
   # ============================================
   escalation-api:
@@ -363,7 +387,7 @@ services:
     ports:
       - "80:80"
     volumes:
-      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx-default.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - keep-api
       - keep-frontend
@@ -374,6 +398,7 @@ services:
       - auth-api
       - alert-state-api
       - loki-gateway
+      - opensrs-health-api
       - escalation-api
     deploy:
       resources:
@@ -386,11 +411,11 @@ services:
 volumes:
   postgres_data:
   keep_secrets:
-  ollama_data:
   n8n_data:
   runbook_data:
   auth_data:
   alert_state_data:
+  opensrs_health_data:
 
 networks:
   uip-net:

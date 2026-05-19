@@ -28,7 +28,15 @@ DB_PATH = os.environ.get("DB_PATH", "/data/runbook.db")
 JIRA_BASE_URL = os.environ.get("JIRA_BASE_URL", "")
 JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "")
 JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
+OCCIR_INCIDENT_ISSUETYPE_ID = os.environ.get("OCCIR_INCIDENT_ISSUETYPE_ID", "10333")
+OCCIR_TICKET_ISSUETYPE_ID = os.environ.get("OCCIR_TICKET_ISSUETYPE_ID", "")
 AUTH_SECRET = os.environ.get("AUTH_SECRET", "")
+RAG_SEARCH_URL = os.environ.get("RAG_SEARCH_URL", "").rstrip("/")
+RAG_COLLECTION = os.environ.get("RAG_COLLECTION", "sre_runbooks")
+RAG_TIMEOUT = float(os.environ.get("RAG_TIMEOUT", "8"))
+# Reciprocal-rank-fusion constant. 60 is the value from the original Cormack paper
+# and is the conventional default; lower values weight high-ranked matches more.
+RRF_K = int(os.environ.get("RRF_K", "60"))
 
 STOP_WORDS = {
     "on", "the", "is", "for", "at", "in", "a", "an", "not", "to",
@@ -213,6 +221,140 @@ def row_to_dict(row):
     return dict(row)
 
 
+# ── RAG Integration ──────────────────────────────────
+#
+# Best-effort calls into the cluster's rag-search service for semantic
+# matching alongside the existing keyword score. All failures are logged and
+# swallowed so the API stays available when rag-search is down.
+
+def _rag_text(alert_name, remediation):
+    """The text we embed: alert + a trimmed slice of remediation."""
+    rem = (remediation or "").strip()
+    if len(rem) > 1500:
+        rem = rem[:1500]
+    return f"{(alert_name or '').strip()}\n\n{rem}".strip()
+
+
+def _rag_post(path, body, timeout=None):
+    if not RAG_SEARCH_URL:
+        return None
+    payload = json.dumps(body).encode()
+    req = Request(
+        f"{RAG_SEARCH_URL}{path}",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=timeout or RAG_TIMEOUT) as resp:
+            return json.loads(resp.read())
+    except (HTTPError, URLError, Exception) as exc:
+        log.warning(f"rag-search {path} failed: {exc}")
+        return None
+
+
+def rag_upsert(entry):
+    """Best-effort upsert of a runbook entry into pgvector."""
+    if not RAG_SEARCH_URL:
+        return
+    text = _rag_text(entry.get("alert_name"), entry.get("remediation"))
+    if not text:
+        return
+    metadata = {
+        "hostname": (entry.get("hostname") or "").lower(),
+        "service": (entry.get("service") or "").lower(),
+        "severity": (entry.get("severity") or "").lower(),
+    }
+    _rag_post(
+        f"/v1/collections/{RAG_COLLECTION}/upsert",
+        {"id": int(entry["id"]), "text": text, "metadata": metadata},
+        timeout=15,
+    )
+
+
+def rag_delete(entry_id):
+    """Best-effort removal of a runbook id from pgvector."""
+    if not RAG_SEARCH_URL:
+        return
+    _rag_post(
+        f"/v1/collections/{RAG_COLLECTION}/delete",
+        {"ids": [int(entry_id)]},
+        timeout=10,
+    )
+
+
+def rag_search(alert_name, top_k):
+    """Return [(id, dense_score), ...] sorted by descending similarity."""
+    if not RAG_SEARCH_URL or not alert_name:
+        return []
+    resp = _rag_post(
+        f"/v1/collections/{RAG_COLLECTION}/search",
+        {"query": alert_name, "top_k": top_k},
+    )
+    if not resp:
+        return []
+    out = []
+    for r in resp.get("results", []):
+        try:
+            out.append((int(r["id"]), float(r.get("score") or 0.0)))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def match_entries_hybrid(db, alert_name, hostname=None, service=None, limit=10):
+    """
+    Hybrid matcher: combines the existing keyword score with semantic recall
+    from rag-search via reciprocal rank fusion. If rag-search is unreachable
+    or disabled, this degrades to the pure keyword behaviour.
+
+    Returns the same shape as match_entries — entry dicts with `score` — but
+    the `score` here is the RRF combination, and we also include `score_kw`
+    and `score_dense` so callers can debug.
+    """
+    keyword_hits = match_entries(db, alert_name, hostname, service, limit=max(limit * 3, 30))
+    dense_hits = rag_search(alert_name, top_k=max(limit * 3, 30))
+
+    # rank dicts: id -> 1-based rank in the respective list
+    kw_rank = {row["id"]: i + 1 for i, row in enumerate(keyword_hits)}
+    dense_rank = {entry_id: i + 1 for i, (entry_id, _) in enumerate(dense_hits)}
+
+    # fetch any dense-only ids that the keyword scan didn't surface, so we
+    # have full row data for the merged response
+    extra_ids = [eid for eid in dense_rank if eid not in kw_rank]
+    extra_rows = {}
+    if extra_ids:
+        placeholders = ",".join("?" * len(extra_ids))
+        cursor = db.execute(
+            f"SELECT * FROM runbook_entries WHERE id IN ({placeholders})", extra_ids
+        )
+        for r in cursor.fetchall():
+            extra_rows[r["id"]] = dict(r)
+
+    candidates = {row["id"]: dict(row) for row in keyword_hits}
+    candidates.update(extra_rows)
+    if not candidates:
+        return []
+
+    kw_score_by_id = {row["id"]: row.get("score", 0) for row in keyword_hits}
+    dense_score_by_id = dict(dense_hits)
+
+    merged = []
+    for entry_id, row in candidates.items():
+        rrf = 0.0
+        if entry_id in kw_rank:
+            rrf += 1.0 / (RRF_K + kw_rank[entry_id])
+        if entry_id in dense_rank:
+            rrf += 1.0 / (RRF_K + dense_rank[entry_id])
+        row["score"] = round(rrf, 6)
+        row["score_kw"] = kw_score_by_id.get(entry_id, 0)
+        row["score_dense"] = round(dense_score_by_id.get(entry_id, 0.0), 4)
+        merged.append(row)
+
+    merged.sort(key=lambda x: (-x["score"], -x["id"]))
+    return merged[:limit]
+
+
 # ── Jira Integration ─────────────────────────────────
 
 def text_to_adf(text):
@@ -234,18 +376,33 @@ def text_to_adf(text):
     return {"type": "doc", "version": 1, "content": content}
 
 
+def resolve_occir_issue_type_id(work_type):
+    normalized = (work_type or "incident").strip().lower()
+    if normalized == "ticket":
+        if not OCCIR_TICKET_ISSUETYPE_ID:
+            return None, "OCCIR Ticket work type is not configured"
+        return OCCIR_TICKET_ISSUETYPE_ID, None
+    return OCCIR_INCIDENT_ISSUETYPE_ID, None
+
+
 def create_jira_incident(data, jira_email=None, jira_api_token=None):
-    """Create a Jira incident in the OCCIR project."""
+    """Create an OCCIR Jira issue using the requested work type."""
     email = jira_email or JIRA_EMAIL
     token = jira_api_token or JIRA_API_TOKEN
     if not all([JIRA_BASE_URL, email, token]):
         return None, "Jira integration not configured"
 
+    issue_type_id, issue_type_error = resolve_occir_issue_type_id(
+        data.get("occir_work_type")
+    )
+    if issue_type_error:
+        return None, issue_type_error
+
     auth = base64.b64encode(f"{email}:{token}".encode()).decode()
 
     fields = {
         "project": {"key": "OCCIR"},
-        "issuetype": {"id": "10333"},
+        "issuetype": {"id": issue_type_id},
         "summary": (data.get("summary") or "")[:255],
         "description": text_to_adf(data.get("description") or ""),
     }
@@ -387,7 +544,7 @@ class RunbookHandler(BaseHTTPRequestHandler):
             hostname = params.get("hostname", [None])[0]
             service = params.get("service", [None])[0]
             limit = min(int(params.get("limit", ["10"])[0]), 20)
-            results = match_entries(db, alert_name, hostname, service, limit)
+            results = match_entries_hybrid(db, alert_name, hostname, service, limit)
             self._send_json(200, results)
 
         elif path == "/api/runbook/entries":
@@ -524,6 +681,14 @@ class RunbookHandler(BaseHTTPRequestHandler):
             db.commit()
             entry_id = cursor.lastrowid
             log.info(f"Created runbook entry #{entry_id}: {alert_name[:60]}")
+            rag_upsert({
+                "id": entry_id,
+                "alert_name": alert_name,
+                "remediation": remediation,
+                "hostname": data.get("hostname"),
+                "service": data.get("service"),
+                "severity": data.get("severity"),
+            })
             self._send_json(201, {"id": entry_id, "status": "created"})
 
         elif path == "/api/runbook/feedback":
@@ -679,6 +844,7 @@ class RunbookHandler(BaseHTTPRequestHandler):
             db.commit()
             if cursor.rowcount > 0:
                 log.info(f"Deleted runbook entry #{entry_id}")
+                rag_delete(entry_id)
                 self._send_json(200, {"status": "deleted"})
             else:
                 self._send_json(404, {"error": "not found"})

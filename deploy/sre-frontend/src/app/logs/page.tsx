@@ -1,7 +1,9 @@
 'use client';
 
-import { useState, useCallback, useRef, useEffect } from 'react';
-import { queryLokiLogs, LogEntry, timeAgo } from '@/lib/keep-api';
+import { useState, useCallback, useRef } from 'react';
+import { analyzeOpenSRSLogs, queryLokiLogs, LogEntry } from '@/lib/keep-api';
+import { OpenSRSHealthDashboard } from '@/app/opensrs-health/OpenSRSHealthDashboard';
+import { OpenSRSLogAnalysisResult } from '@/lib/types';
 
 const PRESETS = [
   { label: 'Registry Timing', query: '{app="ra"} |~ "total="' },
@@ -32,6 +34,14 @@ function formatTs(ts: string): string {
   }
 }
 
+function formatRangeSeconds(seconds: number): string {
+  const known = TIME_RANGES.find((item) => item.seconds === seconds);
+  if (known) return known.label;
+  if (seconds >= 3600) return `${Math.round(seconds / 3600)}h`;
+  if (seconds >= 60) return `${Math.round(seconds / 60)}m`;
+  return `${seconds}s`;
+}
+
 function classifyLine(message: string): 'error' | 'slow' | 'normal' {
   if (/with\s+resp\s+[45]\d{2}/.test(message)) return 'error';
   if (/result code="[2-9]\d{3}"/.test(message)) return 'error';
@@ -42,6 +52,7 @@ function classifyLine(message: string): 'error' | 'slow' | 'normal' {
 }
 
 export default function LogsPage() {
+  const [activeTab, setActiveTab] = useState<'logs' | 'opensrs-health'>('logs');
   const [query, setQuery] = useState(PRESETS[0].query);
   const [activePreset, setActivePreset] = useState(0);
   const [range, setRange] = useState(3600);
@@ -53,6 +64,10 @@ export default function LogsPage() {
   const [hasQueried, setHasQueried] = useState(false);
   const [filter, setFilter] = useState('');
   const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set());
+  const [aiQuestion, setAiQuestion] = useState('where are errors or slowness?');
+  const [aiLogAnalysis, setAiLogAnalysis] = useState<OpenSRSLogAnalysisResult | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const runQuery = useCallback(async () => {
@@ -99,6 +114,25 @@ export default function LogsPage() {
     });
   };
 
+  const askAI = useCallback(async () => {
+    setAiLoading(true);
+    setAiError(null);
+    try {
+      const result = await analyzeOpenSRSLogs({
+        query: '',
+        rangeSeconds: range,
+        limit,
+        question: aiQuestion.trim() || 'where are errors or slowness?',
+      });
+      setAiLogAnalysis(result);
+    } catch (e: unknown) {
+      setAiError(e instanceof Error ? e.message : 'AI log analysis failed');
+      setAiLogAnalysis(null);
+    } finally {
+      setAiLoading(false);
+    }
+  }, [aiQuestion, limit, range]);
+
   // No auto-run — user clicks "Run Query" to start
 
   const filtered = filter
@@ -119,6 +153,27 @@ export default function LogsPage() {
         </div>
       </div>
 
+      <div className="flex gap-1 bg-zinc-800/50 p-1 rounded-lg w-fit">
+        <button
+          onClick={() => setActiveTab('logs')}
+          className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+            activeTab === 'logs' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-white'
+          }`}
+        >
+          Logs Explorer
+        </button>
+        <button
+          onClick={() => setActiveTab('opensrs-health')}
+          className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+            activeTab === 'opensrs-health' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-white'
+          }`}
+        >
+          OpenSRS Health
+        </button>
+      </div>
+
+      {activeTab === 'logs' ? (
+        <>
       {/* Query controls */}
       <div className="bg-surface border border-border rounded-lg p-4 space-y-3">
         {/* Presets row */}
@@ -199,6 +254,32 @@ export default function LogsPage() {
             {loading ? 'Querying...' : 'Run Query'}
           </button>
         </div>
+      </div>
+
+      <div className="bg-surface border border-border rounded-lg p-4 space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-semibold text-text-bright">AI log analysis</h2>
+            <div className="text-xs text-muted mt-0.5">Uses current LogQL, range, and capped read-only samples.</div>
+          </div>
+          <button
+            onClick={askAI}
+            disabled={aiLoading || !query.trim()}
+            className="px-4 py-1.5 text-xs font-medium rounded-md bg-accent text-white hover:bg-accent/90 disabled:opacity-40 transition-colors"
+          >
+            {aiLoading ? 'Analyzing...' : 'Ask AI'}
+          </button>
+        </div>
+        <input
+          value={aiQuestion}
+          onChange={(e) => setAiQuestion(e.target.value)}
+          placeholder="Ask about slowness, errors, hosts, registry agents, actions..."
+          className="w-full bg-bg border border-border rounded-md px-3 py-2 text-sm text-text-bright placeholder:text-muted/50 focus:outline-none focus:border-accent/50"
+        />
+        {aiError && (
+          <div className="bg-red/10 border border-red/30 rounded-md px-3 py-2 text-xs text-red">{aiError}</div>
+        )}
+        {aiLogAnalysis && <LogAIAnalysis result={aiLogAnalysis} />}
       </div>
 
       {/* Error */}
@@ -291,6 +372,128 @@ export default function LogsPage() {
           )}
         </div>
       )}
+        </>
+      ) : (
+        <OpenSRSHealthDashboard />
+      )}
     </div>
   );
+}
+
+function LogAIAnalysis({ result }: { result: OpenSRSLogAnalysisResult }) {
+  const analysis = result.analysis || {};
+  const evidence = result.evidence;
+  const answer = typeof analysis.answer === 'string' ? analysis.answer : '';
+  const findings = Array.isArray(analysis.findings) ? analysis.findings : [];
+  const likelyCauses = Array.isArray(analysis.likely_causes) ? analysis.likely_causes : [];
+  const recommendedActions = Array.isArray(analysis.recommended_sre_actions) ? analysis.recommended_sre_actions : [];
+  const problemAreas = Array.isArray(evidence.problem_areas) ? evidence.problem_areas : [];
+  const latencyAreas = Array.isArray(evidence.latency_areas) ? evidence.latency_areas : [];
+  const tldAreas = Array.isArray(evidence.tld_areas) ? evidence.tld_areas : [];
+  const scope = evidence.access_scope;
+  const warning = typeof analysis.warning === 'string' ? analysis.warning : '';
+  const rawFormat = typeof analysis.raw_format === 'string' ? analysis.raw_format : '';
+
+  return (
+    <div className="border border-border/50 rounded-md bg-bg/30 p-4 space-y-4">
+      {scope && (
+        <div className="rounded-md border border-border/60 bg-bg/40 p-3 space-y-2">
+          <div className="text-xs font-medium text-muted uppercase">Data scope - AI-selected query</div>
+          <div className="font-mono text-xs text-text-bright break-all">{scope.query}</div>
+          <div className="text-xs text-muted">
+            Source: {scope.source || 'Grafana Loki'} / Range: {formatRangeSeconds(scope.range_seconds)} / Analyzed: {scope.entries_analyzed} entries / Cap: {scope.sample_cap || evidence.entries_analyzed}
+          </div>
+        </div>
+      )}
+      {answer ? (
+        <div className="text-sm leading-6 text-text-bright whitespace-pre-wrap">{answer}</div>
+      ) : typeof analysis.summary === 'string' ? (
+        <div className="text-sm leading-6 text-text-bright whitespace-pre-wrap">{analysis.summary}</div>
+      ) : analysis.error ? (
+        <div className="text-sm text-red">{String(analysis.error)}</div>
+      ) : (
+        <div className="text-sm text-muted">No AI answer was returned for this query.</div>
+      )}
+      {findings.length > 0 && (
+        <div className="space-y-1">
+          <div className="text-xs font-medium text-muted uppercase">What it sees</div>
+          {findings.slice(0, 6).map((item, idx) => (
+            <div key={idx} className="text-xs text-text-bright">
+              {formatAnalysisItem(item)}
+            </div>
+          ))}
+        </div>
+      )}
+      {tldAreas.length > 0 && (
+        <div className="space-y-1.5">
+          <div className="text-xs font-medium text-muted uppercase">Top TLD latency</div>
+          {tldAreas.slice(0, 4).map((area) => (
+            <div key={area.key} className="border-l-2 border-yellow/60 pl-3 py-1">
+              <div className="font-mono text-xs text-text-bright break-all">{area.key}</div>
+              <div className="text-xs text-muted mt-1">
+                {area.events} events / avg {area.avg_latency_ms ?? '--'}ms / p95 {area.p95_latency_ms ?? '--'}ms / {area.failures} failures / {area.timeouts} timeouts / {area.slow} slow
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {latencyAreas.length > 0 && (
+        <div className="space-y-1.5">
+          <div className="text-xs font-medium text-muted uppercase">Top latency paths</div>
+          {latencyAreas.slice(0, 4).map((area) => (
+            <div key={area.key} className="border-l-2 border-yellow/50 pl-3 py-1">
+              <div className="font-mono text-xs text-text-bright break-all">{area.key}</div>
+              <div className="text-xs text-muted mt-1">
+                {area.events} events / avg {area.avg_latency_ms ?? '--'}ms / p95 {area.p95_latency_ms ?? '--'}ms / {area.failures} failures / {area.timeouts} timeouts / {area.slow} slow
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {problemAreas.length > 0 && (
+        <div className="space-y-1.5">
+          <div className="text-xs font-medium text-muted uppercase">Where it found problems</div>
+          {problemAreas.slice(0, 4).map((area) => (
+            <div key={area.key} className="border-l-2 border-accent/50 pl-3 py-1">
+              <div className="font-mono text-xs text-text-bright break-all">{area.key}</div>
+              <div className="text-xs text-muted mt-1">
+                {area.events} events · {area.failures} failures · {area.timeouts} timeouts · {area.slow} slow · p95 {area.p95_latency_ms ?? '--'}ms
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {likelyCauses.length > 0 && <AnalysisSection title="Likely causes" items={likelyCauses} />}
+      {recommendedActions.length > 0 && <AnalysisSection title="Suggested SRE checks" items={recommendedActions} />}
+      <div className="text-[11px] text-muted border-t border-border/50 pt-3">
+        Evidence used: {evidence.entries_analyzed} entries, {evidence.failures} failures, {evidence.timeouts} timeouts, {evidence.slow} slow.
+        {rawFormat === 'json' && ' Model returned JSON; displayed answer was normalized to plain text.'}
+        {warning && ` ${warning}`}
+      </div>
+    </div>
+  );
+}
+
+function AnalysisSection({ title, items }: { title: string; items: unknown[] }) {
+  return (
+    <div className="space-y-1">
+      <div className="text-xs font-medium text-muted uppercase">{title}</div>
+      {items.slice(0, 6).map((item, idx) => (
+        <div key={idx} className="text-xs text-text-bright">
+          {formatAnalysisItem(item)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function formatAnalysisItem(item: unknown) {
+  if (typeof item === 'string') return item;
+  if (item && typeof item === 'object') {
+    const values = Object.values(item as Record<string, unknown>)
+      .filter(value => typeof value === 'string' || typeof value === 'number')
+      .map(String);
+    if (values.length > 0) return values.join(' - ');
+  }
+  return String(item ?? '');
 }
