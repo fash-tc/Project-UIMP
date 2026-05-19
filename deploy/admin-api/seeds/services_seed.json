@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "restartable_containers": [
+    "uip-alert-enricher",
+    "uip-alert-state-api",
+    "uip-auth-api",
+    "uip-escalation-api",
+    "uip-health-checker",
+    "uip-loki-gateway",
+    "uip-noc-escalation-bot-1",
+    "uip-opensrs-health-api",
+    "uip-runbook-api",
+    "uip-sre-frontend",
+    "uip-statuspage-api",
+    "uip-uptime-watchdog"
+  ],
+  "notes": [
+    "Allowlist for docker restart endpoint (§5.6). Container names verified live on server 2026-05-19.",
+    "uip-keep-api, uip-keep-ui, uip-nginx, uip-postgres, uip-open-webui, uip-n8n, portainer intentionally excluded — restart via SSH only.",
+    "uip-admin-api self-exclusion is enforced in docker_ops.py regardless of seed."
+  ]
+}

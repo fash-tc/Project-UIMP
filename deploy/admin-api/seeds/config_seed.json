@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "keys": {
+    "ai.cluster.endpoint": {
+      "scope": "ai",
+      "value_type": "string",
+      "default": "http://aicompute01.cnco1.tucows.cloud:31434",
+      "reload_kind": "hot",
+      "description": "Base URL of the AI compute cluster.",
+      "validation": {"regex": "^https?://[a-zA-Z0-9.\\-]+(:[0-9]+)?(/.*)?$"},
+      "is_secret": false,
+      "env_legacy": "OLLAMA_URL",
+      "consumed_by": ["alert-enricher", "noc-escalation-bot", "opensrs-health-api"]
+    },
+    "ai.enricher.model": {
+      "scope": "ai",
+      "value_type": "string",
+      "default": "qwen3-32b-thinking",
+      "reload_kind": "hot",
+      "description": "Model name for alert-enricher LLM calls.",
+      "validation": null,
+      "is_secret": false,
+      "env_legacy": "OLLAMA_MODEL",
+      "consumed_by": ["alert-enricher"]
+    },
+    "pipeline.enricher.poll_interval_sec": {
+      "scope": "pipeline",
+      "value_type": "int",
+      "default": 60,
+      "reload_kind": "hot",
+      "description": "Seconds between enricher poll cycles.",
+      "validation": {"min": 5, "max": 3600},
+      "is_secret": false,
+      "env_legacy": "POLL_INTERVAL",
+      "consumed_by": ["alert-enricher"]
+    },
+    "features.admin.ai_sandbox": {
+      "scope": "features",
+      "value_type": "bool",
+      "default": true,
+      "reload_kind": "hot",
+      "description": "Allow the /admin/ai sandbox to send test requests to the cluster.",
+      "validation": null,
+      "is_secret": false,
+      "env_legacy": null,
+      "consumed_by": ["admin-api"]
+    }
+  },
+  "notes": [
+    "v1 seed deliberately minimal. Slices 2-7 will add their own keys via seed bumps + migrations.",
+    "Every entry must include: scope, value_type, default, reload_kind, description, validation, is_secret, env_legacy, consumed_by.",
+    "env_legacy is null when the key has no historical env-var equivalent."
+  ]
+}
