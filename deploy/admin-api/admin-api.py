@@ -18,7 +18,10 @@ log = logging.getLogger("admin-api")
 API_PORT = int(os.environ.get("API_PORT", "8096"))
 DB_PATH = os.environ.get("DB_PATH", "/data/admin.db")
 AUTH_API_URL = os.environ.get("AUTH_API_URL", "http://auth-api:8093")
-AUTH_SECRET = os.environ["AUTH_SECRET"]  # required; crash fast if missing
+try:
+    AUTH_SECRET = os.environ["AUTH_SECRET"]
+except KeyError:
+    sys.exit("AUTH_SECRET environment variable is required")
 ADMIN_BYPASS_TOKEN = os.environ.get("ADMIN_BYPASS_TOKEN") or None
 CLUSTER_ENDPOINT = os.environ.get("CLUSTER_ENDPOINT", "")
 
@@ -45,13 +48,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     log.info("admin-api starting on :%s (DB=%s)", API_PORT, DB_PATH)
-    server = ThreadingHTTPServer(("0.0.0.0", API_PORT), Handler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        log.info("admin-api stopped")
-        server.shutdown()
+    with ThreadingHTTPServer(("0.0.0.0", API_PORT), Handler) as server:
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            log.info("admin-api stopped")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
