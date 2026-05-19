@@ -97,9 +97,14 @@ deploy/admin-api/
 └── tests/
     ├── conftest.py                   # pytest fixtures (temp DB, fake auth-api)
     ├── test_db.py
-    ├── test_secrets.py
+    ├── test_seeds.py
+    ├── test_secretbox.py
+    ├── test_health.py
+    ├── test_auth.py
+    ├── test_routes_common.py
     ├── test_routes_config.py
-    └── test_routes_audit.py
+    ├── test_routes_audit.py
+    └── test_build_schemas.py
 
 deploy/uip_config_client/
 ├── __init__.py                       # exports ConfigClient, KeySchema
@@ -223,7 +228,7 @@ def admin_api_server():
             proc.kill()
             out_text = "(timed out reading admin-api stdout)"
         raise RuntimeError(f"admin-api failed to start. Output:\n{out_text}")
-    yield port, proc
+    yield port, proc, db_path
     proc.terminate()
     try:
         # communicate() drains stdout/stderr and reaps the process; safe even
@@ -252,7 +257,7 @@ import urllib.request
 
 
 def test_health_endpoint_returns_200(admin_api_server):
-    port, _ = admin_api_server
+    port, _, _db_path = admin_api_server
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as r:
         assert r.status == 200
         body = r.read().decode()
@@ -1454,7 +1459,7 @@ import time
 
 
 def test_sse_events_endpoint_streams(admin_api_server):
-    port, _ = admin_api_server
+    port, _, _db_path = admin_api_server
 
     received = []
 
@@ -1942,7 +1947,7 @@ def _call(port, method, path, body=None, headers=None):
 
 
 def test_get_config_lists_seeded_keys(admin_api_server):
-    port, _ = admin_api_server
+    port, _, _db_path = admin_api_server
     status, body = _call(port, "GET", "/api/admin/config")
     assert status == 200
     keys = {item["key"] for item in body["items"]}
@@ -1950,7 +1955,7 @@ def test_get_config_lists_seeded_keys(admin_api_server):
 
 
 def test_get_config_filtered_by_scope(admin_api_server):
-    port, _ = admin_api_server
+    port, _, _db_path = admin_api_server
     status, body = _call(port, "GET", "/api/admin/config?scope=ai")
     assert status == 200
     assert all(item["key"].startswith("ai.") for item in body["items"])
@@ -1958,7 +1963,7 @@ def test_get_config_filtered_by_scope(admin_api_server):
 
 
 def test_get_single_key(admin_api_server):
-    port, _ = admin_api_server
+    port, _, _db_path = admin_api_server
     status, body = _call(port, "GET", "/api/admin/config/ai.cluster.endpoint")
     assert status == 200
     assert body["key"] == "ai.cluster.endpoint"
@@ -1966,7 +1971,7 @@ def test_get_single_key(admin_api_server):
 
 
 def test_patch_writes_history_and_broadcasts(admin_api_server):
-    port, _ = admin_api_server
+    port, _, _db_path = admin_api_server
     status, body = _call(port, "PATCH", "/api/admin/config/ai.enricher.model",
                           body={"value": "qwen3-235b-thinking", "reason": "test bump"})
     assert status == 200, body
@@ -1976,14 +1981,14 @@ def test_patch_writes_history_and_broadcasts(admin_api_server):
 
 
 def test_patch_validation_failure_returns_400(admin_api_server):
-    port, _ = admin_api_server
+    port, _, _db_path = admin_api_server
     status, body = _call(port, "PATCH", "/api/admin/config/pipeline.enricher.poll_interval_sec",
                           body={"value": 2})  # below min=5
     assert status == 400
 
 
 def test_delete_resets_to_default(admin_api_server):
-    port, _ = admin_api_server
+    port, _, _db_path = admin_api_server
     _call(port, "PATCH", "/api/admin/config/ai.enricher.model", body={"value": "qwen3-235b-thinking"})
     status, body = _call(port, "DELETE", "/api/admin/config/ai.enricher.model")
     assert status == 200
@@ -1992,20 +1997,43 @@ def test_delete_resets_to_default(admin_api_server):
 
 
 def test_get_schemas_version(admin_api_server):
-    port, _ = admin_api_server
+    port, _, _db_path = admin_api_server
     status, body = _call(port, "GET", "/api/admin/config/schemas/version")
     assert status == 200
     assert body["seed_version"] >= 1
 
 
 def test_unauthenticated_returns_401(admin_api_server):
-    port, _ = admin_api_server
+    port, _, _db_path = admin_api_server
     req = urllib.request.Request(f"http://127.0.0.1:{port}/api/admin/config")
     try:
         urllib.request.urlopen(req, timeout=2)
         assert False, "expected 401"
     except urllib.error.HTTPError as e:
         assert e.code == 401
+
+
+def test_patch_secret_key_returns_409(admin_api_server):
+    """PATCH must refuse is_secret=1 keys (use rotate-secret instead)."""
+    port, _, db_path = admin_api_server
+    import sqlite3
+    # Inject an is_secret=1 row directly into the live DB so we don't depend on seed evolution
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "INSERT INTO config (key, scope, value, value_type, reload_kind, default_value, is_secret, updated_at, updated_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            ("integrations.jira.api_token", "integrations", '"old-ciphertext"', "secret", "hot", '""', "2026-05-19T00:00:00Z", "__test__")
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    status, body = _call(port, "PATCH", "/api/admin/config/integrations.jira.api_token",
+                          body={"value": "new-plaintext"})
+    assert status == 409, body
+    assert "rotate-secret" in str(body).lower()
+
 ```
 
 - [ ] **Step 2: Run — verify failure**
@@ -2127,6 +2155,8 @@ def handle(handler, method: str, path: str, query: dict, db_path: str) -> bool:
 
         if method == "GET":
             if user is None: unauthorized(handler); return True
+            if not has_permission(user, "view_admin"):
+                forbid(handler); return True
             with get_conn(db_path) as conn:
                 row = conn.execute("SELECT * FROM config WHERE key=?", (key,)).fetchone()
             if row is None:
@@ -2302,7 +2332,7 @@ def _call(port, method, path, body=None):
 
 
 def test_audit_returns_seed_inserts(admin_api_server):
-    port, _ = admin_api_server
+    port, _, _db_path = admin_api_server
     # seed runs on boot — 4 audit rows from initial inserts
     status, body, _ = _call(port, "GET", "/api/admin/audit")
     assert status == 200
@@ -2312,7 +2342,7 @@ def test_audit_returns_seed_inserts(admin_api_server):
 
 
 def test_audit_filtered_by_key(admin_api_server):
-    port, _ = admin_api_server
+    port, _, _db_path = admin_api_server
     status, body, _ = _call(port, "GET", "/api/admin/audit?key=ai.enricher.model")
     data = json.loads(body)
     assert len(data["items"]) >= 1
@@ -2320,7 +2350,7 @@ def test_audit_filtered_by_key(admin_api_server):
 
 
 def test_audit_export_csv(admin_api_server):
-    port, _ = admin_api_server
+    port, _, _db_path = admin_api_server
     status, body, ctype = _call(port, "GET", "/api/admin/audit/export")
     assert status == 200
     assert "csv" in ctype.lower()
