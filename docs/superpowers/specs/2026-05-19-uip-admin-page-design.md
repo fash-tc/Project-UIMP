@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-19
 **Author:** fash (with Claude)
-**Status:** Draft v2 — addresses spec-review feedback
+**Status:** Draft v3 — ready for user review
 
 ## Problem
 
@@ -54,7 +54,7 @@ This spec is grounded in **what's currently running on `fash@10.177.154.196:~/ui
 | **reload_kind** | `hot` (SSE propagation; consumer swaps in memory) or `restart` (config is read at boot only; UI shows banner that a restart is needed). |
 | **restart_target** | When `reload_kind=restart`, the docker compose service name that must be restarted to pick up the change. |
 | **env_legacy** | Bridge field in the seed: name of the pre-existing env var whose value is used to seed the DB on first boot. |
-| **ConfigClient** | Shared Python module (`uip_config_client.py`) that each consumer imports. Reads config via HTTP+SSE from admin-api, falls back to env. |
+| **ConfigClient** | Shared Python module (`uip_config_client/ (Python package)`) that each consumer imports. Reads config via HTTP+SSE from admin-api, falls back to env. |
 
 ---
 
@@ -345,6 +345,7 @@ Config:
   POST   /api/admin/config/{key}/rotate-secret  {value}  (is_secret=1 keys only)
   DELETE /api/admin/config/{key}              reset to default
   GET    /api/admin/config/events             SSE; channel "config_changed"
+  GET    /api/admin/config/schemas/version    {seed_version: int}  (for ConfigClient drift detection — §5.5.1)
 
 Audit:
   GET    /api/admin/audit?from=&to=&by=&key=
@@ -412,7 +413,7 @@ Lifted from `alert-state-api.py` `_sse_broadcast` (commit `bbe36aa`). Event payl
 }
 ```
 
-### 5.5 Consumer client (`uip_config_client.py`)
+### 5.5 Consumer client (`uip_config_client/ (Python package)`)
 
 Shared library imported by every consuming service. Full interface:
 
