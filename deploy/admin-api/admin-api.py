@@ -9,6 +9,8 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+from db import init_db
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -48,6 +50,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     log.info("admin-api starting on :%s (DB=%s)", API_PORT, DB_PATH)
+    init_db(DB_PATH)
+    log.info("schema bootstrapped at %s", DB_PATH)
     with ThreadingHTTPServer(("0.0.0.0", API_PORT), Handler) as server:
         try:
             server.serve_forever()
