@@ -141,10 +141,10 @@ def get_conn(path: str | None = None) -> Iterator[sqlite3.Connection]:
     """Yield a connection with WAL + foreign keys. Caller commits / rolls back."""
     p = path or os.environ.get("DB_PATH") or "/data/admin.db"
     conn = sqlite3.connect(p, isolation_level=None)  # autocommit; caller uses transactions explicitly
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.row_factory = sqlite3.Row
     try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.row_factory = sqlite3.Row
         yield conn
     finally:
         conn.close()

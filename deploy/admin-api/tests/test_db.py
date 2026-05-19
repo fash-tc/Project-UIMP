@@ -1,5 +1,4 @@
 import sqlite3
-import tempfile
 import os
 
 import pytest
@@ -12,18 +11,17 @@ from db import init_db, get_conn
 
 
 @pytest.fixture
-def tmp_db(monkeypatch):
-    path = tempfile.mktemp(suffix=".db")
+def tmp_db(tmp_path, monkeypatch):
+    path = str(tmp_path / "admin.db")
     monkeypatch.setenv("DB_PATH", path)
     yield path
-    # WAL mode leaves -shm/-wal sidecars; remove all three on Windows.
-    for suffix in ("", "-shm", "-wal"):
-        p = path + suffix
-        if os.path.exists(p):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+    # tmp_path cleanup is automatic; remove WAL sidecars if Windows held them
+    for suf in ("", "-wal", "-shm"):
+        try:
+            if os.path.exists(path + suf):
+                os.unlink(path + suf)
+        except OSError:
+            pass
 
 
 def test_init_db_creates_all_tables(tmp_db):
@@ -49,3 +47,19 @@ def test_init_db_enables_wal(tmp_db):
     mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
     conn.close()
     assert mode.lower() == "wal"
+
+
+def test_get_conn_yields_row_factory_and_closes(tmp_db):
+    init_db(tmp_db)
+    with get_conn(tmp_db) as conn:
+        conn.execute(
+            "INSERT INTO config (key, scope, value, value_type, reload_kind, default_value, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("test.key", "test", '"v"', "string", "hot", '"v"', "2026-05-19T00:00:00Z"),
+        )
+        row = conn.execute("SELECT key, scope FROM config WHERE key=?", ("test.key",)).fetchone()
+        assert row["key"] == "test.key"
+        assert row["scope"] == "test"
+    # connection is closed after context exit
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
