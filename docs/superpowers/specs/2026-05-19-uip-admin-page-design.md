@@ -105,12 +105,12 @@ This spec is grounded in **what's currently running on `fash@10.177.154.196:~/ui
 
 ## 2. Tab inventory
 
-Ten tabs under `/portal/admin/*`. The first two are pre-existing on the server (verified live) and will be touched only to extend permissions. The remaining eight are new.
+Ten tabs under `/admin/*` (mounted at `/portal/admin/*` by the existing Next.js base-path config; the spec uses `/admin/…` for brevity throughout). The first two are pre-existing on the server (verified live) and will be touched only to extend permissions. The remaining eight are new.
 
 | Tab | Permission | Status | Purpose |
 |---|---|---|---|
 | `users` | `manage_users` | exists | Users CRUD + role assignment |
-| `roles` | `manage_roles` | exists, extend | Roles CRUD + permission editor; adds 7 new perms to `ALL_PERMISSIONS` |
+| `roles` | `manage_roles` | exists, extend | Roles CRUD + permission editor; adds 8 new perms to `ALL_PERMISSIONS` |
 | `ai` | `manage_ai` | new | Models, prompts, sandbox, instructions, kill switches |
 | `pipeline` | `manage_pipeline` | new | Intervals, thresholds, cluster-merge rules, severity overrides |
 | `zabbix` | `manage_zabbix` | new | Instance CRUD, "Run setup", action filters |
@@ -120,7 +120,7 @@ Ten tabs under `/portal/admin/*`. The first two are pre-existing on the server (
 | `runbooks` | `manage_runbooks` | new | Runbook CRUD, Confluence import, re-embed |
 | `audit` | `view_audit` | new | Append-only change log; CSV export |
 
-**Seven new permissions to add** to `ALL_PERMISSIONS` (in both `auth-api.py:39` and `sre-frontend/src/lib/keep-api.ts:1786`): `manage_ai`, `manage_pipeline`, `manage_zabbix`, `manage_integrations`, `manage_services`, `manage_features`, `manage_runbooks`, `view_audit`. (That's 8 strings, granting access to 8 new tabs; the 7 vs 8 difference is `manage_runbooks` and `view_audit` — counted as 8.)
+**Eight new permissions** to add to `ALL_PERMISSIONS` (in both `auth-api.py:39` and `sre-frontend/src/lib/keep-api.ts:1786`): `manage_ai`, `manage_pipeline`, `manage_zabbix`, `manage_integrations`, `manage_services`, `manage_features`, `manage_runbooks`, `view_audit`. One permission per new tab.
 
 Default role mapping (delta to existing seed):
 - `Admin (id=1)`: receives all 8 new permissions.
@@ -279,7 +279,7 @@ Side-by-side: template editor on the left, sandbox panel on the right.
 - Model picker, temperature, max_tokens, timeout.
 - Template with `{{placeholder}}` syntax.
 - Sandbox: fill placeholders manually or "Load real alert" from `alert-state-api`.
-- "Run" issues `POST /api/admin/ai/test` with `Accept: text/event-stream` — server resolves placeholders, calls cluster, streams chunks back as `chunked transfer encoding` over the same connection. Frontend uses `ReadableStream` on `fetch()` Response.body.
+- "Run" issues `POST /api/admin/ai/test` (no special `Accept` header — plain `application/json` request body). Server resolves placeholders, calls cluster, streams the model's tokens back to the client over the same connection using HTTP chunked transfer encoding (NOT SSE — see §1 and §5.8). Frontend reads via `ReadableStream` on the `fetch()` Response.body.
 - "Save" stages (writes to `prompt_templates` + `prompt_versions`). "Save & deploy" additionally emits SSE `config_changed`.
 - Sandbox calls do NOT count as production traffic; admin-api tags `metrics_channel="sandbox"` on the call so it's excluded from SLI dashboards. (Sandbox calls are still subject to whatever rate-limits the cluster enforces — admin-api passes them through unmodified. If sandbox traffic hurts production, the operator can disable sandboxing via a `feature.admin.ai_sandbox` flag.)
 
@@ -291,7 +291,7 @@ Per call site, paginated list of `prompt_versions` rows: timestamp, author, note
 
 Cluster endpoint is a config key `ai.cluster.endpoint`. Edit triggers a synchronous probe (`GET /api/tags`). If models referenced by call sites don't exist on the new cluster, a modal lists conflicts and **blocks save** until the operator remaps the conflicting call sites. Save = SSE deploy = all services repoint instantly.
 
-This is `ai.cluster.endpoint` is treated as a **high-stakes key**: the save requires a confirmation dialog ("This will repoint every AI service. Type 'repoint' to confirm.") and is rate-limited to 1 change per 60 seconds. No second confirmation beyond that.
+`ai.cluster.endpoint` is treated as a **high-stakes key**: the save requires a confirmation dialog ("This will repoint every AI service. Type 'repoint' to confirm.") and is rate-limited to 1 change per 60 seconds. No second confirmation beyond that. No other config key requires typed confirmation in this iteration.
 
 ### 4.5 Out of scope
 
@@ -324,7 +324,8 @@ admin-api/
 │   ├── 0001_initial.py
 │   └── …
 ├── seeds/
-│   └── config_seed.json
+│   ├── config_seed.json
+│   └── services_seed.json     # restartable-container allowlist (§5.6)
 ├── sse.py                # SSE broadcaster (port from alert-state-api)
 ├── auth.py               # session validation client → auth-api
 ├── secrets.py            # Fernet wrapper + HKDF derivation
@@ -424,7 +425,15 @@ class ConfigClient:
         poll_interval_sec: int = 30,
         sse_reconnect_max_sec: int = 60,
         on_invalid_payload: Callable[[dict, Exception], None] | None = None,
+        schemas: dict[str, KeySchema] | None = None,   # see §5.5.1
     ): ...
+
+    def register_schema(self, key: str, schema: KeySchema) -> None:
+        """
+        Register or override the local validation schema for a single key.
+        Idempotent. Can be called at any time, including after init, to support
+        consumers that register a subset of keys lazily.
+        """
 
     def get(self, key: str, default: Any = _SENTINEL) -> Any:
         """
@@ -446,9 +455,26 @@ class ConfigClient:
         """Snapshot. Useful for boot-time dumps."""
 ```
 
+### 5.5.1 Schema source-of-truth and packaging
+
+To prevent drift between admin-api's authoritative validation and the client-side check that protects consumers:
+
+- **Single source of truth**: `admin-api/seeds/config_seed.json`. Each entry carries the same `validation` JSON that ends up in `admin.db.config.validation`.
+- **Generated module**: `admin-api/build_schemas.py` reads the seed JSON and emits `uip_config_client/schemas.py` — a plain Python module exporting `SCHEMAS: dict[str, KeySchema]` where `KeySchema` is a simple `@dataclass(frozen=True)` holding `value_type`, `validation_rule`, and `seed_version`. Generated at deploy time (Slice 1 ship step), committed to git so consumer images get it via bind-mount of the shared lib.
+- **`KeySchema` type**:
+  ```python
+  @dataclass(frozen=True)
+  class KeySchema:
+      value_type: Literal["int", "float", "string", "bool", "json", "secret"]
+      validation_rule: dict | None  # e.g. {"min": 1, "max": 3600} or {"enum": [...]} or {"regex": "..."}
+      seed_version: int
+  ```
+- **Registration default**: when `ConfigClient(schemas=None)`, the constructor calls `register_schema()` for every key in `uip_config_client.schemas.SCHEMAS`. Consumers don't need to register anything for the happy path; they only call `register_schema()` if they want to override or add a key (e.g., a service-private key not in the global seed).
+- **Version mismatch detection**: at startup, the client compares its `SCHEMAS` `seed_version` to admin-api's `GET /api/admin/config/schemas/version`. If they diverge by more than 1, the client logs a structured warning `schema_version_drift=N` so operators see stale consumers after a seed upgrade. The client keeps working; it just flags the gap.
+
 **Invalid-payload handling** (success criterion 7):
 
-- The client validates every received value against a locally-known schema (declared per-key at registration time). Schema is the same one admin-api applies, packaged as a Python module exported by the client.
+- Every received value is validated against the registered `KeySchema`.
 - If validation fails:
   - Old in-memory value is **kept**.
   - `on_invalid_payload(payload, exception)` is called (defaults to a structured log entry tagged `invalid_config=true`).
@@ -696,7 +722,12 @@ Out of scope but required first.
 - `features/page.tsx`: grid of every `*_ENABLED` flag
 - First consumer per §7: `health-checker` migrated to `ConfigClient`
 
-**Ship gate**: restart `noc-escalation-bot` from UI; flip `ALERT_QA_ENABLED` and watch noc-bot react within seconds.
+**Ship gate** (three independent checks):
+1. Restart `noc-escalation-bot` from the UI Services tab — proves docker.sock allowlist + RBAC.
+2. Flip `ALERT_QA_ENABLED` in the Features tab — value appears in `admin.db.config`, audit row written, banner shows *"noc-escalation-bot not yet migrated — restart required to apply"* (noc-bot consumes this flag at boot until Slice 6).
+3. Change `health-checker`'s probe interval via the Services tab's env editor — health-checker (the slice's migrated consumer) reflects the new interval within one cycle via SSE, no restart needed.
+
+This separation makes it explicit that Slice 2 demonstrates **the admin plane** (DB+SSE+RBAC+docker.sock) and **one migrated consumer** (`health-checker`); the legacy unmigrated services pick up flag changes only on restart until their slice.
 
 ### Slice 3 — AI tab (week 2)
 
