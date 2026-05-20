@@ -41,7 +41,35 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/health":
             return self._send_json(200, {"ok": True, "service": "admin-api"})
+        if path == "/api/admin/config/events":
+            return self._handle_sse()
         self._send_json(404, {"error": "not found", "path": path})
+
+    def _handle_sse(self) -> None:
+        from sse import add_client, remove_client
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            add_client(self.wfile)
+            # Block until client disconnects. ThreadingHTTPServer handles many.
+            # We rely on broadcast() to write; we just hold the connection.
+            try:
+                while True:
+                    # Send a keepalive every 25s
+                    import time
+                    time.sleep(25)
+                    try:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                    except Exception:
+                        break
+            finally:
+                remove_client(self.wfile)
+        except Exception as e:
+            log.warning("SSE handler error: %s", e)
 
     def log_message(self, fmt: str, *args) -> None:
         # Route http.server logs through logging instead of stderr
