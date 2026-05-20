@@ -1801,6 +1801,14 @@ export const ALL_PERMISSIONS = [
   { key: 'manage_highlight_rules', label: 'Manage Highlight Rules', group: 'Management' },
   { key: 'manage_users', label: 'Manage Users', group: 'Admin' },
   { key: 'manage_roles', label: 'Manage Roles', group: 'Admin' },
+  { key: 'manage_ai', label: 'Manage AI', group: 'Admin' },
+  { key: 'manage_pipeline', label: 'Manage Pipeline', group: 'Admin' },
+  { key: 'manage_zabbix', label: 'Manage Zabbix', group: 'Admin' },
+  { key: 'manage_integrations', label: 'Manage Integrations', group: 'Admin' },
+  { key: 'manage_services', label: 'Manage Services', group: 'Admin' },
+  { key: 'manage_features', label: 'Manage Features', group: 'Admin' },
+  { key: 'manage_runbooks', label: 'Manage Runbooks', group: 'Admin' },
+  { key: 'view_audit', label: 'View Audit Log', group: 'Admin' },
 ];
 
 /* ── Client-side highlight rule evaluator ── */
