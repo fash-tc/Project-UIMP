@@ -44,6 +44,8 @@ class ConfigClient:
         self._snapshot_loaded = False
         # Cold-start snapshot attempt (silent if admin-api is down)
         self._try_initial_snapshot()
+        self._stop_sse = False
+        self._start_sse_thread()
 
     # --- public ---
 
@@ -111,6 +113,97 @@ class ConfigClient:
                 log.info("initial snapshot loaded: %d keys", len(self._values))
         except Exception as e:
             log.warning("initial snapshot failed (will use env fallback): %s", e)
+
+    def _start_sse_thread(self) -> None:
+        t = threading.Thread(target=self._sse_loop, name="config-sse", daemon=True)
+        t.start()
+        self._sse_thread = t
+
+    def _sse_loop(self) -> None:
+        url = f"{self._admin_api}/api/admin/config/events"
+        backoff = 1
+        while not getattr(self, "_stop_sse", False):
+            try:
+                req = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
+                with urllib.request.urlopen(req, timeout=None) as r:
+                    # Reset backoff only after we receive the first real frame, not
+                    # just on connection open — a server that accepts then immediately
+                    # drops would otherwise spin in a tight loop.
+                    received_first_frame = False
+                    event_type, data_lines = None, []
+                    for raw in r:
+                        line = raw.decode().rstrip("\n").rstrip("\r")
+                        if line.startswith("event:"):
+                            event_type = line[len("event:"):].strip()
+                        elif line.startswith("data:"):
+                            data_lines.append(line[len("data:"):].strip())
+                        elif line == "" and event_type:
+                            try:
+                                payload = json.loads("\n".join(data_lines))
+                                if event_type == "config_changed":
+                                    self._apply_event(payload)
+                                if not received_first_frame:
+                                    backoff = 1
+                                    received_first_frame = True
+                            except Exception as e:
+                                log.warning("SSE parse error: %s", e)
+                            event_type, data_lines = None, []
+            except Exception as e:
+                log.warning("SSE reconnect in %ds: %s", backoff, e)
+                import time as _time
+                _time.sleep(backoff)
+                backoff = min(backoff * 2, self._sse_max)
+
+    def _apply_event(self, payload: dict) -> None:
+        key = payload.get("key")
+        new_value = payload.get("new_value")
+        if key is None: return
+        # Validate against local schema
+        schema = self._schemas.get(key)
+        if schema is not None:
+            err = self._validate(new_value, schema)
+            if err:
+                try:
+                    self._on_invalid(payload, ValueError(err))
+                except Exception as ee:
+                    log.warning("on_invalid_payload raised: %s", ee)
+                return
+        with self._lock:
+            old_value = self._values.get(key)
+            self._values[key] = new_value
+            listeners = list(self._listeners.get(key, []))
+        for cb in listeners:
+            try:
+                cb(old_value, new_value)
+            except Exception as e:
+                log.warning("on_change callback raised: %s", e)
+
+    def _validate(self, value, schema) -> str | None:
+        vtype = schema.value_type
+        rule = schema.validation_rule
+        if vtype == "int":
+            if not isinstance(value, int) or isinstance(value, bool):
+                return f"expected int, got {type(value).__name__}"
+        elif vtype == "float":
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                return f"expected number, got {type(value).__name__}"
+        elif vtype == "bool":
+            if not isinstance(value, bool):
+                return f"expected bool, got {type(value).__name__}"
+        elif vtype == "string":
+            if not isinstance(value, str):
+                return f"expected string, got {type(value).__name__}"
+        if not rule: return None
+        if vtype in ("int", "float"):
+            if "min" in rule and value < rule["min"]: return f"value {value} below min {rule['min']}"
+            if "max" in rule and value > rule["max"]: return f"value {value} above max {rule['max']}"
+        if vtype == "string":
+            import re
+            if "regex" in rule and not re.match(rule["regex"], value):
+                return f"value does not match regex"
+            if "enum" in rule and value not in rule["enum"]:
+                return f"value not in enum"
+        return None
 
     def _default_on_invalid(self, payload: dict, exc: Exception) -> None:
         log.warning("invalid_config=true key=%s err=%s", payload.get("key"), exc)
