@@ -122,28 +122,38 @@ def handle(handler, method: str, path: str, query: dict, db_path: str) -> bool:
             new_value = body.get("value")
             reason = body.get("reason")
             with get_conn(db_path) as conn:
-                row = conn.execute("SELECT * FROM config WHERE key=?", (key,)).fetchone()
-                if row is None:
-                    send_json(handler, 404, {"error": "not found", "key": key}); return True
-                # Secrets must go through POST /rotate-secret (Fernet path); PATCH on is_secret=1
-                # would overwrite ciphertext with raw plaintext.
-                if row["is_secret"]:
-                    send_json(handler, 409, {"error": "use POST /api/admin/config/{key}/rotate-secret for is_secret=1 keys"}); return True
-                rule = json.loads(row["validation"]) if row["validation"] else None
-                err = _validate(new_value, row["value_type"], rule)
-                if err:
-                    send_json(handler, 400, {"error": err}); return True
-                old_value_json = row["value"]
-                new_value_json = json.dumps(new_value)
-                now = _now_iso()
-                conn.execute(
-                    "UPDATE config SET value=?, updated_at=?, updated_by=? WHERE key=?",
-                    (new_value_json, now, user.username, key),
-                )
-                conn.execute(
-                    "INSERT INTO config_history (key, old_value, new_value, changed_by, changed_at, reason, source) VALUES (?, ?, ?, ?, ?, ?, 'user')",
-                    (key, old_value_json, new_value_json, user.username, now, reason),
-                )
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute("SELECT * FROM config WHERE key=?", (key,)).fetchone()
+                    if row is None:
+                        conn.execute("ROLLBACK")
+                        send_json(handler, 404, {"error": "not found", "key": key}); return True
+                    # Secrets must go through POST /rotate-secret (Fernet path); PATCH on is_secret=1
+                    # would overwrite ciphertext with raw plaintext.
+                    if row["is_secret"]:
+                        conn.execute("ROLLBACK")
+                        send_json(handler, 409, {"error": "use POST /api/admin/config/{key}/rotate-secret for is_secret=1 keys"}); return True
+                    rule = json.loads(row["validation"]) if row["validation"] else None
+                    err = _validate(new_value, row["value_type"], rule)
+                    if err:
+                        conn.execute("ROLLBACK")
+                        send_json(handler, 400, {"error": err}); return True
+                    old_value_json = row["value"]
+                    new_value_json = json.dumps(new_value)
+                    now = _now_iso()
+                    conn.execute(
+                        "UPDATE config SET value=?, updated_at=?, updated_by=? WHERE key=?",
+                        (new_value_json, now, user.username, key),
+                    )
+                    conn.execute(
+                        "INSERT INTO config_history (key, old_value, new_value, changed_by, changed_at, reason, source) VALUES (?, ?, ?, ?, ?, ?, 'user')",
+                        (key, old_value_json, new_value_json, user.username, now, reason),
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    try: conn.execute("ROLLBACK")
+                    except Exception: pass
+                    raise
             broadcast("config_changed", {
                 "key": key,
                 "new_value": new_value,
@@ -160,21 +170,29 @@ def handle(handler, method: str, path: str, query: dict, db_path: str) -> bool:
             if not has_permission(user, "view_admin"):
                 forbid(handler); return True
             with get_conn(db_path) as conn:
-                row = conn.execute("SELECT * FROM config WHERE key=?", (key,)).fetchone()
-                if row is None:
-                    send_json(handler, 404, {"error": "not found", "key": key}); return True
-                default_value = json.loads(row["default_value"])
-                old_value_json = row["value"]
-                new_value_json = row["default_value"]
-                now = _now_iso()
-                conn.execute(
-                    "UPDATE config SET value=?, updated_at=?, updated_by=? WHERE key=?",
-                    (new_value_json, now, user.username, key),
-                )
-                conn.execute(
-                    "INSERT INTO config_history (key, old_value, new_value, changed_by, changed_at, reason, source) VALUES (?, ?, ?, ?, ?, ?, 'rollback')",
-                    (key, old_value_json, new_value_json, user.username, now, "reset to default"),
-                )
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute("SELECT * FROM config WHERE key=?", (key,)).fetchone()
+                    if row is None:
+                        conn.execute("ROLLBACK")
+                        send_json(handler, 404, {"error": "not found", "key": key}); return True
+                    default_value = json.loads(row["default_value"])
+                    old_value_json = row["value"]
+                    new_value_json = row["default_value"]
+                    now = _now_iso()
+                    conn.execute(
+                        "UPDATE config SET value=?, updated_at=?, updated_by=? WHERE key=?",
+                        (new_value_json, now, user.username, key),
+                    )
+                    conn.execute(
+                        "INSERT INTO config_history (key, old_value, new_value, changed_by, changed_at, reason, source) VALUES (?, ?, ?, ?, ?, ?, 'rollback')",
+                        (key, old_value_json, new_value_json, user.username, now, "reset to default"),
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    try: conn.execute("ROLLBACK")
+                    except Exception: pass
+                    raise
             broadcast("config_changed", {
                 "key": key,
                 "new_value": default_value,

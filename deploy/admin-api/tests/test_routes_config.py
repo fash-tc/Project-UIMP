@@ -86,13 +86,28 @@ def test_get_single_key(admin_api_server):
 
 
 def test_patch_writes_history_and_broadcasts(admin_api_server):
-    port, _, _db_path = admin_api_server
+    port, _, db_path = admin_api_server
     status, body = _call(port, "PATCH", "/api/admin/config/ai.enricher.model",
                           body={"value": "qwen3-235b-thinking", "reason": "test bump"})
     assert status == 200, body
     # Read back
     status, body = _call(port, "GET", "/api/admin/config/ai.enricher.model")
     assert body["value"] == "qwen3-235b-thinking"
+    # Verify config_history row was written
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT new_value, reason, source FROM config_history WHERE key=? ORDER BY changed_at DESC LIMIT 1",
+            ("ai.enricher.model",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    import json as _json
+    assert _json.loads(row[0]) == "qwen3-235b-thinking"
+    assert row[1] == "test bump"
+    assert row[2] == "user"
 
 
 def test_patch_validation_failure_returns_400(admin_api_server):
@@ -104,11 +119,17 @@ def test_patch_validation_failure_returns_400(admin_api_server):
 
 def test_delete_resets_to_default(admin_api_server):
     port, _, _db_path = admin_api_server
+    # Capture default from GET
+    status, body = _call(port, "GET", "/api/admin/config/ai.enricher.model")
+    expected_default = body["default"]
+    # Mutate
     _call(port, "PATCH", "/api/admin/config/ai.enricher.model", body={"value": "qwen3-235b-thinking"})
+    # Reset
     status, body = _call(port, "DELETE", "/api/admin/config/ai.enricher.model")
     assert status == 200
+    # Verify reset to default
     status, body = _call(port, "GET", "/api/admin/config/ai.enricher.model")
-    assert body["value"] == "qwen3-32b-thinking"  # default
+    assert body["value"] == expected_default
 
 
 def test_get_schemas_version(admin_api_server):
