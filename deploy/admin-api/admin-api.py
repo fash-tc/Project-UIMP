@@ -9,6 +9,9 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
+
 from db import apply_seed, init_db
 
 logging.basicConfig(
@@ -37,12 +40,35 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _parse(self):
+        u = urlparse(self.path)
+        from urllib.parse import parse_qs
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        return u.path, q
+
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
+        from routes import config as r_config
+        path, query = self._parse()
         if path == "/health":
             return self._send_json(200, {"ok": True, "service": "admin-api"})
         if path == "/api/admin/config/events":
             return self._handle_sse()
+        if r_config.handle(self, "GET", path, query, DB_PATH):
+            return
+        self._send_json(404, {"error": "not found", "path": path})
+
+    def do_PATCH(self) -> None:
+        from routes import config as r_config
+        path, query = self._parse()
+        if r_config.handle(self, "PATCH", path, query, DB_PATH):
+            return
+        self._send_json(404, {"error": "not found", "path": path})
+
+    def do_DELETE(self) -> None:
+        from routes import config as r_config
+        path, query = self._parse()
+        if r_config.handle(self, "DELETE", path, query, DB_PATH):
+            return
         self._send_json(404, {"error": "not found", "path": path})
 
     def _handle_sse(self) -> None:
