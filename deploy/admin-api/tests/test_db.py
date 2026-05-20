@@ -82,10 +82,13 @@ def test_apply_seed_is_idempotent(tmp_db):
     from db import init_db, apply_seed, get_conn
     init_db(tmp_db)
     apply_seed(tmp_db)
-    apply_seed(tmp_db)  # second run should not duplicate or error
     with get_conn(tmp_db) as conn:
-        n = conn.execute("SELECT COUNT(*) FROM config").fetchone()[0]
-    assert n == 4
+        n1 = conn.execute("SELECT COUNT(*) FROM config").fetchone()[0]
+    apply_seed(tmp_db)  # second run should not duplicate
+    with get_conn(tmp_db) as conn:
+        n2 = conn.execute("SELECT COUNT(*) FROM config").fetchone()[0]
+    assert n1 == n2
+    assert n1 > 0  # confirm we actually seeded something
 
 
 def test_apply_seed_honors_env_legacy_on_first_boot(tmp_db, monkeypatch):

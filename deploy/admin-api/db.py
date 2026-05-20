@@ -165,49 +165,60 @@ def _utc_now_iso() -> str:
 def apply_seed(db_path: str) -> None:
     """Apply config_seed.json. Idempotent. Honours env_legacy on first insert only."""
     seed_path = os.path.join(_SEEDS_DIR, "config_seed.json")
+    if not os.path.exists(seed_path):
+        log.error("seed file missing: %s", seed_path)
+        return
     with open(seed_path) as f:
         seed = json.load(f)
+    if not isinstance(seed, dict) or "keys" not in seed:
+        raise ValueError(f"malformed seed file at {seed_path}: expected dict with 'keys' field")
     seed_version = int(seed.get("version", 1))
 
     with get_conn(db_path) as conn:
         existing = {r["key"] for r in conn.execute("SELECT key FROM config")}
         now = _utc_now_iso()
-        for key, entry in seed["keys"].items():
-            if key in existing:
-                continue
-            # Use env_legacy if set on first insert, otherwise default
-            env_legacy = entry.get("env_legacy")
-            raw_value = os.environ.get(env_legacy) if env_legacy else None
-            value = _parse_env_value(raw_value, entry["value_type"]) if raw_value is not None else entry["default"]
-            conn.execute(
-                """
-                INSERT INTO config
-                (key, scope, value, value_type, reload_kind, restart_target,
-                 default_value, description, validation, is_secret,
-                 updated_at, updated_by, seed_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    key,
-                    entry["scope"],
-                    json.dumps(value),
-                    entry["value_type"],
-                    entry["reload_kind"],
-                    entry.get("restart_target"),
-                    json.dumps(entry["default"]),
-                    entry.get("description"),
-                    json.dumps(entry.get("validation")) if entry.get("validation") is not None else None,
-                    1 if entry.get("is_secret") else 0,
-                    now,
-                    "__seed__",
-                    seed_version,
-                ),
-            )
-            conn.execute(
-                "INSERT INTO config_history (key, old_value, new_value, changed_by, changed_at, reason, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (key, None, json.dumps(value), "__seed__", now, f"seed v{seed_version}", "seed"),
-            )
-            log.info("seed: inserted key=%s value_source=%s", key, "env_legacy" if raw_value else "default")
+        conn.execute("BEGIN")
+        try:
+            for key, entry in seed["keys"].items():
+                if key in existing:
+                    continue
+                # Use env_legacy if set on first insert, otherwise default
+                env_legacy = entry.get("env_legacy")
+                raw_value = (os.environ.get(env_legacy) or None) if env_legacy else None
+                value = _parse_env_value(raw_value, entry["value_type"]) if raw_value is not None else entry["default"]
+                conn.execute(
+                    """
+                    INSERT INTO config
+                    (key, scope, value, value_type, reload_kind, restart_target,
+                     default_value, description, validation, is_secret,
+                     updated_at, updated_by, seed_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key,
+                        entry["scope"],
+                        json.dumps(value),
+                        entry["value_type"],
+                        entry["reload_kind"],
+                        entry.get("restart_target"),
+                        json.dumps(entry["default"]),
+                        entry.get("description"),
+                        json.dumps(entry.get("validation")) if entry.get("validation") is not None else None,
+                        1 if entry.get("is_secret") else 0,
+                        now,
+                        "__seed__",
+                        seed_version,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO config_history (key, old_value, new_value, changed_by, changed_at, reason, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (key, None, json.dumps(value), "__seed__", now, f"seed v{seed_version}", "seed"),
+                )
+                log.info("seed: inserted key=%s value_source=%s", key, "env_legacy" if raw_value else "default")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
 
 def _parse_env_value(raw: str, value_type: str):
