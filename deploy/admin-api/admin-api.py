@@ -55,6 +55,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_sse()
         if r_config.handle(self, "GET", path, query, DB_PATH):
             return
+        from routes import audit as r_audit
+        if r_audit.handle(self, "GET", path, query, DB_PATH):
+            return
         self._send_json(404, {"error": "not found", "path": path})
 
     def do_PATCH(self) -> None:
