@@ -272,6 +272,36 @@ services:
       - uip-net
 
   # ============================================
+  # Admin API — Runtime Config + Control Plane
+  # ============================================
+  admin-api:
+    image: python:3.12-slim
+    container_name: uip-admin-api
+    restart: unless-stopped
+    command: sh -c "pip install -q -r /app/requirements.txt && python3 -u /app/admin-api.py"
+    volumes:
+      - ./admin-api:/app:ro
+      - ./uip_config_client:/uip_config_client:ro
+      - admin_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      API_PORT: "8096"
+      DB_PATH: /data/admin.db
+      AUTH_API_URL: http://auth-api:8093
+      AUTH_SECRET: "${AUTH_SECRET}"
+      CLUSTER_ENDPOINT: "${OLLAMA_URL}"
+      ADMIN_BYPASS_TOKEN: "${ADMIN_BYPASS_TOKEN:-}"
+      PYTHONPATH: "/:/app"
+    depends_on:
+      auth-api:
+        condition: service_started
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: "0.5" }
+    networks:
+      - uip-net
+
+  # ============================================
   # Alert State API - Investigation Tracking
   # ============================================
   alert-state-api:
@@ -396,6 +426,7 @@ services:
       - health-checker
       - runbook-api
       - auth-api
+      - admin-api
       - alert-state-api
       - loki-gateway
       - opensrs-health-api
@@ -416,6 +447,7 @@ volumes:
   auth_data:
   alert_state_data:
   opensrs_health_data:
+  admin_data:
 
 networks:
   uip-net:
