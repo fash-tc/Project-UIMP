@@ -43,6 +43,15 @@ ALL_PERMISSIONS = [
     "manage_routing_rules", "manage_highlight_rules",
     "manage_users", "manage_roles",
     "view_settings", "view_admin",
+    # Admin tab permissions (added Slice 1 — UIP admin page)
+    "manage_ai",
+    "manage_pipeline",
+    "manage_zabbix",
+    "manage_integrations",
+    "manage_services",
+    "manage_features",
+    "manage_runbooks",
+    "view_audit",
 ]
 
 _SEED_ROLES = [
@@ -65,6 +74,29 @@ _SEED_ROLES = [
         "view_dashboard", "view_alerts", "view_settings",
     ]),
 ]
+
+NEW_ADMIN_TAB_PERMS = [
+    "manage_ai", "manage_pipeline", "manage_zabbix", "manage_integrations",
+    "manage_services", "manage_features", "manage_runbooks", "view_audit",
+]
+
+
+def seed_admin_tab_permissions(conn):
+    """Idempotent: ensure Admin and SRE roles get the new admin-tab perms; Viewer gets view_audit only."""
+    # Admin (id=1) and SRE (id=2) — all 8
+    for role_id in (1, 2):
+        for perm in NEW_ADMIN_TAB_PERMS:
+            conn.execute(
+                "INSERT OR IGNORE INTO role_permissions (role_id, permission) VALUES (?, ?)",
+                (role_id, perm),
+            )
+    # Viewer (id=3) — view_audit only
+    conn.execute(
+        "INSERT OR IGNORE INTO role_permissions (role_id, permission) VALUES (?, ?)",
+        (3, "view_audit"),
+    )
+    conn.commit()
+
 
 # In-memory set of invalidated tokens (cleared on restart — acceptable for single-instance)
 _invalidated_tokens = set()
@@ -148,6 +180,7 @@ def _init_db():
                 db.execute("INSERT OR IGNORE INTO role_permissions (role_id, permission) VALUES (?, ?)", (role_id, perm))
             log.info(f"Seeded role: {name} with {len(perms)} permissions")
 
+    seed_admin_tab_permissions(db)
     db.commit()
     _seed_users(db)
     log.info(f"Database initialized at {DB_PATH}")
